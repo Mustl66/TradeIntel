@@ -48,7 +48,22 @@ def load_watchlist() -> list:
     if WATCHLIST_FILE.exists():
         try:
             with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Migrate rss_link to rss_links
+                for entry in data:
+                    if "rss_link" in entry:
+                        val = entry.pop("rss_link")
+                        if not val:
+                            entry["rss_links"] = []
+                        elif isinstance(val, str):
+                            entry["rss_links"] = [val]
+                        elif isinstance(val, list):
+                            entry["rss_links"] = [x for x in val if x]
+                        else:
+                            entry["rss_links"] = []
+                    elif "rss_links" not in entry:
+                        entry["rss_links"] = []
+                return data
         except Exception as e:
             logger.error(f"Failed to read {WATCHLIST_FILE}: {e}")
     return []
@@ -198,7 +213,7 @@ def run(exchange: str, limit: int) -> None:
         new_entry = {
             "symbol": ticker,
             "company_name": company_name,
-            "rss_link": [],
+            "rss_links": [],
             "gnw_search_url": gnw_url,
             "exchange": exchange_upper,
             "status": "true",

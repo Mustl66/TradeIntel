@@ -61,7 +61,22 @@ def load_watchlist() -> list:
     if WATCHLIST_FILE.exists():
         try:
             with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Migrate rss_link to rss_links
+                for entry in data:
+                    if "rss_link" in entry:
+                        val = entry.pop("rss_link")
+                        if not val:
+                            entry["rss_links"] = []
+                        elif isinstance(val, str):
+                            entry["rss_links"] = [val]
+                        elif isinstance(val, list):
+                            entry["rss_links"] = [x for x in val if x]
+                        else:
+                            entry["rss_links"] = []
+                    elif "rss_links" not in entry:
+                        entry["rss_links"] = []
+                return data
         except Exception as e:
             logger.error(f"Failed to read {WATCHLIST_FILE}: {e}")
     return []
@@ -83,7 +98,7 @@ def build_gnw_search_url(company_name: str) -> str:
 
 
 def normalize_rss_links(existing) -> list:
-    """Normalize rss_link field to a list (handles str, list, None)."""
+    """Normalize rss_links field to a list (handles str, list, None)."""
     if not existing:
         return []
     if isinstance(existing, str):
@@ -93,22 +108,19 @@ def normalize_rss_links(existing) -> list:
     return []
 
 
-def merge_rss_links(existing, new_links: list) -> list | str:
-    """Add new_links to existing without duplicates. Returns list or str."""
+def merge_rss_links(existing, new_links: list) -> list:
+    """Add new_links to existing without duplicates. Returns list."""
     current = normalize_rss_links(existing)
     for link in new_links:
         if link and link not in current:
             current.append(link)
-    # Preserve single-item as string for backward compat with existing entries
-    if len(current) == 1:
-        return current[0]
     return current
 
 
 def has_rss(entry: dict) -> bool:
-    """Return True if the entry already has at least one valid RSS link."""
-    links = normalize_rss_links(entry.get("rss_link"))
-    return any(l.startswith("http") for l in links)
+    """Return True if the entry already has at least one GlobeNewswire RSS link."""
+    links = entry.get("rss_links", [])
+    return any("globenewswire.com" in l for l in links)
 
 
 # ─── GlobeNewswire Fetcher ───────────────────────────────────────────────────
@@ -220,7 +232,7 @@ def process_entry(entry: dict, refresh: bool) -> dict:
         logger.info(f"  [ATOM]  {sym} – {feeds['atom']}")
 
     if new_links:
-        entry["rss_link"] = merge_rss_links(entry.get("rss_link"), new_links)
+        entry["rss_links"] = merge_rss_links(entry.get("rss_links"), new_links)
     else:
         logger.warning(f"  [NO RSS] {sym} – no RSS/Atom feed found in article.")
 
