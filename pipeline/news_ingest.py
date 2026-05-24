@@ -28,6 +28,13 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateutil_parser
 
+# curl_cffi — TLS fingerprint spoof for CDN-blocked feeds (Edgio, Cloudflare)
+try:
+    from curl_cffi import requests as cffi_requests
+    _CFFI_AVAILABLE = True
+except ImportError:
+    _CFFI_AVAILABLE = False
+
 from db.connection import get_connection
 
 logger = logging.getLogger(__name__)
@@ -42,9 +49,41 @@ ARTICLE_WORKERS   = 6        # parallel article scrapers (be polite)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; TradeIntel/2.0; "
-        "+https://github.com/tradeintel)"
+        "+https://github.com/tradeintel)\n"
     )
 }
+
+# Rotating browser header profiles — used in _fetch_feed to avoid bot detection
+import random as _random
+
+_HEADER_PROFILES = [
+    {   # Chrome 124 Windows
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        # NOTE: Do NOT set Accept-Encoding. requests adds it automatically and handles
+        # gzip decompression. If we override with 'br' (Brotli), requests can't decompress
+        # and feedparser receives raw binary garbage → bozo=True, 0 entries.
+    },
+    {   # Firefox 125 Windows
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    },
+    {   # Safari 17 macOS
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    },
+    {   # Edge 124 Windows
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    },
+]
+
+def _random_headers() -> dict:
+    return _random.choice(_HEADER_PROFILES)
 
 
 # ── Hash ───────────────────────────────────────────────────────────────────────
@@ -132,12 +171,29 @@ def _fetch_feed(feed_row: dict) -> list[dict]:
         # Use requests for HTTP so we get a real timeout.
         # feedparser.parse(url) uses urllib with NO timeout —
         # one hung server stalls the worker thread forever.
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=_random_headers(), timeout=REQUEST_TIMEOUT)
+
+        # 403/429 = CDN block (Edgio, Cloudflare). Retry with curl_cffi TLS spoof.
+        if resp.status_code in (403, 429) and _CFFI_AVAILABLE:
+            logger.debug(f"[{symbol}] HTTP {resp.status_code} — retrying with curl_cffi: {url}")
+            resp = cffi_requests.get(url, impersonate='chrome124', timeout=REQUEST_TIMEOUT)
+
         resp.raise_for_status()
-        parsed = feedparser.parse(resp.content)
+        parsed = feedparser.parse(resp.text)
     except requests.exceptions.Timeout:
-        logger.warning(f"[{symbol}] Feed timed out ({REQUEST_TIMEOUT}s): {url}")
-        return []
+        # TLS-level timeout — some CDNs (Edgio) drop requests connections entirely.
+        # Retry once with curl_cffi before giving up.
+        if _CFFI_AVAILABLE:
+            try:
+                logger.debug(f"[{symbol}] Timeout — retrying with curl_cffi: {url}")
+                resp = cffi_requests.get(url, impersonate='chrome124', timeout=REQUEST_TIMEOUT)
+                parsed = feedparser.parse(resp.text)
+            except Exception as exc:
+                logger.warning(f"[{symbol}] curl_cffi retry also failed ({url}): {exc}")
+                return []
+        else:
+            logger.warning(f"[{symbol}] Feed timed out ({REQUEST_TIMEOUT}s): {url}")
+            return []
     except requests.exceptions.RequestException as exc:
         logger.warning(f"[{symbol}] Feed fetch error ({url}): {exc}")
         return []
@@ -197,8 +253,8 @@ def _get_active_feeds(conn, exchange: str, limit: int) -> list[dict]:
         FROM rss_feeds rf
         JOIN symbols   s  ON s.id = rf.symbol_id
         WHERE rf.is_active = TRUE
-          AND s.status     = TRUE
           AND s.exchange   = %s
+          AND rf.feed_type IN ('rss', 'atom', 'unknown')
         ORDER BY s.symbol
     """
     if limit > 0:

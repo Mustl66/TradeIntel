@@ -1,0 +1,116 @@
+2026-05-24 09:32:03,132 [WARNING] pipeline.html_ingest – [html_ingest] Timeout: https://ir.alaunos.com/press-releases
+2026-05-24 09:32:03,564 [WARNING] pipeline.html_ingest – [html_ingest] Timeout: https://investor.ssctech.com/news-and-events/press-releases/default.aspx
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF4 0x2D 0x6B
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF4 0x2D 0x6B
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF4 0x2D 0x6B
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF4 0x2D 0x6B
+encoding error : input conversion failed due to input error, bytes 0x8F 0x44 0x98 0xB6
+encoding error : input conversion failed due to input error, bytes 0x8F 0x44 0x98 0xB6
+encoding error : input conversion failed due to input error, bytes 0x8F 0x44 0x98 0xB6
+encoding error : input conversion failed due to input error, bytes 0x8F 0x44 0x98 0xB6
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF7 0xF5 0x9A
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF7 0xF5 0x9A
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF7 0xF5 0x9A
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF7 0xF5 0x9A
+2026-05-24 09:32:07,428 [INFO] pipeline.html_ingest – [TTMI] RSS autodiscovered: https://investors.ttm.com/news-events/press-releases/rss
+encoding error : input conversion failed due to input error, bytes 0x8D 0xA6 0xCA 0x23
+encoding error : input conversion failed due to input error, bytes 0x8D 0xA6 0xCA 0x23
+encoding error : input conversion failed due to input error, bytes 0x8D 0xA6 0xCA 0x23
+encoding error : input conversion failed due to input error, bytes 0x8D 0xA6 0xCA 0x23
+2026-05-24 09:32:10,247 [INFO] pipeline.html_ingest – [UPXI] RSS autodiscovered: https://ir.upexi.com/news-events/press-releases/rss
+encoding error : input conversion failed due to input error, bytes 0x81 0xF6 0x87 0xEE
+encoding error : input conversion failed due to input error, bytes 0x81 0xF6 0x87 0xEE
+encoding error : input conversion failed due to input error, bytes 0x81 0xF6 0x87 0xEE
+encoding error : input conversion failed due to input error, bytes 0x81 0xF6 0x87 0xEE
+encoding error : input conversion failed due to input error, bytes 0x90 0xFD 0x19 0x4E
+encoding error : input conversion failed due to input error, bytes 0x90 0xFD 0x19 0x4E
+encoding error : input conversion failed due to input error, bytes 0x90 0xFD 0x19 0x4E
+encoding error : input conversion failed due to input error, bytes 0x90 0xFD 0x19 0x4E
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF5 0x87 0x00
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF5 0x87 0x00
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF5 0x87 0x00
+encoding error : input conversion failed due to input error, bytes 0x9D 0xF5 0x87 0x00
+2026-05-24 09:32:15,540 [INFO] pipeline.html_ingest – [html_ingest] Pages: 650/691 | articles collected: 1112
+encoding error : input conversion failed due to input error, bytes 0x81 0x47 0x09 0x1D
+encoding error : input conversion failed due to input error, bytes 0x81 0x47 0x09 0x1D
+encoding error : input conversion failed due to input error, bytes 0x81 0x47 0x09 0x1D
+encoding error : input conversion failed due to input error, bytes 0x81 0x47 0x09 0x1D
+encoding error : input conversion failed due to input error, bytes 0x90 0x61 0xEE 0x3F
+encoding error : input conversion failed due to input error, bytes 0x90 0x61 0xEE 0x3F
+encoding error : input conversion failed due to input error, bytes 0x90 0x61 0xEE 0x3F
+encoding error : input conversion failed due to input error, bytes 0x90 0x61 0xEE 0x3F
+2026-05-24 09:32:18,511 [INFO] pipeline.html_ingest – [WAY] RSS autodiscovered: https://www.waystar.com/feed/
+encoding error : input conversion failed due to input error, bytes 0x9D 0x19 0x59 0xCF
+encoding error : input conversion failed due to input error, bytes 0x9D 0x19 0x59 0xCF
+encoding error : input conversion failed due to input error, bytes 0x9D 0x19 0x59 0xCF
+encoding error : input conversion failed due to input error, bytes 0x9D 0x19 0x59 0xCF
+2026-05-24 09:32:19,277 [INFO] pipeline.html_ingest – [WAVE] RSS autodiscovered: https://www.ecowavepower.com/feed/
+encoding error : input conversion failed due to input error, bytes 0x8F 0xBF 0xFE 0xF9
+encoding error : input conversion failed due to input error, bytes 0x8F 0xBF 0xFE 0xF9
+encoding error : input conversion failed due to input error, bytes 0x8F 0xBF 0xFE 0xF9
+encoding error : input conversion failed due to input error, bytes 0x8F 0xBF 0xFE 0xF9
+encoding error : input conversion failed due to input error, bytes 0x8F 0x28 0xEC 0xC3
+encoding error : input conversion failed due to input error, bytes 0x8F 0x28 0xEC 0xC3
+encoding error : input conversion failed due to input error, bytes 0x8F 0x28 0xEC 0xC3
+encoding error : input conversion failed due to input error, bytes 0x8F 0x28 0xEC 0xC3
+encoding error : input conversion failed due to input error, bytes 0x9D 0xB2 0x93 0x19
+encoding error : input conversion failed due to input error, bytes 0x9D 0xB2 0x93 0x19
+encoding error : input conversion failed due to input error, bytes 0x9D 0xB2 0x93 0x19
+encoding error : input conversion failed due to input error, bytes 0x9D 0xB2 0x93 0x19
+encoding error : input conversion failed due to input error, bytes 0x9D 0xCD 0x2A 0x1F
+encoding error : input conversion failed due to input error, bytes 0x9D 0xCD 0x2A 0x1F
+encoding error : input conversion failed due to input error, bytes 0x9D 0xCD 0x2A 0x1F
+encoding error : input conversion failed due to input error, bytes 0x9D 0xCD 0x2A 0x1F
+encoding error : input conversion failed due to input error, bytes 0x90 0x19 0xA9 0x49
+encoding error : input conversion failed due to input error, bytes 0x90 0x19 0xA9 0x49
+encoding error : input conversion failed due to input error, bytes 0x90 0x19 0xA9 0x49
+encoding error : input conversion failed due to input error, bytes 0x90 0x19 0xA9 0x49
+encoding error : input conversion failed due to input error, bytes 0x81 0x34 0x92 0xB0
+encoding error : input conversion failed due to input error, bytes 0x81 0x34 0x92 0xB0
+encoding error : input conversion failed due to input error, bytes 0x81 0x34 0x92 0xB0
+encoding error : input conversion failed due to input error, bytes 0x81 0x34 0x92 0xB0
+2026-05-24 09:32:26,213 [INFO] pipeline.html_ingest – [YHC] RSS autodiscovered: https://invest.lqrhouse.com/feed/
+2026-05-24 09:32:26,669 [INFO] pipeline.html_ingest – [ZD] RSS autodiscovered: https://www.ziffdavis.com/feed
+encoding error : input conversion failed due to input error, bytes 0x9D 0xAD 0x3A 0x53
+encoding error : input conversion failed due to input error, bytes 0x9D 0xAD 0x3A 0x53
+encoding error : input conversion failed due to input error, bytes 0x9D 0xAD 0x3A 0x53
+encoding error : input conversion failed due to input error, bytes 0x9D 0xAD 0x3A 0x53
+2026-05-24 09:32:33,007 [INFO] pipeline.html_ingest – [html_ingest] Pages: 691/691 | articles collected: 1222
+2026-05-24 09:32:33,056 [INFO] pipeline.html_ingest – [html_ingest] [KMB] RSS promoted: https://investor.kimberly-clark.com/rss.xml
+2026-05-24 09:32:33,059 [INFO] pipeline.html_ingest – [html_ingest] 1222 raw articles collected
+2026-05-24 09:32:33,080 [INFO] pipeline.html_ingest – [html_ingest] 192 new (1030 already in DB, skipped)
+2026-05-24 09:32:33,129 [INFO] pipeline.html_ingest – [html_ingest] Done — feeds=691, new=192, skipped=1030, rss_promoted=1, methods={'none': 564, 'skip': 40, 'prnewswire': 21, 'nasdaq_api': 22, 'rss_autodiscovery': 41, 'json-ld': 2, 'q4ir_rss': 1}
+2026-05-24 09:32:33,131 [INFO] news_ingest_runner – [news_ingest_runner] HTML result: {'html_feeds': 691, 'articles_new': 192, 'articles_skip': 1030, 'rss_promoted': 1, 'methods': {'none': 564, 'skip': 40, 'prnewswire': 21, 'nasdaq_api': 22, 'rss_autodiscovery': 41, 'json-ld': 2, 'q4ir_rss': 1}}
+2026-05-24 09:32:33,131 [INFO] news_ingest_runner – [news_ingest_runner] Starting SEC EDGAR 8-K pipeline...
+2026-05-24 09:32:33,153 [INFO] pipeline.edgar_ingest – [edgar] Downloading SEC bulk ticker→CIK map...
+2026-05-24 09:32:33,616 [INFO] pipeline.edgar_ingest – [edgar] CIK map loaded: 10371 companies
+2026-05-24 09:32:33,633 [INFO] pipeline.edgar_ingest – [edgar] 37491 articles already in DB
+2026-05-24 09:32:33,646 [INFO] pipeline.edgar_ingest – [edgar] 1154 symbols to process | 976 have CIK | 178 unknown to SEC
+2026-05-24 09:41:31,127 [INFO] pipeline.edgar_ingest – [edgar] Progress: 50/976 | inserted: 944
+2026-05-24 09:53:18,120 [INFO] pipeline.edgar_ingest – [edgar] Progress: 100/976 | inserted: 2118
+2026-05-24 10:02:13,740 [INFO] pipeline.edgar_ingest – [edgar] Progress: 150/976 | inserted: 3134
+2026-05-24 10:12:13,950 [INFO] pipeline.edgar_ingest – [edgar] Progress: 200/976 | inserted: 4158
+2026-05-24 10:23:54,501 [INFO] pipeline.edgar_ingest – [edgar] Progress: 250/976 | inserted: 5568
+2026-05-24 10:35:09,882 [INFO] pipeline.edgar_ingest – [edgar] Progress: 300/976 | inserted: 6914
+2026-05-24 10:47:12,983 [INFO] pipeline.edgar_ingest – [edgar] Progress: 350/976 | inserted: 8343
+2026-05-24 10:54:45,509 [INFO] pipeline.edgar_ingest – [edgar] Progress: 400/976 | inserted: 9220
+2026-05-24 11:03:26,680 [INFO] pipeline.edgar_ingest – [edgar] Progress: 450/976 | inserted: 10248
+2026-05-24 11:12:48,451 [INFO] pipeline.edgar_ingest – [edgar] Progress: 500/976 | inserted: 11371
+2026-05-24 11:22:23,627 [INFO] pipeline.edgar_ingest – [edgar] Progress: 550/976 | inserted: 12511
+2026-05-24 11:31:14,164 [INFO] pipeline.edgar_ingest – [edgar] Progress: 600/976 | inserted: 13522
+2026-05-24 11:42:15,933 [INFO] pipeline.edgar_ingest – [edgar] Progress: 650/976 | inserted: 14849
+2026-05-24 11:52:13,040 [INFO] pipeline.edgar_ingest – [edgar] Progress: 700/976 | inserted: 16032
+2026-05-24 12:01:20,017 [INFO] pipeline.edgar_ingest – [edgar] Progress: 750/976 | inserted: 17095
+2026-05-24 12:11:51,449 [INFO] pipeline.edgar_ingest – [edgar] Progress: 800/976 | inserted: 18322
+2026-05-24 12:21:26,799 [INFO] pipeline.edgar_ingest – [edgar] Progress: 850/976 | inserted: 19448
+2026-05-24 12:32:18,375 [INFO] pipeline.edgar_ingest – [edgar] Progress: 900/976 | inserted: 20779
+2026-05-24 12:43:48,923 [INFO] pipeline.edgar_ingest – [edgar] Progress: 950/976 | inserted: 22138
+2026-05-24 12:47:42,459 [INFO] pipeline.edgar_ingest – [edgar] Done — 22423 articles inserted | 178 symbols had no SEC CIK
+2026-05-24 12:47:42,461 [INFO] news_ingest_runner – [news_ingest_runner] EDGAR result: {'inserted': 22423, 'no_cik': 178}
+2026-05-24 12:47:42,461 [INFO] tradeintel.main – Pipeline finished.
+
+
+
+ https://ir.abivax.com/rss.xml
+
+this has informations aabout the latest news but my program at this state cant fetch this type correctly. please fix this problem

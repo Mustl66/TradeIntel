@@ -23,6 +23,260 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [0.9.0] – 2026-05-24 — RSS/Atom Ingest Bug Fixes + CDN 403 Bypass
+
+#### Problems Fixed
+
+**Bug 1 — news_ingest processing html/api feeds through feedparser**
+`_get_active_feeds()` had no `feed_type` filter. It pulled all 3890 active feeds
+including 850 html and 775 api feeds into feedparser. feedparser returned 0 entries
+for html/api feeds silently — wasted CPU, logged nothing, articles never inserted.
+
+Fix: Added `AND rf.feed_type IN ('rss', 'atom', 'unknown')` to the query.
+Result: 2455 feeds processed instead of 3890 — 37% reduction in wasted work.
+
+**Bug 2 — CDN TLS-level blocks (Edgio, Cloudflare) returning timeout or 403**
+URLs like `ir.abivax.com/rss.xml` are behind Edgio CDN which drops the TCP connection
+at TLS handshake level when it detects non-browser TLS fingerprints. `requests` library
+times out completely — never gets to HTTP layer. Other CDNs return 403 directly.
+
+Fix: Two-layer fallback in `_fetch_feed`:
+- On HTTP 403/429: retry immediately with `curl_cffi impersonate='chrome124'`
+- On `ReadTimeout`: retry with `curl_cffi` before giving up
+
+`curl_cffi` spoofs the TLS fingerprint of real Chrome — CDNs see a legitimate browser.
+
+**Bug 3 — Static bot User-Agent in news_ingest HEADERS constant**
+The original UA `Mozilla/5.0 (compatible; TradeIntel/2.0)` is immediately identifiable
+as a bot by most CDNs and rate-limiters. All feeds using this UA were potentially
+degraded in service quality.
+
+Fix: Added `_HEADER_PROFILES` pool (Chrome 124, Firefox 125, Safari 17, Edge 124)
+with full Accept/Accept-Language/Accept-Encoding headers per profile.
+`_random_headers()` picks a random profile per feed request.
+
+#### Files Changed
+- `pipeline/news_ingest.py` — feed_type filter, curl_cffi fallback, header rotation
+
+### [0.8.0] – 2026-05-24 — Q4 Inc. / default.aspx IR Platform Handler
+
+#### Problem
+IR pages ending in `/default.aspx` (e.g. `investors.airbnb.com/press-releases/default.aspx`,
+`ir.archgroup.com/news/default.aspx`) were routed to the old `q4ir` handler which only probed
+for `/rss.xml`. That probe always returned 0 results — these Q4-hosted IR pages don't expose RSS.
+Result: every `default.aspx` feed silently produced 0 articles.
+
+#### Root Cause Discovery
+Playwright network interception revealed the Q4 platform makes a hidden API call during page load:
+```
+GET {base}/feed/PressRelease.svc/GetPressReleaseList
+    ?bodyType=2&pageSize=-1&year=-1&...
+```
+This endpoint is IDENTICAL across every Q4-hosted IR site — same path, same params, different base domain.
+`bodyType=2` returns the full press release HTML body inline — no article detail-page fetches needed.
+`year=-1` returns ALL years in one call.
+
+#### Transport
+`curl_cffi` with `impersonate='chrome124'` — same as Nasdaq. Regular `requests` gets blocked.
+
+#### Fix (`pipeline/html_ingest.py`)
+- Replaced `_handle_q4ir_rss_probe()` with `_handle_q4ir_api()`.
+- Single API call per company, returns full article list + bodies inline.
+- Date parsed from `PressReleaseDate` field (`MM/DD/YYYY HH:MM:SS` format).
+- `_process_html_feed` updated to call `_handle_q4ir_api`, method tagged `q4ir_api`.
+
+#### Verified Live
+| Symbol | IR Domain | Articles |
+|--------|-----------|---------|
+| ABNB | investors.airbnb.com | 63 ✓ |
+| BLFY | investor.fultonbank.com | 514 ✓ |
+| ACGL | ir.archgroup.com | 175 ✓ |
+| ADV | ir.youradv.com | 122 ✓ |
+
+Note: some Q4 sites return 403 (server-side block, not our transport). These are unchanged — 0 articles, expected.
+
+#### Coverage
+Covers all `default.aspx` URLs in `rss_feeds` regardless of subdomain (`investors.`, `ir.`, `investor.`).
+`_detect_platform` already tagged all of these as `q4ir`.
+
+---
+
+### [0.7.0] – 2026-05-24 — Yahoo Finance Scraper + Admin SEC Filings Tab
+
+
+#### Yahoo Finance Press Releases (pipeline/html_ingest.py)
+
+Problem: `finance.yahoo.com/quote/{ticker}/press-releases` pages are full JS-rendered and blocked by a GDPR consent wall. `requests`, BeautifulSoup, and Playwright all failed.
+
+Fix — two-layer approach:
+
+Layer 1 — Yahoo internal search API (no JS, no consent wall):
+```
+GET https://query2.finance.yahoo.com/v1/finance/search?q={ticker}&newsCount=40
+```
+Returns JSON with title, publisher, timestamp, article link. Filter by publisher set (Business Wire, PRNewswire, GlobeNewswire, Accesswire) to keep only press releases, discard analyst commentary and general news.
+
+Layer 2 — Trafilatura for full text:
+`trafilatura.fetch_url()` bypasses the Yahoo consent wall entirely and extracts clean article body from Yahoo article URLs.
+
+Verified live (ACTG):
+- "Acacia Research to Release First Quarter 2026 Financial Results on May 7, 2026" — exact match
+- "Acacia Research Corporation Reports Fourth Quarter and Year End 2025 Financial Results" — exact match
+
+#### Admin Panel: SEC Filings Tab
+
+- Added third tab "SEC Filings" next to RSS Feeds and News
+- `GET /symbol/{id}/sec` — serves only articles with `source_name='edgar_8k'`
+- Keyword search box (300ms debounce) with pagination
+- Displays SEC 8-K chip instead of feed URL chip
+- Empty state guides user to enable EDGAR pipeline in `pipeline_config.py`
+- News tab now EXCLUDES edgar articles (`source_name != 'edgar_8k'`) — clean separation
+- Live tested on ACTG (66 edgar filings) — all routes 200 OK
+
+---
+
+### [0.6.0] – 2026-05-24 — Pipeline Toggle System + Admin Search Upgrade
+
+#### New File: pipeline_config.py
+Single master switch file for enabling/disabling entire pipelines without touching code.
+
+```python
+PIPELINES = {
+    "rss":   {"active": True,  "description": "RSS/Atom feed ingestion"},
+    "html":  {"active": True,  "description": "HTML page scraping (Nasdaq, PRNewswire...)"},
+    "edgar": {"active": False, "description": "SEC EDGAR 8-K filings — future step"},
+}
+```
+
+Change `active: False` → `active: True` and run `main.py`. No CLI flags needed.
+CLI flags (`--rss-only`, `--html-only`, `--edgar-only`) still override for testing.
+
+#### Admin: Symbol Search Now Matches Feed URLs
+- `GET /symbols?q=globenewswire` now returns symbols that have GlobeNewswire feeds even if ticker/company name don't contain the word
+- SQL: added `OR f.feed_url ILIKE %s` to the WHERE clause
+- Works for: `nasdaq`, `prnewswire`, `globenewswire`, `businesswire`, any domain fragment
+- 14 TDD tests — all GREEN
+
+#### Admin: News Tab Keyword Search
+- `GET /symbol/{id}/news?q=FDA` filters by `title ILIKE` OR `full_text ILIKE`
+- Live search box rendered at top of every news tab (300ms HTMX debounce)
+- Empty state: "No articles matching FDA" when no hits
+- Pagination carries `q=` so paging doesn't reset the filter
+
+---
+
+### [0.5.0] – 2026-05-24 — Nasdaq Press Release Scraper (FIXED + VERIFIED)
+
+#### Problem
+Nasdaq press-release pages (`/market-activity/stocks/{ticker}/press-releases`) are
+fully JS-rendered shells. `requests`, Playwright, and all standard scrapers return
+a 15KB React skeleton with zero article content. The old fallback (BusinessWire RSS)
+returned RANDOM unrelated news, not ticker-specific articles.
+
+#### Root Cause Analysis
+Three separate bugs combined to produce silent failure:
+
+1. **Wrong data source** — BusinessWire RSS is a global feed, not ticker-filtered.
+   GYRO was getting peptide-market reports instead of Gyrodyne press releases.
+
+2. **`content_hash` vs `article_hash` key mismatch** — The Nasdaq handler built
+   article dicts with key `content_hash` but `_insert_articles()` expected `article_hash`.
+   Every article hit a KeyError silently — zero DB inserts, no error logged.
+
+3. **BNBX stored as `feed_type='rss'`** — feedparser consumed the Nasdaq API URL
+   instead of routing it to html_ingest. The API URL
+   (`api.nasdaq.com/api/news/topic/press_release?q=symbol:BNBX|...`)
+   was classified as RSS by the URL heuristic, bypassing the HTML pipeline entirely.
+
+#### Fix: Nasdaq Internal JSON API
+
+Discovered via JS bundle inspection. Nasdaq's own page loads articles from:
+```
+GET https://api.nasdaq.com/api/news/topic/press_release
+    ?q=symbol:{TICKER}|assetclass:stocks&limit=40&offset=0
+```
+Returns clean JSON: title, date, relative URL. No JS rendering needed.
+
+Transport: `curl_cffi` with `impersonate='chrome124'` — bypasses Nasdaq's HTTP/2
+TLS fingerprint block that kills both `requests` and Playwright.
+
+Article body: fetched from `https://www.nasdaq.com/press-release/{slug}` using
+`div.body__content` CSS selector.
+
+#### What Changed (pipeline/html_ingest.py)
+- `_handle_nasdaq_page()` — complete rewrite using the internal API
+- `_detect_platform()` — now recognises both URL formats:
+  - `/market-activity/stocks/{ticker}/press-releases`
+  - `api.nasdaq.com/api/news/topic/press_release?q=symbol:{ticker}|...`
+- Ticker extraction handles both URL formats
+- `article_hash` key fixed (was `content_hash`) — articles now insert correctly
+- Added `api.nasdaq.com` URL format to `platform_config.py` detection
+
+#### DB Fix
+- BNBX and similar symbols with API-style Nasdaq URLs: `feed_type` updated
+  `rss` → `html` in DB so html_ingest picks them up correctly
+
+#### False Article Cleanup
+- 182 wrongly-linked GlobeNewswire articles deleted from symbols that only had
+  Nasdaq HTML feeds (they were inserted by the old broken BusinessWire RSS fallback)
+
+#### Verified Live (exact title match)
+| Symbol | Expected (from Nasdaq page) | Result |
+|--------|---------------------------|--------|
+| GYRO | "Gyrodyne Announces Agreement with Star Equity Fund" (Oct 17 2025) | ✅ Inserted |
+| GYRO | "GYRODYNE ANNOUNCES CLOSING OF SUCCESSFUL RIGHTS OFFERING" | ✅ Inserted |
+| BNBX | "BNB Plus Corp. Completes Historic $1.2 Million LineaDNA™ Order" (Apr 23 2026) | ✅ Inserted |
+| BNBX | "BNB Plus Corp. Announces Review of Strategic Alternatives" (Apr 20 2026) | ✅ Inserted |
+| BLDP | Ballard Power / Weichai articles | ✅ Inserted |
+
+#### Human-Like Request Behaviour
+- Full browser header rotation: Chrome / Firefox / Safari / Edge fingerprint pools
+- Random delay 0.5–1.0s between every HTTP request
+- `curl_cffi` TLS impersonation for Nasdaq-specific endpoints
+
+---
+
+### [0.4.1] – 2026-05-24 — HTML Ingest Pipeline + feed_type Migration
+
+#### Problem
+849 feeds stored in `rss_feeds` with HTML press-release page URLs were being
+silently ignored. feedparser returned 0 entries on HTML pages, no error logged.
+
+#### New File: pipeline/html_ingest.py
+Multi-layer HTML scraping pipeline for non-RSS sources:
+
+| Layer | Method | Coverage |
+|-------|--------|----------|
+| 1 | RSS autodiscovery (`<link rel="alternate">` in page `<head>`) | Promotes to RSS permanently |
+| 2 | JSON-LD structured data | Modern IR pages |
+| 3 | Trafilatura full-text extraction | Generic fallback |
+| 4 | LM Studio quality gate (gemma-4-e4b @ localhost:1234) | Validates Trafilatura output |
+
+Platform-specific handlers (bypass generic scraping):
+- **Nasdaq** — internal JSON API (see v0.5.0 above)
+- **PRNewswire** — `class="newsreleaseconsolidatelink"` anchor selector on listing pages
+- **GlobeNewswire HTML listings** — scrapes `/news-release/YYYY/MM/DD/` links directly from search results page
+- **BusinessWire** — RSS endpoint fallback
+- **Q4IR / Airbnb IR** — attempts `/rss.xml` probe first
+
+#### New File: pipeline/migrate_feed_type.py
+One-time classifier. Probes all feeds via URL heuristic + HTTP.
+Results: rss=679, atom=2041, html=849, unknown=39.
+Run with `--reclassify` to re-probe existing feeds.
+
+#### DB Schema Updates
+- `rss_feeds.feed_type` CHECK now allows: `rss`, `atom`, `html`, `unknown`, `api`
+- `rss_feeds.source` CHECK now allows: `globenewswire`, `company_ir`, `other`, `edgar_8k`
+- `news_articles.source_type` column added
+
+#### news_ingest_runner.py
+Now orchestrates all three pipelines with flags:
+- `--rss-only` — only RSS/Atom feeds
+- `--html-only` — only HTML page feeds
+- `--edgar-only` — only EDGAR 8-K (currently inactive)
+
+---
+
 ### [0.4.0] – 2026-05-22 — Admin Panel (admin.py)
 
 Standalone FastAPI + HTMX admin panel for manual DB management. Completely

@@ -102,6 +102,23 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
     font-size: 0.7rem; font-weight: 700; color: #475569;
     background: #1a2133; padding: 2px 7px; border-radius: 99px;
   }}
+  .fetch-btn {{
+    font-size: 0.65rem; padding: 2px 7px; border-radius: 99px;
+    background: #1e3a5f; color: #60a5fa; border: 1px solid #2563eb;
+    cursor: pointer; transition: background 0.15s;
+    line-height: 1.4;
+  }}
+  .fetch-btn:hover {{ background: #2563eb; color: #fff; }}
+  .fetch-btn:active {{ transform: scale(0.95); }}
+  .fetch-log {{
+    font-family: monospace; font-size: 0.75rem; color: #94a3b8;
+    background: #0f172a; border-radius: 8px; padding: 14px 16px;
+    margin: 16px; white-space: pre-wrap; word-break: break-all;
+    max-height: 500px; overflow-y: auto; border: 1px solid #1e2535;
+  }}
+  .fetch-log .ok  {{ color: #4ade80; }}
+  .fetch-log .err {{ color: #f87171; }}
+  .fetch-log .hdr {{ color: #38bdf8; font-weight: bold; }}
   .feed-card {{
     background: #1a2133; border: 1px solid #1e2535;
     border-radius: 8px; padding: 14px 16px; margin: 0 16px 12px;
@@ -191,6 +208,33 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
   }}
   .pagination {{ display: flex; gap: 8px; padding: 16px; justify-content: center; }}
   .news-count {{ font-size: 0.72rem; color: #475569; padding: 2px 7px; background: #1a2133; border-radius: 99px; }}
+  .filter-bar {{ display: flex; gap: 5px; flex-wrap: wrap; padding: 8px 12px; border-bottom: 1px solid #1e2535; background: #161b27; }}
+  .filter-btn {{
+    font-size: 0.68rem; font-weight: 700; padding: 3px 9px;
+    border-radius: 99px; border: 1px solid #2d3748;
+    background: #0f1117; color: #64748b; cursor: pointer;
+    transition: all .15s; letter-spacing: 0.3px;
+  }}
+  .filter-btn:hover {{ background: #1e2535; color: #94a3b8; }}
+  .filter-btn.active {{ background: #1e3a5f; color: #60a5fa; border-color: #3b82f6; }}
+  .filter-btn.warn {{ }}
+  .filter-btn.warn.active {{ background: #451a03; color: #fb923c; border-color: #c2410c; }}
+  .filter-btn.danger.active {{ background: #450a0a; color: #f87171; border-color: #991b1b; }}
+  .art-count {{
+    font-size: 0.68rem; font-weight: 700; padding: 2px 7px;
+    border-radius: 99px; min-width: 28px; text-align: center;
+  }}
+  .art-zero  {{ background: #450a0a22; color: #f87171; border: 1px solid #7f1d1d44; }}
+  .art-low   {{ background: #451a0322; color: #fb923c; border: 1px solid #c2410c44; }}
+  .art-ok    {{ background: #14532d22; color: #4ade80; border: 1px solid #15803d44; }}
+  .sort-bar {{ display: flex; gap: 5px; padding: 6px 12px; border-bottom: 1px solid #1e2535; align-items: center; }}
+  .sort-label {{ font-size: 0.65rem; color: #475569; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }}
+  .sort-btn {{
+    font-size: 0.68rem; font-weight: 600; padding: 2px 8px;
+    border-radius: 99px; border: 1px solid transparent;
+    background: none; color: #475569; cursor: pointer;
+  }}
+  .sort-btn.active {{ color: #60a5fa; border-color: #3b82f6; background: #1e3a5f; }}
 </style>
 </head>
 <body>
@@ -204,18 +248,51 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
     <div class="panel-head">
       <h2>Symbols</h2>
       <div class="search-wrap" style="padding:0">
-        <input type="text" id="sym-search" placeholder="Search ticker or name…"
+        <input type="text" id="sym-search" placeholder="Search ticker, name, or feed source…"
           hx-get="/symbols"
           hx-trigger="keyup changed delay:200ms"
           hx-target="#sym-list"
-          hx-include="#sym-search"
+          hx-include="#sym-search, #sym-filter, #sym-sort"
           name="q"
           autocomplete="off"
         />
       </div>
     </div>
+    <!-- filter bar -->
+    <div class="filter-bar">
+      <span style="font-size:0.65rem;color:#475569;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;align-self:center;">Filter</span>
+      <button class="filter-btn active" onclick="setFilter(this,'all')" title="All symbols">All</button>
+      <button class="filter-btn danger" onclick="setFilter(this,'zero')" title="No articles yet — needs fixing">0 articles</button>
+      <button class="filter-btn warn"   onclick="setFilter(this,'low')"  title="1-4 articles — might be broken">Low &lt;5</button>
+      <button class="filter-btn"        onclick="setFilter(this,'ok')"   title="5+ articles">OK</button>
+      <button class="filter-btn"        onclick="setFilter(this,'nofeed')" title="No feed URL at all">No feed</button>
+    </div>
+    <!-- sort bar -->
+    <div class="sort-bar">
+      <span class="sort-label">Sort</span>
+      <button class="sort-btn active" onclick="setSort(this,'alpha')"    title="A→Z">A-Z</button>
+      <button class="sort-btn"        onclick="setSort(this,'articles')" title="Fewest articles first">Fewest first</button>
+      <button class="sort-btn"        onclick="setSort(this,'most')"     title="Most articles first">Most first</button>
+    </div>
+    <input type="hidden" id="sym-filter" name="filter" value="all"/>
+    <input type="hidden" id="sym-sort"   name="sort"   value="alpha"/>
+    <script>
+      function setFilter(btn, val) {{
+        document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('sym-filter').value = val;
+        htmx.trigger('#sym-search', 'keyup');
+      }}
+      function setSort(btn, val) {{
+        document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('sym-sort').value = val;
+        htmx.trigger('#sym-search', 'keyup');
+      }}
+    </script>
     <div class="panel-body" id="sym-list"
-      hx-get="/symbols" hx-trigger="load" hx-target="#sym-list" hx-swap="innerHTML">
+      hx-get="/symbols" hx-trigger="load" hx-target="#sym-list" hx-swap="innerHTML"
+      hx-include="#sym-search, #sym-filter, #sym-sort">
       <div class="empty-state"><span class="spinner"></span></div>
     </div>
   </div>
@@ -242,33 +319,49 @@ async def root():
 
 
 @app.get("/symbols", response_class=HTMLResponse)
-async def symbols(q: str = ""):
+async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # base WHERE
+            where_clauses = []
+            params = []
             if q.strip():
-                cur.execute("""
-                    SELECT s.id, s.symbol, s.company_name,
-                           COUNT(f.id) FILTER (WHERE f.is_active) AS active_feeds,
-                           COUNT(f.id) AS total_feeds
-                    FROM symbols s
-                    LEFT JOIN rss_feeds f ON f.symbol_id = s.id
-                    WHERE s.symbol ILIKE %s OR s.company_name ILIKE %s
-                    GROUP BY s.id
-                    ORDER BY s.symbol
-                    LIMIT 200
-                """, (f"%{q}%", f"%{q}%"))
-            else:
-                cur.execute("""
-                    SELECT s.id, s.symbol, s.company_name,
-                           COUNT(f.id) FILTER (WHERE f.is_active) AS active_feeds,
-                           COUNT(f.id) AS total_feeds
-                    FROM symbols s
-                    LEFT JOIN rss_feeds f ON f.symbol_id = s.id
-                    GROUP BY s.id
-                    ORDER BY s.symbol
-                    LIMIT 500
-                """)
+                where_clauses.append("(s.symbol ILIKE %s OR s.company_name ILIKE %s OR f.feed_url ILIKE %s)")
+                params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+
+            # article count filter
+            having_clause = ""
+            if filter == "zero":
+                having_clause = "HAVING COUNT(na.id) = 0"
+            elif filter == "low":
+                having_clause = "HAVING COUNT(na.id) BETWEEN 1 AND 4"
+            elif filter == "ok":
+                having_clause = "HAVING COUNT(na.id) >= 5"
+            elif filter == "nofeed":
+                having_clause = "HAVING COUNT(f.id) = 0"
+
+            # sort
+            order = {
+                "articles": "article_count ASC, s.symbol ASC",
+                "most":     "article_count DESC, s.symbol ASC",
+            }.get(sort, "s.symbol ASC")
+
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            cur.execute(f"""
+                SELECT s.id, s.symbol, s.company_name,
+                       COUNT(DISTINCT f.id) FILTER (WHERE f.is_active) AS active_feeds,
+                       COUNT(DISTINCT f.id) AS total_feeds,
+                       COUNT(DISTINCT na.id) AS article_count
+                FROM symbols s
+                LEFT JOIN rss_feeds f   ON f.symbol_id  = s.id
+                LEFT JOIN news_articles na ON na.symbol_id = s.id
+                {where_sql}
+                GROUP BY s.id
+                {having_clause}
+                ORDER BY {order}
+                LIMIT 500
+            """, params)
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -279,6 +372,14 @@ async def symbols(q: str = ""):
     html = ""
     for r in rows:
         feeds_label = f"{r['active_feeds']}/{r['total_feeds']}" if r['total_feeds'] else "0"
+        art = r['article_count']
+        if art == 0:
+            art_cls = "art-count art-zero"
+        elif art < 5:
+            art_cls = "art-count art-low"
+        else:
+            art_cls = "art-count art-ok"
+        art_label = str(art) if art < 1000 else f"{art//1000}k"
         html += f"""
         <div class="sym-row"
           hx-get="/symbol/{r['id']}/feeds"
@@ -290,7 +391,19 @@ async def symbols(q: str = ""):
             <div class="sym-ticker">{r['symbol']}</div>
             <div class="sym-name">{r['company_name'] or '—'}</div>
           </div>
-          <span class="feed-count">{feeds_label}</span>
+          <div style="display:flex;gap:5px;align-items:center;">
+            <span class="{art_cls}" title="{art} articles">{art_label}</span>
+            <span class="feed-count">{feeds_label}</span>
+            <button
+              class="fetch-btn"
+              title="Fetch news for {r['symbol']}"
+              hx-post="/symbol/{r['id']}/fetch"
+              hx-target="#feed-panel"
+              hx-swap="innerHTML"
+              hx-indicator="#fetch-spinner-{r['id']}"
+              onclick="event.stopPropagation();document.querySelectorAll('.sym-row').forEach(e=>e.classList.remove('active'));this.closest('.sym-row').classList.add('active')"
+            >▶</button>
+          </div>
         </div>"""
     return HTMLResponse(html)
 
@@ -323,6 +436,8 @@ async def symbol_feeds(sym_id: int):
         onclick="switchTab({sym_id},'feeds')">RSS Feeds</button>
       <button class="tab-btn" id="tab-news-{sym_id}"
         onclick="switchTab({sym_id},'news')">News</button>
+      <button class="tab-btn" id="tab-sec-{sym_id}"
+        onclick="switchTab({sym_id},'sec')">SEC Filings</button>
     </div>
     <div id="tab-content-{sym_id}" class="panel-body" style="padding-bottom:20px">
     """
@@ -354,6 +469,13 @@ async def symbol_feeds(sym_id: int):
             <div class="edit-form">
               <input type="url" id="edit-url-{f['id']}" value="{f['feed_url']}"
                 placeholder="New feed URL" style="flex:1"/>
+              <select class="select-sm" id="edit-type-{f['id']}">
+                <option value="rss"    {'selected' if f['feed_type']=='rss'    else ''}>rss</option>
+                <option value="atom"   {'selected' if f['feed_type']=='atom'   else ''}>atom</option>
+                <option value="html"   {'selected' if f['feed_type']=='html'   else ''}>html</option>
+                <option value="api"    {'selected' if f['feed_type']=='api'    else ''}>api</option>
+                <option value="unknown"{'selected' if f['feed_type']=='unknown' else ''}>unknown</option>
+              </select>
               <button class="btn btn-primary"
                 onclick="saveEdit({f['id']})">Save</button>
               <button class="btn btn-ghost"
@@ -366,9 +488,16 @@ async def symbol_feeds(sym_id: int):
     # Add new feed form
     html += f"""
     <div class="add-form">
-      <h3>+ Add new RSS feed</h3>
+      <h3>+ Add new feed</h3>
       <div class="form-row">
         <input type="url" id="new-url-{sym_id}" placeholder="https://example.com/feed.xml" style="flex:1"/>
+        <select class="select-sm" id="new-type-{sym_id}">
+          <option value="rss">rss</option>
+          <option value="atom">atom</option>
+          <option value="html">html</option>
+          <option value="api">api</option>
+          <option value="unknown">unknown</option>
+        </select>
         <select class="select-sm" id="new-source-{sym_id}">
           <option value="company_ir">Company IR</option>
           <option value="globenewswire">GlobeNewswire</option>
@@ -387,10 +516,14 @@ async def symbol_feeds(sym_id: int):
     function switchTab(symId, tab) {{
       document.getElementById('tab-feeds-' + symId).classList.toggle('active', tab === 'feeds');
       document.getElementById('tab-news-' + symId).classList.toggle('active', tab === 'news');
+      document.getElementById('tab-sec-' + symId).classList.toggle('active', tab === 'sec');
       const content = document.getElementById('tab-content-' + symId);
       if (tab === 'news') {{
         content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
         htmx.ajax('GET', '/symbol/' + symId + '/news?page=1', content);
+      }} else if (tab === 'sec') {{
+        content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
+        htmx.ajax('GET', '/symbol/' + symId + '/sec?page=1', content);
       }} else {{
         htmx.ajax('GET', '/symbol/' + symId + '/feeds', '#feed-panel');
       }}
@@ -418,16 +551,16 @@ async def symbol_feeds(sym_id: int):
     }}
 
     async function addFeed(symId) {{
-      const url = document.getElementById('new-url-' + symId).value.trim();
+      const url    = document.getElementById('new-url-'    + symId).value.trim();
       const source = document.getElementById('new-source-' + symId).value;
+      const ftype  = document.getElementById('new-type-'   + symId).value;
       if (!url) return;
       const r = await fetch('/feeds', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-        body: 'symbol_id=' + symId + '&feed_url=' + encodeURIComponent(url) + '&source=' + source
+        body: 'symbol_id=' + symId + '&feed_url=' + encodeURIComponent(url) + '&source=' + source + '&feed_type=' + ftype
       }});
       if (r.ok) {{
-        // reload feed panel
         htmx.ajax('GET', '/symbol/' + symId + '/feeds', '#feed-panel');
       }} else {{
         const data = await r.json();
@@ -436,22 +569,24 @@ async def symbol_feeds(sym_id: int):
     }}
 
     async function saveEdit(feedId) {{
-      const url = document.getElementById('edit-url-' + feedId).value.trim();
+      const url    = document.getElementById('edit-url-'  + feedId).value.trim();
+      const ftype  = document.getElementById('edit-type-' + feedId).value;
       if (!url) return;
       const valBox = document.getElementById('edit-val-' + feedId);
-      valBox.innerHTML = '<div class="validation-box" style="color:#94a3b8">Validating…</div>';
-      // validate first
-      const vr = await fetch('/feeds/validate?url=' + encodeURIComponent(url));
-      const vd = await vr.json();
-      if (!vd.ok) {{
-        valBox.innerHTML = `<div class="validation-box val-err">✗ ${{vd.error}} — fix the URL before saving.</div>`;
-        return;
+      // skip RSS validation for html/api types
+      if (ftype === 'rss' || ftype === 'atom' || ftype === 'unknown') {{
+        valBox.innerHTML = '<div class="validation-box" style="color:#94a3b8">Validating…</div>';
+        const vr = await fetch('/feeds/validate?url=' + encodeURIComponent(url));
+        const vd = await vr.json();
+        if (!vd.ok) {{
+          valBox.innerHTML = `<div class="validation-box val-err">✗ ${{vd.error}} — fix the URL before saving.</div>`;
+          return;
+        }}
       }}
-      // save
       const r = await fetch('/feeds/' + feedId, {{
         method: 'PUT',
         headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-        body: 'feed_url=' + encodeURIComponent(url)
+        body: 'feed_url=' + encodeURIComponent(url) + '&feed_type=' + ftype
       }});
       if (r.ok) {{
         const html = await r.text();
@@ -487,24 +622,102 @@ async def validate_feed(url: str):
         return {"ok": False, "error": str(e)}
 
 
+# ── Fetch symbol pipeline ──────────────────────────────────────────────────────
+
+@app.post("/symbol/{sym_id}/fetch", response_class=HTMLResponse)
+async def fetch_symbol(sym_id: int):
+    import subprocess, sys, time
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT symbol, company_name FROM symbols WHERE id=%s", (sym_id,))
+            row = cur.fetchone()
+            if not row:
+                return HTMLResponse('<div class="fetch-log"><span class="err">Symbol not found</span></div>')
+            symbol = row["symbol"]
+            name   = row["company_name"] or symbol
+
+            cur.execute("SELECT COUNT(*) AS c FROM news_articles WHERE symbol_id=%s", (sym_id,))
+            before = cur.fetchone()["c"]
+    finally:
+        conn.close()
+
+    script = os.path.join(os.path.dirname(__file__), "test_symbol.py")
+    start  = time.time()
+    try:
+        result = subprocess.run(
+            [sys.executable, script, symbol],
+            capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(__file__)
+        )
+        output = (result.stdout + result.stderr).strip()
+        elapsed = round(time.time() - start, 1)
+    except subprocess.TimeoutExpired:
+        output  = "ERROR: timed out after 120s"
+        elapsed = 120
+
+    conn2 = get_conn()
+    try:
+        with conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM news_articles WHERE symbol_id=%s", (sym_id,))
+            after = cur.fetchone()["c"]
+    finally:
+        conn2.close()
+
+    new_count = after - before
+
+    # colorise output lines
+    lines_html = ""
+    for line in output.splitlines():
+        ll = line.lower()
+        if any(x in ll for x in ("error", "fail", "exception", "traceback")):
+            lines_html += f'<span class="err">{line}</span>\n'
+        elif any(x in ll for x in ("inserted", "new", "fetched", "ok", "✓", "articles")):
+            lines_html += f'<span class="ok">{line}</span>\n'
+        else:
+            lines_html += f'{line}\n'
+
+    summary_cls = "ok" if new_count > 0 else ("err" if new_count == 0 and before == 0 else "")
+    summary = f'+{new_count} new articles inserted' if new_count > 0 else 'no new articles (all already in DB or no feeds)'
+
+    return HTMLResponse(f"""
+    <div style="padding:16px 16px 8px">
+      <div style="font-size:0.85rem;color:#e2e8f0;margin-bottom:8px">
+        <span class="fetch-log hdr" style="background:none;padding:0;margin:0">
+          ▶ {symbol} — {name}
+        </span>
+        &nbsp;<span style="color:#64748b;font-size:0.75rem">{elapsed}s</span>
+      </div>
+      <div style="font-size:0.8rem;margin-bottom:8px">
+        Before: <b>{before}</b> articles &nbsp;→&nbsp; After: <b>{after}</b> articles
+        &nbsp;<span class="fetch-log {summary_cls}" style="background:none;padding:0;margin:0">({summary})</span>
+      </div>
+    </div>
+    <div class="fetch-log">{lines_html}</div>
+    <div style="padding:0 16px 16px">
+      <button class="fetch-btn" style="font-size:0.75rem;padding:4px 12px"
+        hx-get="/symbol/{sym_id}/feeds"
+        hx-target="#feed-panel"
+        hx-swap="innerHTML">
+        ← Back to feeds
+      </button>
+    </div>
+    """)
+
+
 @app.post("/feeds", response_class=HTMLResponse)
 async def add_feed(
     symbol_id: int = Form(...),
     feed_url:  str = Form(...),
     source:    str = Form("other"),
+    feed_type: str = Form("unknown"),
 ):
-    # Validate source value
     valid_sources = {"globenewswire", "company_ir", "other"}
     if source not in valid_sources:
         raise HTTPException(400, f"Invalid source. Must be one of: {valid_sources}")
 
-    # Quick feed validation
-    try:
-        resp = requests.get(feed_url, timeout=12,
-                            headers={"User-Agent": "TradeIntel-Admin/1.0"})
-        parsed = feedparser.parse(resp.content)
-        feed_type = "atom" if parsed.version and "atom" in parsed.version else "rss"
-    except Exception:
+    valid_types = {"rss", "atom", "html", "api", "unknown"}
+    if feed_type not in valid_types:
         feed_type = "unknown"
 
     conn = get_conn()
@@ -526,13 +739,10 @@ async def add_feed(
 
 
 @app.put("/feeds/{feed_id}", response_class=HTMLResponse)
-async def edit_feed(feed_id: int, feed_url: str = Form(...)):
-    try:
-        resp = requests.get(feed_url, timeout=12,
-                            headers={"User-Agent": "TradeIntel-Admin/1.0"})
-        parsed = feedparser.parse(resp.content)
-        feed_type = "atom" if parsed.version and "atom" in parsed.version else "rss"
-    except Exception:
+async def edit_feed(feed_id: int, feed_url: str = Form(...), feed_type: str = Form("unknown")):
+    # use the type the user explicitly chose — don't re-detect and overwrite
+    valid_types = {"rss", "atom", "html", "api", "unknown"}
+    if feed_type not in valid_types:
         feed_type = "unknown"
 
     conn = get_conn()
@@ -599,36 +809,83 @@ async def delete_feed(feed_id: int):
 # ── News route ────────────────────────────────────────────────────────────────
 
 @app.get("/symbol/{sym_id}/news", response_class=HTMLResponse)
-async def symbol_news(sym_id: int, page: int = 1):
+async def symbol_news(sym_id: int, page: int = 1, q: str = ""):
     per_page = 20
     offset   = (page - 1) * per_page
+    keyword  = q.strip()
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT COUNT(*) AS total FROM news_articles WHERE symbol_id = %s
-            """, (sym_id,))
+            if keyword:
+                cur.execute("""
+                    SELECT COUNT(*) AS total FROM news_articles
+                    WHERE symbol_id = %s
+                      AND (source_name IS NULL OR source_name != 'edgar_8k')
+                      AND (title ILIKE %s OR full_text ILIKE %s)
+                """, (sym_id, f"%{keyword}%", f"%{keyword}%"))
+            else:
+                cur.execute("""
+                    SELECT COUNT(*) AS total FROM news_articles
+                    WHERE symbol_id = %s
+                      AND (source_name IS NULL OR source_name != 'edgar_8k')
+                """, (sym_id,))
             total = cur.fetchone()["total"]
 
-            cur.execute("""
-                SELECT
-                    na.id, na.title, na.url, na.published_at, na.inserted_at,
-                    na.full_text,
-                    rf.feed_url
-                FROM news_articles na
-                LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
-                WHERE na.symbol_id = %s
-                ORDER BY na.published_at DESC NULLS LAST
-                LIMIT %s OFFSET %s
-            """, (sym_id, per_page, offset))
+            if keyword:
+                cur.execute("""
+                    SELECT
+                        na.id, na.title, na.url, na.published_at, na.inserted_at,
+                        na.full_text,
+                        rf.feed_url
+                    FROM news_articles na
+                    LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
+                    WHERE na.symbol_id = %s
+                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
+                      AND (na.title ILIKE %s OR na.full_text ILIKE %s)
+                    ORDER BY na.published_at DESC NULLS LAST
+                    LIMIT %s OFFSET %s
+                """, (sym_id, f"%{keyword}%", f"%{keyword}%", per_page, offset))
+            else:
+                cur.execute("""
+                    SELECT
+                        na.id, na.title, na.url, na.published_at, na.inserted_at,
+                        na.full_text,
+                        rf.feed_url
+                    FROM news_articles na
+                    LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
+                    WHERE na.symbol_id = %s
+                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
+                    ORDER BY na.published_at DESC NULLS LAST
+                    LIMIT %s OFFSET %s
+                """, (sym_id, per_page, offset))
             articles = cur.fetchall()
     finally:
         conn.close()
 
-    if not articles and page == 1:
-        return HTMLResponse('<div class="empty-state">No news articles yet — run main.py to ingest</div>')
+    # ── Search box (always shown at top of news tab) ──────────────────────────
+    q_safe = keyword.replace('"', '&quot;')
+    html = f"""
+    <div style="padding:12px 16px 0">
+      <input type="text" id="news-search-{sym_id}" placeholder="Search keywords (FDA, patent, groundbreaking…)"
+        value="{q_safe}"
+        hx-get="/symbol/{sym_id}/news"
+        hx-trigger="keyup changed delay:300ms"
+        hx-target="#tab-content-{sym_id}"
+        hx-include="#news-search-{sym_id}"
+        name="q"
+        autocomplete="off"
+        style="width:100%"
+      />
+    </div>
+    """
 
-    html = ""
+    if not articles and page == 1:
+        if keyword:
+            html += f'<div class="empty-state">No articles matching <strong>{q_safe}</strong></div>'
+        else:
+            html += '<div class="empty-state">No news articles yet — run main.py to ingest</div>'
+        return HTMLResponse(html)
+
     for a in articles:
         pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "Unknown date"
         preview = ""
@@ -639,7 +896,6 @@ async def symbol_news(sym_id: int, page: int = 1):
         feed_chip = f'<span class="chip chip-gray" title="{a["feed_url"] or ""}">{(a["feed_url"] or "?")[:40]}…</span>' \
                     if a["feed_url"] and len(a["feed_url"]) > 40 \
                     else f'<span class="chip chip-gray">{a["feed_url"] or "unknown feed"}</span>'
-        title_safe = (a["title"] or "Untitled").replace('"', "&quot;")
         html += f"""
         <div class="news-card">
           <a class="news-title" href="{a['url']}" target="_blank">{a['title'] or 'Untitled'}</a>
@@ -650,21 +906,120 @@ async def symbol_news(sym_id: int, page: int = 1):
           {'<div class="news-preview">' + preview + '</div>' if preview else ''}
         </div>"""
 
-    # pagination
+    # ── Pagination (preserves keyword) ────────────────────────────────────────
     total_pages = max(1, (total + per_page - 1) // per_page)
+    q_param = f"&q={q_safe}" if keyword else ""
     if total_pages > 1:
         html += '<div class="pagination">'
         if page > 1:
-            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page-1}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Prev</button>'
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page-1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Prev</button>'
         html += f'<span style="color:#475569;font-size:.8rem;padding:5px 10px">Page {page} / {total_pages} &nbsp;·&nbsp; {total} articles</span>'
         if page < total_pages:
-            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page+1}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">Next →</button>'
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page+1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">Next →</button>'
         html += '</div>'
 
     return HTMLResponse(html)
 
 
-# ── Shared card renderer ───────────────────────────────────────────────────────
+# ── SEC Filings route ─────────────────────────────────────────────────────────
+
+@app.get("/symbol/{sym_id}/sec", response_class=HTMLResponse)
+async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
+    per_page = 20
+    offset   = (page - 1) * per_page
+    keyword  = q.strip()
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if keyword:
+                cur.execute("""
+                    SELECT COUNT(*) AS total FROM news_articles
+                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                      AND (title ILIKE %s OR full_text ILIKE %s)
+                """, (sym_id, f"%{keyword}%", f"%{keyword}%"))
+            else:
+                cur.execute("""
+                    SELECT COUNT(*) AS total FROM news_articles
+                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                """, (sym_id,))
+            total = cur.fetchone()["total"]
+
+            if keyword:
+                cur.execute("""
+                    SELECT id, title, url, published_at, inserted_at, full_text
+                    FROM news_articles
+                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                      AND (title ILIKE %s OR full_text ILIKE %s)
+                    ORDER BY published_at DESC NULLS LAST
+                    LIMIT %s OFFSET %s
+                """, (sym_id, f"%{keyword}%", f"%{keyword}%", per_page, offset))
+            else:
+                cur.execute("""
+                    SELECT id, title, url, published_at, inserted_at, full_text
+                    FROM news_articles
+                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                    ORDER BY published_at DESC NULLS LAST
+                    LIMIT %s OFFSET %s
+                """, (sym_id, per_page, offset))
+            filings = cur.fetchall()
+    finally:
+        conn.close()
+
+    q_safe = keyword.replace('"', '&quot;')
+    html = f"""
+    <div style="padding:12px 16px 0">
+      <input type="text" id="sec-search-{sym_id}" placeholder="Search SEC filings (merger, acquisition, CEO…)"
+        value="{q_safe}"
+        hx-get="/symbol/{sym_id}/sec"
+        hx-trigger="keyup changed delay:300ms"
+        hx-target="#tab-content-{sym_id}"
+        hx-include="#sec-search-{sym_id}"
+        name="q"
+        autocomplete="off"
+        style="width:100%"
+      />
+    </div>
+    """
+
+    if not filings and page == 1:
+        if keyword:
+            html += f'<div class="empty-state">No SEC filings matching <strong>{q_safe}</strong></div>'
+        else:
+            html += '<div class="empty-state">No SEC filings yet — enable EDGAR pipeline in pipeline_config.py</div>'
+        return HTMLResponse(html)
+
+    for a in filings:
+        pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "Unknown date"
+        preview = ""
+        if a["full_text"]:
+            preview = a["full_text"][:300].replace("<", "&lt;").replace(">", "&gt;")
+            if len(a["full_text"]) > 300:
+                preview += "…"
+        html += f"""
+        <div class="news-card">
+          <a class="news-title" href="{a['url']}" target="_blank">{a['title'] or 'Untitled 8-K'}</a>
+          <div class="news-meta">
+            <span class="news-date">📅 {pub}</span>
+            <span class="chip chip-blue">SEC 8-K</span>
+          </div>
+          {'<div class="news-preview">' + preview + '</div>' if preview else ''}
+        </div>"""
+
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    q_param = f"&q={q_safe}" if keyword else ""
+    if total_pages > 1:
+        html += '<div class="pagination">'
+        if page > 1:
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/sec?page={page-1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Prev</button>'
+        html += f'<span style="color:#475569;font-size:.8rem;padding:5px 10px">Page {page} / {total_pages} &nbsp;·&nbsp; {total} filings</span>'
+        if page < total_pages:
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/sec?page={page+1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">Next →</button>'
+        html += '</div>'
+
+    return HTMLResponse(html)
+
+
+
 
 def _feed_card_html(f) -> str:
     active_chip = '<span class="chip chip-green">ACTIVE</span>' if f['is_active'] else '<span class="chip chip-red">INACTIVE</span>'

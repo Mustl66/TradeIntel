@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS rss_feeds (
     symbol_id       INTEGER      NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     feed_url        TEXT         NOT NULL,
     feed_type       VARCHAR(20)  NOT NULL DEFAULT 'unknown'
-                    CHECK (feed_type IN ('rss', 'atom', 'unknown')),
+                    CHECK (feed_type IN ('rss', 'atom', 'html', 'unknown')),
     source          VARCHAR(50)  NOT NULL DEFAULT 'globenewswire'
                     CHECK (source IN ('globenewswire', 'company_ir', 'other')),
     is_active       BOOLEAN      NOT NULL DEFAULT TRUE,

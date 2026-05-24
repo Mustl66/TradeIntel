@@ -182,7 +182,6 @@ def load_target_symbols(conn, exchange: str, limit: int) -> list[dict]:
                 ) AS has_rss
             FROM symbols s
             WHERE s.exchange = %s
-              AND s.status = TRUE
             ORDER BY s.symbol
             """ + ("LIMIT %s" if limit > 0 else ""),
             (exchange_upper, limit) if limit > 0 else (exchange_upper,)
