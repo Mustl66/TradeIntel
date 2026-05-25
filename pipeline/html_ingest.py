@@ -120,7 +120,7 @@ _HEADER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
@@ -131,7 +131,7 @@ _HEADER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
+
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
@@ -142,14 +142,14 @@ _HEADER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+
         "Connection": "keep-alive",
     },
     {   # Edge 124 / Windows
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+
         "Connection": "keep-alive",
     },
 ]
@@ -428,9 +428,9 @@ def _handle_yahoo_finance(url: str, symbol: str, feed_id: int, symbol_id: int) -
         full_text = ""
         try:
             _delay()
-            downloaded = trafilatura.fetch_url(link)
-            if downloaded:
-                extracted = trafilatura.extract(downloaded, include_comments=False,
+            resp_tf = requests.get(link, headers=_headers(), timeout=10, allow_redirects=True)
+            if resp_tf.status_code == 200:
+                extracted = trafilatura.extract(resp_tf.text, include_comments=False,
                                                 include_tables=False)
                 full_text = (extracted or "")[:MAX_FULL_TEXT_LEN]
         except Exception as e:
@@ -498,796 +498,301 @@ def _handle_nasdaq_page(url: str, symbol: str, feed_id: int, symbol_id: int) -> 
 
     try:
         _delay()
+
+        _delay()
         if _USE_CFFI:
-            r = cffi_req.get(api_url, headers=api_headers, impersonate="chrome124",
-                             timeout=REQUEST_TIMEOUT)
+            resp = cffi_req.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT, impersonate="chrome124")
         else:
-            r = requests.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT)
-
-        if r.status_code != 200:
-            logger.warning(f"[{symbol}] Nasdaq API returned {r.status_code}")
+            resp = requests.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning(f"[{symbol}] Nasdaq API HTTP {resp.status_code}: {api_url}")
             return []
-
-        data = r.json()
-        rows = data.get("data", {}).get("rows", [])
-        if not rows:
-            logger.debug(f"[{symbol}] Nasdaq API — no rows for {ticker}")
-            return []
-
-        logger.info(f"[{symbol}] Nasdaq API — {len(rows)} press releases found")
-        arts = []
-
-        for row in rows:
-            title = (row.get("title") or "").strip()
-            rel_url = (row.get("url") or "").strip()
-            created_str = (row.get("created") or row.get("ago") or "").strip()
-            if not title or not rel_url:
-                continue
-
-            article_url = f"https://www.nasdaq.com{rel_url}"
-
-            # Parse date
-            pub_dt = None
-            if created_str:
-                try:
-                    pub_dt = dateutil_parser.parse(created_str, fuzzy=True)
-                    if pub_dt.tzinfo is None:
-                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    pub_dt = None
-
-            # Fetch full article body
-            full_text = ""
-            try:
-                _delay()
-                art_headers = dict(api_headers)
-                art_headers["Accept"] = "text/html,*/*"
-                if _USE_CFFI:
-                    ar = cffi_req.get(article_url, headers=art_headers,
-                                      impersonate="chrome124", timeout=REQUEST_TIMEOUT)
-                else:
-                    ar = requests.get(article_url, headers=art_headers,
-                                      timeout=REQUEST_TIMEOUT)
-                if ar.status_code == 200:
-                    soup = _make_soup(ar.text, "lxml")
-                    body = soup.select_one("div.body__content")
-                    if body:
-                        full_text = body.get_text(separator="\n", strip=True)[:MAX_FULL_TEXT_LEN]
-            except Exception as e:
-                logger.debug(f"[{symbol}] Nasdaq article fetch failed: {e}")
-
-            article_hash = hashlib.sha256(
-                f"{symbol_id}:{article_url}".encode()
-            ).hexdigest()
-
-            arts.append({
-                "symbol_id":    symbol_id,
-                "feed_id":      feed_id,
-                "title":        title,
-                "url":          article_url,
-                "published_at": pub_dt,
-                "full_text":    full_text,
-                "source_name":  "nasdaq_api",
-                "summary":      "",
-                "author":       "",
-                "article_hash": article_hash,
-            })
-
-        return arts
-
-    except Exception as e:
-        logger.error(f"[{symbol}] Nasdaq API error: {e}", exc_info=True)
+        data = resp.json()
+    except Exception as exc:
+        logger.warning(f"[{symbol}] Nasdaq API error: {exc}")
         return []
 
+    rows = (data.get("data") or {}).get("rows") or []
+    if not rows:
+        logger.debug(f"[{symbol}] Nasdaq: 0 rows from API")
+        return []
 
-def _handle_q4ir_api(url: str, symbol: str,
-                     feed_id: int, symbol_id: int) -> list[dict]:
+    articles = []
+    for row in rows:
+        title = (row.get("title") or "").strip()
+        slug  = (row.get("url") or "").strip()
+        date_str = row.get("date", "")
+        if not title or not slug:
+            continue
+        art_url = f"https://www.nasdaq.com{slug}" if slug.startswith("/") else slug
+        pub_dt = None
+        try:
+            pub_dt = dateutil_parser.parse(date_str).replace(tzinfo=timezone.utc)
+        except Exception:
+            pub_dt = datetime.now(timezone.utc)
+
+        art_hash = hashlib.sha256(f"{art_url}|{title}".encode()).hexdigest()
+        articles.append({
+            "symbol_id":    symbol_id,
+            "feed_id":      feed_id,
+            "title":        title,
+            "url":          art_url,
+            "published_at": pub_dt,
+            "summary":      "",
+            "full_text":    "",
+            "author":       "",
+            "source_name":  "nasdaq",
+            "article_hash": art_hash,
+        })
+
+    logger.info(f"[{symbol}] Nasdaq API -> {len(articles)} articles from {url}")
+    return articles
+
+
+def _handle_q4ir_api(url: str, symbol: str, feed_id: int, symbol_id: int) -> list:
+    """Q4 Inc IR platform - default.aspx pages.
+    Hidden API: GET {base}/feed/PressRelease.svc/GetPressReleaseList
+                    ?bodyType=2&pageSize=-1&year=-1
+    Returns full article list + bodies inline.
     """
-    Q4 Inc. / Cision IR platform — GetPressReleaseList JSON API.
-
-    Every site on the Q4 platform (investors.*.com/press-releases/default.aspx,
-    ir.*.com/news/default.aspx, etc.) exposes a single endpoint:
-        {base}/feed/PressRelease.svc/GetPressReleaseList
-
-    bodyType=2 returns full HTML body inline — no detail-page fetches needed.
-    year=-1 returns ALL years in one call.
-    """
-    from curl_cffi import requests as cffi_requests
+    try:
+        from curl_cffi import requests as cffi_req
+        _USE_CFFI = True
+    except ImportError:
+        _USE_CFFI = False
 
     parsed = urlparse(url)
     base   = f"{parsed.scheme}://{parsed.netloc}"
-    api_url = f"{base}/feed/PressRelease.svc/GetPressReleaseList"
-    params = {
-        "LanguageId":            "1",
-        "bodyType":              "2",       # full HTML body inline
-        "pressReleaseDateFilter":"3",
-        "categoryId":            "00000000-0000-0000-0000-000000000000",
-        "pageSize":              "-1",      # all articles
-        "pageNumber":            "0",
-        "tagList":               "",
-        "includeTags":           "true",
-        "year":                  "-1",      # all years
-        "excludeSelection":      "1",
-    }
-    headers = {
+    api_url = (
+        f"{base}/feed/PressRelease.svc/GetPressReleaseList"
+        f"?bodyType=2&pageSize=-1&year=-1&includeTags=true&tagList="
+    )
+    api_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":     "application/json, text/javascript, */*; q=0.01",
-        "Referer":    url,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": url,
+        "X-Requested-With": "XMLHttpRequest",
     }
 
-    _delay()
     try:
-        r = cffi_requests.get(api_url, params=params, headers=headers,
-                               impersonate="chrome124", timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            logger.warning(f"[{symbol}] Q4 API HTTP {r.status_code}: {api_url}")
+        _delay()
+        if _USE_CFFI:
+            resp = cffi_req.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT, impersonate="chrome124")
+        else:
+            resp = requests.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning(f"[{symbol}] Q4 API HTTP {resp.status_code}: {api_url}")
             return []
-        data  = r.json()
-        items = data.get("GetPressReleaseListResult", [])
-        if not items:
-            return []
-    except Exception as e:
-        logger.warning(f"[{symbol}] Q4 API error: {e}")
+        data = resp.json()
+    except Exception as exc:
+        logger.warning(f"[{symbol}] Q4 API error: {exc}")
         return []
 
-    arts = []
+    items = data if isinstance(data, list) else (data.get("items") or data.get("GetPressReleaseListResult") or [])
+    if not items:
+        logger.debug(f"[{symbol}] Q4 API: 0 items from {api_url}")
+        return []
+
+    articles = []
     for item in items:
-        headline = (item.get("Headline") or item.get("Title") or "").strip()
-        if not headline:
+        title     = (item.get("Headline") or item.get("title") or "").strip()
+        slug      = (item.get("LinkToDetailPage") or item.get("url") or "").strip()
+        body_html = (item.get("Body") or item.get("body") or "").strip()
+        date_str  = item.get("PressReleaseDate") or item.get("date") or ""
+
+        if not title:
             continue
 
-        link     = item.get("LinkToDetailPage", "") or ""
-        full_url = (base + link) if link.startswith("/") else (link or url)
+        art_url = (f"{base}{slug}" if slug and slug.startswith("/") else slug) or f"{base}/press-releases"
 
-        # Parse date: "MM/DD/YYYY HH:MM:SS"
-        raw_date = item.get("PressReleaseDate", "")
-        published = None
-        if raw_date:
-            try:
-                published = datetime.strptime(raw_date, "%m/%d/%Y %H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
-            except ValueError:
-                try:
-                    published = dateutil_parser.parse(raw_date)
-                except Exception:
-                    pass
+        pub_dt = None
+        try:
+            pub_dt = dateutil_parser.parse(date_str).replace(tzinfo=timezone.utc)
+        except Exception:
+            pub_dt = datetime.now(timezone.utc)
 
-        # Full text from inline HTML body
-        body_html = item.get("Body") or ""
         full_text = ""
         if body_html:
-            full_text = _make_soup(body_html, "lxml").get_text(" ", strip=True)
-        summary   = (item.get("ShortDescription") or item.get("ShortBody") or "").strip()
+            try:
+                soup = _make_soup(body_html, "lxml")
+                full_text = soup.get_text(separator=" ", strip=True)[:MAX_FULL_TEXT_LEN]
+            except Exception:
+                full_text = body_html[:MAX_FULL_TEXT_LEN]
 
-        art_hash = hashlib.sha256(
-            f"{symbol_id}:{full_url}:{headline}".encode()
-        ).hexdigest()
-
-        arts.append({
+        art_hash = hashlib.sha256(f"{art_url}|{title}".encode()).hexdigest()
+        articles.append({
             "symbol_id":    symbol_id,
             "feed_id":      feed_id,
-            "title":        headline[:1000],
-            "url":          full_url,
-            "published_at": published,
-            "full_text":    full_text[:MAX_FULL_TEXT_LEN],
-            "summary":      summary[:500],
+            "title":        title,
+            "url":          art_url,
+            "published_at": pub_dt,
+            "summary":      "",
+            "full_text":    full_text,
             "author":       "",
             "source_name":  "q4ir",
             "article_hash": art_hash,
         })
 
-    logger.info(f"[{symbol}] Q4 API → {len(arts)} articles from {base}")
-    return arts
-
-
-def _handle_prnewswire(url: str, symbol: str,
-                       feed_id: int, symbol_id: int) -> list[dict]:
-    """
-    PRNewswire company pages: fetch the listing page and extract article links,
-    then scrape each article page.
-    Pattern: https://www.prnewswire.com/news/{company-slug}/
-    """
-    resp = _fetch(url)
-    if not resp:
-        return []
-
-    soup = _make_soup(resp.content, "lxml")
-    arts = []
-    seen = set()
-
-    # PRNewswire uses class="newsreleaseconsolidatelink" on article anchors
-    # href pattern: /news-releases/{slug}-NNNNNN.html  (no date in path)
-    for a in soup.find_all("a", class_=re.compile(r"newsreleaseconsolidatelink", re.I)):
-        href = a.get("href", "").strip()
-        if not href or href in seen:
-            continue
-        seen.add(href)
-        full_url = urljoin("https://www.prnewswire.com", href)
-
-        # Title + date are both in the link text: "Nov 28, 2025, 09:01 ETAbove Food..."
-        raw_text = a.get_text(strip=True)
-        # Split on ET — date prefix is everything before "ET", title is after
-        if "ET" in raw_text:
-            parts = raw_text.split("ET", 1)
-            date_part  = parts[0].strip()
-            title_part = parts[1].strip() if len(parts) > 1 else raw_text
-        else:
-            date_part  = ""
-            title_part = raw_text
-
-        title = title_part if len(title_part) >= 10 else raw_text
-        if len(title) < 10:
-            continue
-
-        pub_at = _parse_date(date_part) if date_part else datetime.now(timezone.utc)
-        if pub_at is None:
-            pub_at = datetime.now(timezone.utc)
-
-        arts.append({
-            "symbol_id":    symbol_id,
-            "feed_id":      feed_id,
-            "article_hash": _article_hash(full_url, title, pub_at),
-            "url":          full_url,
-            "title":        title,
-            "summary":      None,
-            "full_text":    None,
-            "published_at": pub_at,
-            "author":       None,
-            "source_name":  "prnewswire",
-        })
-
-    # Alternate: PRNewswire has RSS for company search
-    # Try: https://www.prnewswire.com/rss/news-releases-list.rss?name={slug}
-    if not arts:
-        slug_m = re.search(r"/news/([^/]+)/?$", url.lower())
-        if slug_m:
-            slug    = slug_m.group(1)
-            rss_url = f"https://www.prnewswire.com/rss/news-releases-list.rss?name={slug}"
-            _delay()
-            try:
-                rss_resp = requests.get(rss_url, headers=_headers(), timeout=REQUEST_TIMEOUT)
-                rss_resp.raise_for_status()
-                parsed = feedparser.parse(rss_resp.content)
-                if parsed.entries:
-                    arts = _entries_to_articles(parsed.entries, symbol_id, feed_id, "prnewswire_rss")
-            except Exception:
-                pass
-
-    return arts
-
-
-def _handle_businesswire(url: str, symbol: str,
-                          feed_id: int, symbol_id: int) -> list[dict]:
-    """
-    BusinessWire company pages — they have RSS at:
-    https://feed.businesswire.com/rss/home/?rss=G1&company={ticker}
-    """
-    ticker  = symbol.upper()
-    rss_url = f"https://feed.businesswire.com/rss/home/?rss=G1&company={ticker}"
-    entries = _fetch_rss(rss_url)
-    if entries:
-        return _entries_to_articles(entries, symbol_id, feed_id, "businesswire_rss")
-    return []
-
-
-def _handle_globenewswire_listing(url: str, symbol: str,
-                                  feed_id: int, symbol_id: int) -> list[dict]:
-    """
-    GlobeNewswire search/organization pages.
-    Pattern: https://www.globenewswire.com/en/search/organization/{Company+Name}
-             https://www.globenewswire.com/en/search/keyword/{TICKER}
-    Strategy: scrape article links from the search results page directly.
-    Article links follow pattern: /news-release/YYYY/MM/DD/NNNNNN/...
-    """
-    # Single article page — skip, handled by full-text scraper elsewhere
-    if re.search(r"globenewswire\.com/(?:en/)?news-release/\d+", url):
-        return []
-
-    resp = _fetch(url)
-    if not resp:
-        return []
-
-    soup = _make_soup(resp.content, "lxml")
-    arts = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not re.search(r"/news-release/\d{4}/", href):
-            continue
-        full_url = ("https://www.globenewswire.com" + href
-                    if href.startswith("/") else href)
-        if full_url in seen:
-            continue
-        seen.add(full_url)
-
-        title = a.get_text(strip=True)
-        if len(title) < 10:
-            continue
-
-        # Extract date from URL path: /news-release/YYYY/MM/DD/
-        m = re.search(r"/news-release/(\d{4})/(\d{2})/(\d{2})/", href)
-        if m:
-            pub_at = datetime(int(m.group(1)), int(m.group(2)),
-                              int(m.group(3)), tzinfo=timezone.utc)
-        else:
-            pub_at = datetime.now(timezone.utc)
-
-        arts.append({
-            "symbol_id":    symbol_id,
-            "feed_id":      feed_id,
-            "article_hash": _article_hash(full_url, title, pub_at),
-            "url":          full_url,
-            "title":        title,
-            "summary":      None,
-            "full_text":    None,
-            "published_at": pub_at,
-            "author":       None,
-            "source_name":  "globenewswire_scrape",
-        })
-
-    return arts
-
-
-# ── Layer 3: JSON-LD extraction ────────────────────────────────────────────────
-
-_JSONLD_ARTICLE_TYPES = {
-    "newsarticle", "article", "pressrelease", "blogposting",
-    "financialarticle", "reportage"
-}
-
-
-def _extract_jsonld(html: bytes, base_url: str) -> list[dict]:
-    """Parse <script type="application/ld+json"> for article objects."""
-    articles = []
-    try:
-        soup = _make_soup(html, "lxml")
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-            except Exception:
-                continue
-
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if "@graph" in item:
-                    items = items + item["@graph"]
-                    continue
-
-                t = item.get("@type", "")
-                if isinstance(t, list):
-                    t = " ".join(t)
-                if not any(at in t.lower() for at in _JSONLD_ARTICLE_TYPES):
-                    continue
-
-                url = item.get("url") or item.get("mainEntityOfPage", {})
-                if isinstance(url, dict):
-                    url = url.get("@id", "")
-                url = str(url).strip()
-                if not url.startswith("http"):
-                    url = urljoin(base_url, url)
-
-                title = (item.get("headline") or item.get("name") or "").strip()
-                if not title or not url:
-                    continue
-
-                pub_at = _parse_date(
-                    item.get("datePublished") or item.get("dateCreated")
-                ) or datetime.now(timezone.utc)
-
-                body = str(item.get("articleBody") or item.get("text") or "").strip()
-                author_raw = item.get("author")
-                author = None
-                if isinstance(author_raw, dict):
-                    author = author_raw.get("name")
-                elif isinstance(author_raw, str):
-                    author = author_raw
-
-                articles.append({
-                    "url": url, "title": title, "published_at": pub_at,
-                    "full_text": body or None, "author": author,
-                })
-    except Exception as exc:
-        logger.debug(f"JSON-LD parse error: {exc}")
+    logger.info(f"[{symbol}] Q4 API -> {len(articles)} articles from {base}")
     return articles
 
 
-# ── Layer 4: Trafilatura + LM Studio ──────────────────────────────────────────
-
-def _extract_trafilatura(html: bytes, url: str) -> Optional[dict]:
-    if not _TRAFILATURA_AVAILABLE:
-        return None
-    try:
-        result = trafilatura.extract(
-            html, url=url, output_format="json",
-            include_metadata=True, include_links=False,
-            no_fallback=False, favor_precision=True,
-        )
-        if not result:
-            return None
-        data    = json.loads(result)
-        title   = data.get("title", "").strip()
-        text    = data.get("text", "").strip()
-        pub_at  = _parse_date(data.get("date")) or datetime.now(timezone.utc)
-        if not title or len(text) < 200:
-            return None
-        return {
-            "url": url, "title": title, "published_at": pub_at,
-            "full_text": text[:MAX_FULL_TEXT_LEN],
-            "author": data.get("author"),
-        }
-    except Exception as exc:
-        logger.debug(f"Trafilatura failed on {url}: {exc}")
-        return None
-
-
-_LM_SYSTEM = (
-    "You are a financial news content validator. "
-    "Given a page title and extracted text, determine if this is a genuine financial "
-    "news article (earnings, M&A, product launch, regulatory filing, executive change, etc). "
-    'Respond ONLY with JSON: {"valid": true/false, "reason": "one sentence", '
-    '"cleaned_title": "...", "cleaned_body": "first 3 sentences"}'
-)
-
-
-def _lm_quality_gate(title: str, text: str) -> dict:
-    """LM Studio validation. Fails open (returns valid=True) if LM is unreachable."""
-    payload = {
-        "model": LM_STUDIO_MODEL,
-        "messages": [
-            {"role": "system", "content": _LM_SYSTEM},
-            {"role": "user",   "content": f"Title: {title}\n\nText:\n{text[:1000]}"},
-        ],
-        "max_tokens": LM_MAX_TOKENS,
-        "temperature": 0.1,
-    }
-    try:
-        resp = requests.post(LM_STUDIO_URL, json=payload, timeout=LM_TIMEOUT)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-    except Exception as exc:
-        logger.debug(f"LM Studio gate failed (fail-open): {exc}")
-    return {"valid": True, "cleaned_title": title, "cleaned_body": text}
-
-
-# ── Platform detection ────────────────────────────────────────────────────────
-
-def _detect_platform(url: str) -> Optional[str]:
-    low = url.lower()
-    if _SKIP_DOMAINS and any(d in low for d in _SKIP_DOMAINS):
-        return "skip"
-    if "mynewsdesk.com" in low:
-        return "mynewsdesk"
-    if "finance.yahoo.com" in low and ("press-releases" in low or "quote" in low):
-        return "yahoo"
-    if ("nasdaq.com/market-activity/stocks/" in low and "press-releases" in low) \
-            or "nasdaq.com/api/news/topic/press_release" in low:
-        return "nasdaq"
-    if "prnewswire.com/news/" in low:
-        return "prnewswire"
-    if "businesswire.com" in low:
-        return "businesswire"
-    if "globenewswire.com" in low:
-        return "globenewswire"
-    # Q4IR / Cision: investors.*.com ending in default.aspx
-    if "default.aspx" in low or (
-        re.search(r"investors?\.", low) and "press-release" in low
-    ):
+def _detect_platform(url: str) -> str:
+    u = url.lower()
+    if "default.aspx" in u:
         return "q4ir"
-    return None
+    if "nasdaq.com" in u:
+        return "nasdaq"
+    if "finance.yahoo.com" in u:
+        return "yahoo"
+    if "mynewsdesk.com" in u:
+        return "mynewsdesk"
+    return "generic"
 
 
-# ── Per-feed processor ────────────────────────────────────────────────────────
-
-def _process_html_feed(feed_row: dict) -> dict:
-    feed_id   = feed_row["id"]
-    symbol_id = feed_row["symbol_id"]
-    symbol    = feed_row["symbol"]
-    url       = feed_row["feed_url"]
-
-    result = {
-        "feed_id":   feed_id,
-        "symbol_id": symbol_id,
-        "symbol":    symbol,
-        "url":       url,
-        "rss_found": None,
-        "articles":  [],
-        "method":    None,
-    }
-
-    # ── Skip list ──────────────────────────────────────────────────────────
-    platform = _detect_platform(url)
-    if platform == "skip":
-        logger.debug(f"[{symbol}] Skipping JS-only platform: {url}")
-        result["method"] = "skip"
-        return result
-
-    # ── Platform-specific handlers ─────────────────────────────────────────
-    if platform == "mynewsdesk":
-        arts = _handle_mynewsdesk(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "mynewsdesk"
-            return result
-
-    if platform == "yahoo":
-        arts = _handle_yahoo_finance(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "yahoo_api"
-            return result
-
-    if platform == "nasdaq":
-        arts = _handle_nasdaq_page(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "nasdaq_api"
-            return result
-
-    if platform == "prnewswire":
-        arts = _handle_prnewswire(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "prnewswire"
-            return result
-
-    if platform == "businesswire":
-        arts = _handle_businesswire(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "businesswire"
-            return result
-
-    if platform == "q4ir":
-        arts = _handle_q4ir_api(url, symbol, feed_id, symbol_id)
-        if arts:
-            result["articles"] = arts
-            result["method"]   = "q4ir_api"
-            return result
-
-    # ── Fetch page for generic layers ──────────────────────────────────────
-    resp = _fetch(url)
-    if resp is None:
-        return result
-
-    html = resp.content
-
-    # ── Layer 1: RSS Autodiscovery ─────────────────────────────────────────
-    rss_url = _discover_rss_in_html(url, html)
-    if rss_url:
-        logger.info(f"[{symbol}] RSS autodiscovered: {rss_url}")
-        entries = _fetch_rss(rss_url)
-        if entries:
-            result["rss_found"] = rss_url
-            result["method"]    = "rss_autodiscovery"
-            result["articles"]  = _entries_to_articles(
-                entries, symbol_id, feed_id, "autodiscovered_rss"
-            )
-            return result
-
-    # ── Layer 3: JSON-LD ───────────────────────────────────────────────────
-    jsonld_arts = _extract_jsonld(html, url)
-    if jsonld_arts:
-        result["method"] = "json-ld"
-        for art in jsonld_arts:
-            result["articles"].append({
-                "symbol_id":    symbol_id,
-                "feed_id":      feed_id,
-                "article_hash": _article_hash(art["url"], art["title"], art["published_at"]),
-                "url":          art["url"],
-                "title":        art["title"],
-                "summary":      None,
-                "full_text":    art.get("full_text"),
-                "published_at": art["published_at"],
-                "author":       art.get("author"),
-                "source_name":  "json-ld",
-            })
-        return result
-
-    # ── Layer 4: Trafilatura + LM Studio ──────────────────────────────────
-    traf = _extract_trafilatura(html, url)
-    if traf:
-        gate = _lm_quality_gate(traf["title"], traf["full_text"] or "")
-        if not gate.get("valid", True):
-            logger.debug(f"[{symbol}] LM gate rejected: {gate.get('reason')}")
-            return result
-
-        clean_title = gate.get("cleaned_title") or traf["title"]
-        clean_body  = gate.get("cleaned_body")  or traf["full_text"]
-        result["method"] = "trafilatura+lm"
-        result["articles"].append({
-            "symbol_id":    symbol_id,
-            "feed_id":      feed_id,
-            "article_hash": _article_hash(url, clean_title, traf["published_at"]),
-            "url":          url,
-            "title":        clean_title,
-            "summary":      None,
-            "full_text":    str(clean_body)[:MAX_FULL_TEXT_LEN] if clean_body else None,
-            "published_at": traf["published_at"],
-            "author":       traf.get("author"),
-            "source_name":  "html_scrape",
-        })
-
-    return result
-
-
-# ── DB helpers ────────────────────────────────────────────────────────────────
-
-def _get_html_feeds(conn, exchange: str, limit: int) -> list[dict]:
-    sql = """
-        SELECT rf.id AS id, rf.symbol_id AS symbol_id,
-               rf.feed_url AS feed_url, s.symbol AS symbol
-        FROM rss_feeds rf
-        JOIN symbols s ON s.id = rf.symbol_id
-        WHERE rf.feed_type = 'html'
-          AND rf.is_active = TRUE
-          AND s.exchange   = %s
-        ORDER BY s.symbol
-    """
-    if limit > 0:
-        sql += f" LIMIT {limit}"
-    with conn.cursor() as cur:
-        cur.execute(sql, (exchange,))
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def _known_hashes(conn, hashes: list[str]) -> set[str]:
-    if not hashes:
-        return set()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT article_hash FROM news_articles WHERE article_hash = ANY(%s)",
-            (hashes,)
-        )
-        return {row[0] for row in cur.fetchall()}
-
-
-def _insert_articles(conn, articles: list[dict]) -> int:
+def _save_articles(articles: list, conn) -> int:
     if not articles:
         return 0
-    sql = """
-        INSERT INTO news_articles
-            (symbol_id, feed_id, article_hash, url, title,
-             summary, full_text, published_at, author, source_name)
-        VALUES
-            (%(symbol_id)s, %(feed_id)s, %(article_hash)s, %(url)s, %(title)s,
-             %(summary)s, %(full_text)s, %(published_at)s, %(author)s, %(source_name)s)
-        ON CONFLICT (article_hash) DO NOTHING
-    """
-    with conn.cursor() as cur:
-        cur.executemany(sql, articles)
+    cur = conn.cursor()
+    inserted = 0
+    for art in articles:
+        try:
+            cur.execute(
+                """
+                INSERT INTO news_articles
+                    (symbol_id, feed_id, article_hash, url, title,
+                     summary, full_text, published_at, author, source_name)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    art["symbol_id"], art["feed_id"], art["article_hash"],
+                    art["url"], art["title"], art.get("summary"),
+                    art.get("full_text"), art.get("published_at"),
+                    art.get("author"), art.get("source_name"),
+                ),
+            )
+            if cur.rowcount:
+                inserted += 1
+        except Exception as exc:
+            logger.debug(f"[html_ingest] insert error: {exc}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
     conn.commit()
-    return len(articles)
+    cur.close()
+    return inserted
 
 
-def _promote_to_rss(conn, feed_id: int, rss_url: str) -> bool:
-    """Register newly discovered RSS URL. Returns True if new row inserted."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT id FROM rss_feeds WHERE feed_url = %s", (rss_url,))
-        if cur.fetchone():
-            return False
-        cur.execute("SELECT symbol_id, source FROM rss_feeds WHERE id = %s", (feed_id,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        symbol_id, source = row
+def _process_html_feed(feed: dict) -> tuple:
+    symbol    = feed["symbol"]
+    url       = feed["feed_url"]
+    feed_id   = feed["feed_id"]
+    symbol_id = feed["symbol_id"]
+    platform  = _detect_platform(url)
+
+    try:
+        if platform == "q4ir":
+            articles = _handle_q4ir_api(url, symbol, feed_id, symbol_id)
+        elif platform == "nasdaq":
+            articles = _handle_nasdaq_page(url, symbol, feed_id, symbol_id)
+        elif platform == "yahoo":
+            articles = _handle_yahoo_finance(url, symbol, feed_id, symbol_id)
+        elif platform == "mynewsdesk":
+            articles = _handle_mynewsdesk(url, symbol, feed_id, symbol_id)
+        else:
+            resp = _fetch(url)
+            if resp is None:
+                return symbol, 0
+            rss_url = _discover_rss_in_html(url, resp.content)
+            if rss_url:
+                entries  = _fetch_rss(rss_url)
+                articles = _entries_to_articles(entries, symbol_id, feed_id, "rss_autodiscovered")
+            else:
+                return symbol, 0
+
+        if not articles:
+            return symbol, 0
+
+        conn = get_connection()
+        n = _save_articles(articles, conn)
+        conn.close()
+        return symbol, n
+
+    except BaseException as exc:
+        logger.warning(f"[{symbol}] html_ingest error ({type(exc).__name__}): {exc}")
+        return symbol, 0
+
+
+def _get_html_feeds(exchange: str, limit: int, symbol_limit) -> list:
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    if exchange:
         cur.execute(
             """
-            INSERT INTO rss_feeds (symbol_id, feed_url, feed_type, source, is_active)
-            VALUES (%s, %s, 'rss', %s, TRUE)
-            ON CONFLICT (feed_url) DO NOTHING
+            SELECT f.id, f.feed_url, s.id, s.symbol
+            FROM rss_feeds f
+            JOIN symbols s ON s.id = f.symbol_id
+            WHERE f.feed_type = 'html'
+              AND s.exchange = %s
+            ORDER BY s.symbol
             """,
-            (symbol_id, rss_url, source)
+            (exchange,),
         )
-    conn.commit()
-    return True
+    else:
+        cur.execute(
+            """
+            SELECT f.id, f.feed_url, s.id, s.symbol
+            FROM rss_feeds f
+            JOIN symbols s ON s.id = f.symbol_id
+            WHERE f.feed_type = 'html'
+            ORDER BY s.symbol
+            """
+        )
 
-
-# ── Main entry point ──────────────────────────────────────────────────────────
-
-def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
-    exchange = exchange.upper()
-    logger.info(f"[html_ingest] Starting — exchange={exchange}, limit={limit}")
-
-    conn  = get_connection()
-    feeds = _get_html_feeds(conn, exchange, limit)
+    rows = cur.fetchall()
     conn.close()
 
-    if not feeds:
-        logger.info("[html_ingest] No html-type feeds found. Run migrate_feed_type.py first.")
-        return {"html_feeds": 0, "articles_new": 0, "rss_promoted": 0}
+    feeds = [{"feed_id": r[0], "feed_url": r[1], "symbol_id": r[2], "symbol": r[3]} for r in rows]
 
+    if symbol_limit and isinstance(symbol_limit, int) and symbol_limit > 0:
+        seen = []
+        for f in feeds:
+            if f["symbol"] not in seen:
+                seen.append(f["symbol"])
+            if len(seen) >= symbol_limit:
+                break
+        symbol_set = set(seen)
+        feeds = [f for f in feeds if f["symbol"] in symbol_set]
+        logger.info(f"[html_ingest] SYMBOL_LIMIT={symbol_limit}: {len(feeds)} feeds for {len(symbol_set)} symbols")
+
+    if limit and limit > 0:
+        feeds = feeds[:limit]
+
+    return feeds
+
+
+def run(exchange: str = "NASDAQ", limit: int = 0, scrape_full_text: bool = True) -> dict:
+    from pipeline_config import SYMBOL_LIMIT
+
+    feeds = _get_html_feeds(exchange, limit, SYMBOL_LIMIT)
+    logger.info(f"[html_ingest] Starting -- exchange={exchange}, limit={limit}")
     logger.info(f"[html_ingest] {len(feeds)} HTML feeds to process")
 
-    total       = len(feeds)
-    done        = 0
-    all_results = []
-
-    with ThreadPoolExecutor(max_workers=HTML_WORKERS, thread_name_prefix="html") as ex:
-        futures = {ex.submit(_process_html_feed, f): f for f in feeds}
+    total_new = 0
+    with ThreadPoolExecutor(max_workers=HTML_WORKERS) as pool:
+        futures = {pool.submit(_process_html_feed, f): f for f in feeds}
         for fut in as_completed(futures):
-            done += 1
             try:
-                all_results.append(fut.result())
+                symbol, n = fut.result(timeout=REQUEST_TIMEOUT * 2)
+                total_new += n
             except Exception as exc:
-                logger.warning(f"[html_ingest] Feed raised: {exc}")
-            if done % 50 == 0 or done == total:
-                collected = sum(len(r.get("articles", [])) for r in all_results)
-                logger.info(
-                    f"[html_ingest] Pages: {done}/{total} "
-                    f"| articles collected: {collected}"
-                )
+                feed = futures[fut]
+                logger.warning(f"[{feed['symbol']}] future error: {exc}")
 
-    # Promote discovered RSS feeds
-    conn         = get_connection()
-    rss_promoted = 0
-    for res in all_results:
-        if res.get("rss_found"):
-            if _promote_to_rss(conn, res["feed_id"], res["rss_found"]):
-                rss_promoted += 1
-                logger.info(
-                    f"[html_ingest] [{res['symbol']}] RSS promoted: {res['rss_found']}"
-                )
-
-    # Dedup + insert
-    all_articles = [a for res in all_results for a in res.get("articles", [])]
-    logger.info(f"[html_ingest] {len(all_articles)} raw articles collected")
-
-    inserted   = 0
-    skip_count = 0
-    if all_articles:
-        existing   = _known_hashes(conn, [a["article_hash"] for a in all_articles])
-        new_arts   = [a for a in all_articles if a["article_hash"] not in existing]
-        skip_count = len(all_articles) - len(new_arts)
-        logger.info(
-            f"[html_ingest] {len(new_arts)} new "
-            f"({skip_count} already in DB, skipped)"
-        )
-        inserted = _insert_articles(conn, new_arts)
-
-    conn.close()
-
-    # Method breakdown
-    methods: dict[str, int] = {}
-    for res in all_results:
-        m = res.get("method") or "none"
-        methods[m] = methods.get(m, 0) + 1
-
-    logger.info(
-        f"[html_ingest] Done — feeds={len(feeds)}, new={inserted}, "
-        f"skipped={skip_count}, rss_promoted={rss_promoted}, methods={methods}"
-    )
-
-    return {
-        "html_feeds":   len(feeds),
-        "articles_new": inserted,
-        "articles_skip": skip_count,
-        "rss_promoted": rss_promoted,
-        "methods":      methods,
-    }
-
-
-if __name__ == "__main__":
-    import argparse
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-        stream=sys.stderr,
-    )
-    ap = argparse.ArgumentParser(description="Step 2b – HTML Press Release Ingest")
-    ap.add_argument("--exchange", "-e", default="NASDAQ")
-    ap.add_argument("--limit",    "-l", type=int, default=0)
-    args = ap.parse_args()
-    from db import create_tables, test_connection
-    if not test_connection():
-        sys.exit(1)
-    create_tables()
-    print(run(exchange=args.exchange, limit=args.limit))
+    logger.info(f"[html_ingest] Done -- feeds={len(feeds)}, new={total_new}")
+    return {"feeds": len(feeds), "articles_new": total_new, "articles_skipped": 0}

@@ -23,6 +23,355 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [2.1.0] – 2026-05-25 — Bug Fixes, Dev Controls, Market Scores Admin Panel
+
+#### Bug Fixes
+
+**news_ingest.py — Rogue newline in User-Agent header**
+`HEADERS["User-Agent"]` had a literal `\n` in the string. `requests` raises
+`InvalidHeader` on any newline in a header — every `_scrape_full_text()` call
+silently returned `None`. Result: 0/426 full text scraped. Fixed: removed the `\n`.
+
+**html_ingest.py — File corruption (line numbers baked into source)**
+A write_file call with line numbers embedded (`1|"""`) corrupted the file.
+The file was also truncated at exactly 500 lines — the missing ~300 lines
+(`_handle_nasdaq_page` completion, `_handle_q4ir_api`, `_detect_platform`,
+`_process_html_feed`, `_get_html_feeds`, `_save_articles`, `run()`) were
+reconstructed from session history and appended. File now compiles cleanly.
+
+**html_ingest.py — Accept-Encoding: gzip, deflate, br in all 4 header profiles**
+Same Brotli bug as news_ingest (documented in v1.0.0). All 4 `_HEADER_PROFILES`
+in html_ingest had `Accept-Encoding: gzip, deflate, br`. Brotli responses came
+back but `requests` can't decompress them → pipeline stalled at ACGL every run.
+Fixed: removed `Accept-Encoding` from all 4 profiles.
+
+**html_ingest.py — BaseException not caught in futures loop**
+Worker futures caught `except Exception` only. `SystemExit` (a `BaseException`)
+propagated straight through `fut.result()` and killed the main process after
+the first bad worker. Fixed: changed to `except BaseException`, logs type name,
+continues.
+
+**html_ingest.py — s.ticker column doesn't exist**
+`_get_html_feeds()` used `s.ticker` in 4 places but the column is `s.symbol`.
+Every html_ingest run crashed with `UndefinedColumn: Spalte s.ticker existiert nicht`.
+Fixed: all 4 occurrences changed to `s.symbol`.
+
+**sector_map.py — Scanner import error**
+`from tradingview_screener import Scanner, Query, Column` — `Scanner` doesn't
+exist in the installed version. Only `Query` and `Column` are exported.
+Fixed: removed `Scanner` from import.
+
+**sector_map.py — pipeline_runs missing symbols_mapped / symbols_total columns**
+`UPDATE pipeline_runs SET symbols_total=..., symbols_mapped=...` crashed with
+`UndefinedColumn`. Fixed: added both columns via
+`ALTER TABLE pipeline_runs ADD COLUMN IF NOT EXISTS` in schema.py.
+
+**sector_map.py — TradingView returns NASDAQ:AAPL, DB has AAPL → 0 mapped**
+TV ticker format is `{EXCHANGE}:{TICKER}`. `sym_by_ticker` dict keyed on plain
+ticker never matched → `mapped=0` even though TV returned 400 rows.
+Fixed: strip exchange prefix before lookup. `mapped` counter also fixed to read
+final count from DB rather than tracking deltas (re-runs showed 0 even when data
+was already written).
+
+**admin.py — get_connection not defined in market scores routes**
+New `/market-scores` routes used `get_connection()` but the project uses `get_conn()`.
+All 6 call sites in the new routes updated.
+
+**admin.py — Market Scores panel showing only 22 of 389 rows**
+HTMX was truncating large HTML responses. Removed LIMIT/OFFSET pagination,
+added `max-height: 65vh; overflow-y: auto` scrollable container instead.
+All 389 rows load at once.
+
+---
+
+#### New Features
+
+**SYMBOL_LIMIT — pipeline_config.py**
+Cap how many symbols are processed without touching code:
+```python
+SYMBOL_LIMIT = False   # all symbols (production)
+SYMBOL_LIMIT = 100     # first 100 symbols (dev/test)
+```
+Applied in both `news_ingest.py` and `html_ingest.py`. Limit is per symbol
+(not per feed) — a symbol with 3 feeds still gets all 3 of its feeds.
+
+**START_FROM — skip-to stage control**
+Two ways to start the pipeline mid-way without rerunning earlier stages:
+
+CLI flag (one-off):
+```
+python main.py --start-from html
+python main.py --start-from sector_map
+```
+
+Config (persistent):
+```python
+START_FROM = "html"   # in pipeline_config.py
+```
+Valid values: `universe`, `news`, `html`, `sector_map`, `market_research`,
+`macro_multiplier`. CLI flag overrides the config value.
+
+**Admin — 📈 Market Scores panel**
+New green button in admin header opens the `sectors_macro` table as a full panel:
+- Sector tag chip + Industry name
+- Visual multiplier bar (color-coded: gray=neutral, amber=mild, green=strong,
+  bright green=exceptional) + numeric `1.035×` label
+- LLM rationale text
+- Last LLM run timestamp
+- Delete button per row (inline, no reload)
+- "Delete All Rankings" button at top (confirm dialog) for fresh LLM re-run
+- Scrollable table, all rows loaded at once
+
+**market_research_sources.csv imported**
+23 market research feeds bulk-imported into `market_research_feeds` table:
+- 18 GlobeNewswire org feeds (SNS Insider, Grand View Research, MarketsandMarkets, etc.)
+- 5 FDA RSS feeds (drug approvals, safety alerts, etc.)
+1 duplicate (SNS Insider) skipped. Pipeline now has real feeds to process.
+
+---
+
+#### How-To Reference
+
+**Change LLM type** — edit `config.py` or set env var:
+```
+LLM_TYPE=local    # LM Studio at 127.0.0.1:1234 (default)
+LLM_TYPE=ollama   # Ollama at 10.11.12.8:11434
+LLM_TYPE=api      # OpenAI-compatible, set OPENAI_API_KEY in .env
+```
+
+**Change LLM batch size** — edit `pipeline/macro_multiplier.py` line:
+```python
+BATCH_SIZE = 20   # articles per LLM call — increase for fewer calls, decrease for more precision
+```
+
+**Change article text sent to LLM** — edit `pipeline/macro_multiplier.py`:
+```python
+(a.get('full_text') or a.get('summary') or '')[:3000]   # current: summary[:500]
+```
+Use `full_text` for richer analysis of scraped market research articles.
+
+**Scoring architecture decision (2026-05-25)**
+Macro multiplier is applied to the FINAL aggregated raw score, not per-article.
+Multi-sector companies: use MAX(multiplier) across all sectors the company belongs to.
+Formula: `final_score = raw_score × MAX(macro_multiplier of company's sectors)`
+Rationale: per-news multiplier is noisy (one bad article in a hot sector inflates score);
+final multiplier is clean, transparent, and explainable.
+
+---
+
+### [2.0.0] – 2026-05-25 — Phase 3: Industry & Macro Mapping
+
+#### Architecture
+Phase 3 fully implemented. Three new pipeline modules + schema + admin UI.
+
+#### DB Schema (`db/schema.py`)
+- `sectors_macro`: sector_name, industry_name, macro_multiplier (NUMERIC 4,3 range 1.000-1.050),
+  rationale (LLM text), last_llm_run_at. Unique on (sector_name, industry_name).
+- `market_research_feeds`: market-wide RSS feeds, not ticker-specific. source_name, description.
+- `market_research_articles`: articles from above. llm_processed flag + partial index on FALSE.
+- `symbols.sector_id` FK → sectors_macro(id). Added via idempotent DO $$ ALTER block.
+
+#### `config.py` — LLM provider system
+- LLM_TYPE env var: "local" | "ollama" | "api". Default: "local".
+- local: LM Studio 127.0.0.1:1234, model=google/gemma-4-e4b
+- ollama: 10.11.12.8:11434/v1, model=gemma4:e4b, reasoning_mode=True, num_gpu_layers=40
+- api: OpenAI-compatible, api_key blank by default (set in .env)
+- All profiles: temp=0.1, context=16384, max_tokens=12228, freq_penalty=0.2, pres_penalty=0.1
+
+#### `pipeline/sector_map.py`
+- TradingView Screener Query().select(sector, industry). Batches of 500, 0.5s rate limit.
+- Upserts sectors_macro (multiplier=1.000 default). Maps sector_id onto symbols.
+- Logs to pipeline_runs step='sector_map'.
+
+#### `pipeline/market_research_ingest.py`
+- Fetches market_research_feeds RSS/Atom. Stores to market_research_articles.
+- curl_cffi fallback, browser headers, _suppress_stderr — same hardening as news_ingest.
+
+#### `pipeline/macro_multiplier.py`
+- Reads llm_processed=FALSE articles in batches of 20. Calls LLM via OpenAI client.
+- Extracts signals: sector/industry/niche/product/disease/medication + growth_score 0.0-1.0.
+- Score → multiplier: [0.4,1.0] → [1.000,1.050] linear. Below 0.4 = 1.000 (neutral).
+- GREATEST() on UPDATE — multiplier only increases, never decreases from weak articles.
+- --dry-run flag: prints signals without writing DB.
+
+#### Admin UI
+- "Market Research" button in header → full panel in right pane.
+- Add/delete market research feeds with source name + description.
+- Article count + pending LLM badges. "Run LLM Analysis" button (50-article batch).
+
+#### `pipeline_config.py` + `main.py`
+- New toggles: sector_map, market_research, macro_multiplier (all active=True).
+- STAGES order: universe → news → sector_map → market_research → macro_multiplier.
+
+---
+
+### [1.4.0] – 2026-05-24 — Per-Symbol Fetch Button in Admin Panel
+
+#### Feature: Run Pipeline from Admin UI
+Every symbol row now has a ▶ button on the right side.
+Clicking it runs the full pipeline (RSS + HTML + EDGAR if enabled) for that single
+symbol and streams the log output directly into the right panel — no terminal needed.
+
+- Color-coded output: green = inserted/ok, red = error, gray = info
+- Before/after article count shown at top so you see instantly what was inserted
+- Back to feeds button returns to normal feeds view after the run
+- `event.stopPropagation()` prevents the row's hx-get from firing when clicking ▶
+
+Backend: `POST /symbol/{id}/fetch` — calls `test_symbol.run_symbol()` and captures
+stdout + stderr via `subprocess`. Returns HTML with colored pre-formatted log.
+
+#### Files Changed
+- `admin.py` — fetch button in symbol row, CSS for button, `/symbol/{id}/fetch` POST route
+
+---
+
+### [1.3.0] – 2026-05-24 — Feed Type Selector in Admin Edit + Add Forms
+
+#### Problem
+Feeds incorrectly stored as `feed_type='rss'` (Nasdaq API URLs, Yahoo Finance URLs)
+had to be fixed via raw SQL. The admin edit form only had a URL input — no way to
+change `feed_type` from the UI.
+
+#### Fix (admin.py)
+- Edit form: added `feed_type` dropdown (rss / atom / html / api / unknown) pre-filled
+  with the feed's current value. Current type chip visible on every feed card.
+- Add form: same dropdown, defaults to `unknown`.
+- `saveEdit` JS: for `html` and `api` types, skips feedparser validation entirely
+  (feedparser always fails on non-RSS URLs). rss/atom/unknown still validate first.
+- PUT + POST backend: both now accept `feed_type` from the form and use it as-is.
+  Previously the backend silently re-detected and overwrote the type on every save.
+
+#### Workflow
+Find broken symbol via 0-articles filter → feeds tab → chip says `rss` but URL is
+Nasdaq → Edit → change to `html` → Save → run test_symbol.py to verify immediately.
+
+---
+
+### [1.2.0] – 2026-05-24 — Admin Panel Filter + Sort System
+
+#### Feature: Article Count Filtering + Sorting
+The left symbol list now has a filter bar and sort bar for rapid triage of broken symbols.
+
+Filter bar (5 buttons, instant HTMX, no page reload):
+- All — default view
+- 0 articles — symbols with zero news (red badge) — primary fix target
+- Low <5 — symbols with 1-4 articles (orange badge) — likely partially broken
+- OK — symbols with 5+ articles (green badge)
+- No feed — symbols with no feed URL at all
+
+Sort bar:
+- A-Z — default alphabetical
+- Fewest first — broken symbols pushed to top, best for triage
+- Most first — best-covered symbols first
+
+Article count badge on every row: red=0, orange=1-4, green=5+.
+
+Workflow: click "0 articles" then "Fewest first" → instantly see every broken symbol
+sorted worst-first. Click one → go to feeds tab → debug URL/type.
+
+#### Files Changed
+- `admin.py` — filter/sort query params in `/symbols` route, CSS badge styles,
+  filter bar HTML rendered in left panel head
+
+---
+
+### [1.1.0] – 2026-05-24 — test_symbol.py CLI Diagnostic Tool
+
+#### New File: test_symbol.py
+Run the full pipeline for a single symbol and see results immediately.
+No more waiting for the full 3800-symbol run to check if one symbol works.
+
+Usage:
+```
+python test_symbol.py GYRO
+python test_symbol.py BNBX
+python test_symbol.py ABNB
+```
+
+What it does per symbol:
+1. Shows symbol info + all feeds with active/inactive status and feed_type
+2. Shows article count BEFORE run
+3. Runs RSS pipeline for all rss/atom feeds belonging to that symbol
+4. Runs HTML pipeline (Nasdaq, Q4 IR, Yahoo, PRNewswire, mynewsdesk etc.)
+5. Runs EDGAR pipeline if enabled in pipeline_config.py
+6. Shows exact count: X fetched, Y new inserted per feed
+7. Shows total article count BEFORE and AFTER at bottom
+
+Saves results to DB — identical to what main.py does, just scoped to one symbol.
+
+---
+
+### [1.0.0] – 2026-05-24 — Platform Handler: mynewsdesk + Brotli Bug Fix + status Filter Bug
+
+#### Bug 1 — s.status = TRUE blocking 562 symbols from all pipelines
+Root cause: `status = FALSE` in the symbols table means "not on active watchlist"
+NOT "delisted". But all three pipelines had `AND s.status = TRUE` in their feed
+queries — silently dropping 562 real listed companies with valid feeds.
+
+Affected files: `news_ingest.py`, `html_ingest.py`, `rss_finder.py`
+Fix: removed `AND s.status = TRUE` from all three. Feed's own `is_active` column
+is the correct gate.
+
+Result: 350 previously-invisible RSS/atom feeds + unknown HTML feeds now process
+correctly. Confirmed on ABVX, AAPG, ABP — all had valid feeds but 0 articles.
+
+#### Bug 2 — Brotli compression causing feedparser to get binary garbage
+Root cause: `_HEADER_PROFILES` in `news_ingest.py` included `Accept-Encoding: gzip, deflate, br`.
+Servers returned Brotli-compressed responses. `requests` decompresses gzip natively
+but NOT Brotli (requires the `brotli` package). `resp.text` was binary garbage.
+feedparser got garbage → `bozo=True` → 0 entries. Silent failure.
+
+Affected feed type: `adapthealth.com/blogs/latest-news.atom` and any Brotli-capable server.
+Fix: removed `Accept-Encoding` from ALL header profiles. `requests` adds its own
+`Accept-Encoding: gzip, deflate` automatically and handles decompression correctly.
+
+#### Bug 3 — Nasdaq + Yahoo URLs stored as feed_type='rss'
+Bulk of Nasdaq API URLs and Yahoo Finance URLs were classified as `rss` by the
+URL heuristic at import time. feedparser consumed them, returned 0. html_ingest
+never saw them.
+Fix: bulk UPDATE in DB (`feed_type='html'` for these URL patterns) + `_detect_platform`
+updated to catch `nasdaq.com/api/news/topic` URL format.
+
+Affected symbols: ADSE and all others with Nasdaq API-style or Yahoo press-release URLs.
+
+#### New Platform: mynewsdesk.com
+`_handle_mynewsdesk()` added to `html_ingest.py`.
+- RSS autodiscovery first (many mynewsdesk pages have `/newsroom/{company}/rss`)
+- Falls back to scraping `a[href*="/pressreleases/"]` anchor links from server-rendered page
+- Trafilatura extracts full text from each article URL
+
+Verified on ADSE: 12 mynewsdesk articles + 10 Yahoo + 40 Nasdaq = 62 total.
+
+#### Files Changed
+- `pipeline/news_ingest.py` — removed status filter, removed Accept-Encoding
+- `pipeline/html_ingest.py` — removed status filter, mynewsdesk handler, Nasdaq URL pattern fix
+- `pipeline/rss_finder.py` — removed status filter
+
+---
+
+### [0.9.1] – 2026-05-24 — lxml stderr Encoding Error Suppression
+
+#### Problem
+lxml's C parser writes directly to file descriptor 2 (stderr) when it encounters
+malformed or compressed bytes in HTML bodies — completely bypassing Python's
+`warnings` module. Output was 4 identical error lines per article for many Q4 API
+symbols:
+```
+encoding error : input conversion failed due to input error, bytes 0x8D 0x89 0xBF 0x0F
+```
+
+`warnings.filterwarnings` has zero effect on C-level fd writes.
+
+#### Fix (pipeline/html_ingest.py)
+Added `_suppress_stderr()` context manager that redirects file descriptor 2 to
+`os.devnull` at OS level before every BeautifulSoup call and restores it after.
+All 6 `BeautifulSoup(` call sites replaced with `_make_soup()` wrapper.
+
+Data is unaffected — lxml still parses correctly, it just stops printing about
+malformed bytes. Zero articles lost.
+
+---
+
 ### [0.9.0] – 2026-05-24 — RSS/Atom Ingest Bug Fixes + CDN 403 Bypass
 
 #### Problems Fixed

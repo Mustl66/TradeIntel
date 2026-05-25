@@ -114,3 +114,15 @@ encoding error : input conversion failed due to input error, bytes 0x9D 0xAD 0x3
  https://ir.abivax.com/rss.xml
 
 this has informations aabout the latest news but my program at this state cant fetch this type correctly. please fix this problem
+
+
+
+
+
+
+
+so now i want the auto updater for the  news this is just for globenewswire news) take this url:
+https://www.globenewswire.com/en/search/exchange/nasdaq?pageSize=50&page=1
+there are the newest 50 news, and page 2 this is 100 news that is the last and actual appearing on this page,
+
+al news should get every 1 minute (this should be changeable) fetched from this site, (pleasse look in this site and get the structure) then comparison (find the symbol / company / id awhat so ever the one which is the easyest in the database and if it is a new news which is not in the news database of this specific symbol than update it and 

@@ -135,11 +135,61 @@ CREATE INDEX IF NOT EXISTS idx_news_symbol_published
 CREATE INDEX IF NOT EXISTS idx_news_feed_id
     ON news_articles (feed_id);
 
+-- ── sectors_macro ───────────────────────────────────────────────────────────
+-- One row per industry. Macro growth multiplier applied in Phase 5 scoring.
+-- multiplier range: 1.00 (neutral) → 1.05 (top 5% growth forecast).
+-- Set by macro_multiplier.py via LLM analysis of market research articles.
+CREATE TABLE IF NOT EXISTS sectors_macro (
+    id                  SERIAL PRIMARY KEY,
+    sector_name         VARCHAR(100) NOT NULL,
+    industry_name       VARCHAR(100) NOT NULL,
+    macro_multiplier    NUMERIC(4,3) NOT NULL DEFAULT 1.000,
+    rationale           TEXT,                  -- LLM explanation for the multiplier
+    last_llm_run_at     TIMESTAMPTZ,           -- when LLM last updated this row
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_sector_industry UNIQUE (sector_name, industry_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sectors_macro_industry ON sectors_macro (industry_name);
+
+-- ── market_research_feeds ────────────────────────────────────────────────────
+-- RSS/Atom feeds for market research sources (Research and Markets, SNS Insider, etc.)
+-- Separate from rss_feeds — these are market-wide, not ticker-specific.
+CREATE TABLE IF NOT EXISTS market_research_feeds (
+    id              SERIAL PRIMARY KEY,
+    feed_url        TEXT         NOT NULL,
+    source_name     VARCHAR(100) NOT NULL DEFAULT '',
+    description     TEXT,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    discovered_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_checked_at TIMESTAMPTZ,
+    CONSTRAINT uq_market_research_url UNIQUE (feed_url)
+);
+
+-- ── market_research_articles ─────────────────────────────────────────────────
+-- Articles from market research feeds. LLM reads these to derive multipliers.
+CREATE TABLE IF NOT EXISTS market_research_articles (
+    id              BIGSERIAL    PRIMARY KEY,
+    feed_id         INTEGER      REFERENCES market_research_feeds(id) ON DELETE SET NULL,
+    article_hash    CHAR(64)     NOT NULL,
+    url             TEXT         NOT NULL,
+    title           TEXT         NOT NULL,
+    summary         TEXT,
+    full_text       TEXT,
+    published_at    TIMESTAMPTZ  NOT NULL,
+    inserted_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    source_name     TEXT,
+    llm_processed   BOOLEAN      NOT NULL DEFAULT FALSE,
+    CONSTRAINT uq_mr_article_hash UNIQUE (article_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mr_articles_feed      ON market_research_articles (feed_id);
+CREATE INDEX IF NOT EXISTS idx_mr_articles_published ON market_research_articles (published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mr_articles_llm       ON market_research_articles (llm_processed) WHERE llm_processed = FALSE;
+
 -- ── Future tables (placeholders) ────────────────────────────────────────────
 -- CREATE TABLE IF NOT EXISTS insider_transactions ( ... );
 -- CREATE TABLE IF NOT EXISTS social_signals ( ... );
--- CREATE TABLE IF NOT EXISTS sector_mappings ( ... );
--- CREATE TABLE IF NOT EXISTS macro_weights ( ... );
 -- CREATE TABLE IF NOT EXISTS sentiment_scores ( ... );
 -- CREATE TABLE IF NOT EXISTS aggregate_scores ( ... );
 """
@@ -151,6 +201,20 @@ def create_tables() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(_DDL)
+            # Idempotent ALTER — add sector_id to symbols if not present
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='symbols' AND column_name='sector_id'
+                    ) THEN
+                        ALTER TABLE symbols
+                            ADD COLUMN sector_id INTEGER REFERENCES sectors_macro(id) ON DELETE SET NULL;
+                        CREATE INDEX IF NOT EXISTS idx_symbols_sector_id ON symbols (sector_id);
+                    END IF;
+                END$$;
+            """)
         conn.commit()
         logger.info("Database schema verified / created successfully.")
     except Exception as e:

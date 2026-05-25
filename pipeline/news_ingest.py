@@ -42,14 +42,14 @@ logger = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT   = 15       # seconds per HTTP request
 MAX_FULL_TEXT_LEN = 100_000  # chars; truncate absurdly long pages
-SCRAPE_DELAY      = 0.5      # seconds between article scrapes per worker
+SCRAPE_DELAY      = 0.2      # seconds between article scrapes per worker
 FEED_WORKERS      = 10       # parallel feed fetchers
-ARTICLE_WORKERS   = 6        # parallel article scrapers (be polite)
+ARTICLE_WORKERS   = 12       # parallel article scrapers (be polite)
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; TradeIntel/2.0; "
-        "+https://github.com/tradeintel)\n"
+        "+https://github.com/tradeintel)"
     )
 }
 
@@ -242,8 +242,11 @@ def _fetch_feed(feed_row: dict) -> list[dict]:
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
-def _get_active_feeds(conn, exchange: str, limit: int) -> list[dict]:
+def _get_active_feeds(conn, exchange: str, limit: int, symbol_limit=False) -> list[dict]:
     """Return all active feeds joined with symbol info."""
+    from pipeline_config import SYMBOL_LIMIT as _SL
+    _symbol_limit = symbol_limit if symbol_limit is not False else _SL
+
     sql = """
         SELECT
             rf.id          AS id,
@@ -263,7 +266,20 @@ def _get_active_feeds(conn, exchange: str, limit: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(sql, (exchange,))
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        feeds = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    if _symbol_limit and isinstance(_symbol_limit, int) and _symbol_limit > 0:
+        seen = []
+        for f in feeds:
+            if f["symbol"] not in seen:
+                seen.append(f["symbol"])
+            if len(seen) >= _symbol_limit:
+                break
+        symbol_set = set(seen)
+        feeds = [f for f in feeds if f["symbol"] in symbol_set]
+        logger.info(f"[news_ingest] SYMBOL_LIMIT={_symbol_limit}: {len(feeds)} feeds for {len(symbol_set)} symbols")
+
+    return feeds
 
 
 def _known_hashes(conn, hashes: list[str]) -> set[str]:
@@ -293,7 +309,7 @@ def _insert_articles(conn, articles: list[dict]) -> int:
         VALUES
             (%(symbol_id)s, %(feed_id)s, %(article_hash)s, %(url)s, %(title)s,
              %(summary)s, %(full_text)s, %(published_at)s, %(author)s, %(source_name)s)
-        ON CONFLICT (article_hash) DO NOTHING
+        ON CONFLICT DO NOTHING
     """
     with conn.cursor() as cur:
         cur.executemany(sql, articles)
@@ -395,9 +411,18 @@ def run(exchange: str = "NASDAQ", limit: int = 0, scrape_full_text: bool = True)
         scraped_done = 0
         scraped_results = []
         with ThreadPoolExecutor(max_workers=ARTICLE_WORKERS, thread_name_prefix="scrape") as ex:
-            futures = [ex.submit(_scrape_one, a) for a in new_articles]
+            futures = {ex.submit(_scrape_one, a): a for a in new_articles}
+            # NO global timeout on as_completed — let every article finish or
+            # time out individually. Global timeout killed batches of 400+ articles
+            # after only 20 seconds (REQUEST_TIMEOUT + 5).
             for f in as_completed(futures):
-                scraped_results.append(f.result())
+                try:
+                    scraped_results.append(f.result(timeout=REQUEST_TIMEOUT + 5))
+                except Exception:
+                    # timed-out or failed scrape — keep article without full_text
+                    art = futures[f]
+                    art["full_text"] = None
+                    scraped_results.append(art)
                 scraped_done += 1
                 if scraped_done % 100 == 0 or scraped_done == total_arts:
                     logger.info(

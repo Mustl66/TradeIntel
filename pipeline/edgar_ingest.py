@@ -357,7 +357,7 @@ def _insert_articles(conn, feed_id: int, symbol_id: int, articles: list[dict]) -
                 INSERT INTO news_articles
                     (symbol_id, feed_id, url, title, full_text, published_at, inserted_at, article_hash, source_name)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'edgar_8k')
-                ON CONFLICT (article_hash) DO NOTHING
+                ON CONFLICT DO NOTHING
             """, (
                 symbol_id,
                 feed_id,

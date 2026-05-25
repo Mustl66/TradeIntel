@@ -241,6 +241,31 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
 <div class="header">
   <h1>TradeIntel</h1>
   <span class="badge">RSS MANAGER</span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+    <button
+      hx-get="/market-research"
+      hx-target="#feed-panel"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #6366f1;color:#a5b4fc;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+      📊 Market Research
+    </button>
+    <button
+      hx-get="/market-scores"
+      hx-target="#feed-panel"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #10b981;color:#6ee7b7;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+      📈 Market Scores
+    </button>
+    <button
+      hx-post="/admin/dedup"
+      hx-target="#dedup-result"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px"
+      onclick="this.textContent='Running…'">
+      🧹 Dedup Articles
+    </button>
+    <div id="dedup-result" style="font-size:12px;color:#94a3b8"></div>
+  </div>
 </div>
 <div class="layout">
   <!-- LEFT: symbol list -->
@@ -1051,6 +1076,414 @@ def _feed_card_html(f) -> str:
         <div id="edit-val-{fid}"></div>
       </div>
     </div>"""
+
+
+# ── Global dedup route ────────────────────────────────────────────────────────
+
+@app.post("/admin/dedup", response_class=HTMLResponse)
+async def run_dedup():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM (
+                    SELECT symbol_id, url FROM news_articles
+                    GROUP BY symbol_id, url HAVING COUNT(*) > 1
+                ) sub
+            """)
+            dupe_groups = cur.fetchone()["cnt"]
+
+        with conn.cursor() as cur2:
+            cur2.execute("""
+                DELETE FROM news_articles a
+                USING (
+                    SELECT MIN(id) as keep_id, symbol_id, url
+                    FROM news_articles
+                    GROUP BY symbol_id, url
+                ) b
+                WHERE a.symbol_id = b.symbol_id
+                  AND a.url = b.url
+                  AND a.id <> b.keep_id
+            """)
+            deleted = cur2.rowcount
+            conn.commit()
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as total FROM news_articles")
+            total = cur.fetchone()["total"]
+    finally:
+        conn.close()
+
+    color = "#22c55e" if deleted == 0 else "#f59e0b"
+    return f"""
+    <div style="padding:16px;background:#1e1e2e;border-radius:8px;border:1px solid #333;font-family:monospace;font-size:13px">
+      <div style="color:#888;margin-bottom:8px">Dedup complete</div>
+      <div>Duplicate URL groups found: <b style="color:{color}">{dupe_groups}</b></div>
+      <div>Rows deleted: <b style="color:{color}">{deleted}</b></div>
+      <div>Total articles remaining: <b style="color:#60a5fa">{total:,}</b></div>
+      <div style="color:#888;margin-top:8px;font-size:11px">UNIQUE(symbol_id, url) prevents future dupes automatically.</div>
+    </div>"""
+
+
+# ── Market Research Feeds ─────────────────────────────────────────────────────
+
+@app.get("/market-research", response_class=HTMLResponse)
+def market_research_panel(request: Request):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT f.id, f.feed_url, f.source_name, f.description,
+                       f.is_active, f.last_checked_at,
+                       COUNT(a.id) as article_count
+                FROM market_research_feeds f
+                LEFT JOIN market_research_articles a ON a.feed_id = f.id
+                GROUP BY f.id
+                ORDER BY f.source_name, f.id
+            """)
+            feeds = cur.fetchall()
+            cur.execute("SELECT COUNT(*) as total FROM market_research_articles")
+            total_articles = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) as pending FROM market_research_articles WHERE llm_processed = FALSE")
+            pending_llm = cur.fetchone()["pending"]
+    finally:
+        conn.close()
+
+    rows = ""
+    for f in feeds:
+        checked = f["last_checked_at"].strftime("%Y-%m-%d %H:%M") if f["last_checked_at"] else "never"
+        active_chip = (
+            '<span style="background:#166534;color:#4ade80;padding:2px 8px;border-radius:4px;font-size:11px">active</span>'
+            if f["is_active"] else
+            '<span style="background:#3b0764;color:#c084fc;padding:2px 8px;border-radius:4px;font-size:11px">paused</span>'
+        )
+        count_color = "#4ade80" if f["article_count"] > 0 else "#ef4444"
+        rows += f"""
+        <tr id="mr-row-{f['id']}">
+          <td style="padding:10px 8px">
+            <div style="font-weight:500;color:#e2e8f0;font-size:13px">{f['source_name'] or '—'}</div>
+            <div style="color:#64748b;font-size:11px;margin-top:2px">{f['description'] or ''}</div>
+          </td>
+          <td style="padding:10px 8px;font-size:11px;color:#94a3b8;word-break:break-all;max-width:260px">{f['feed_url']}</td>
+          <td style="padding:10px 8px;text-align:center">{active_chip}</td>
+          <td style="padding:10px 8px;text-align:center">
+            <span style="background:#1e293b;color:{count_color};padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600">{f['article_count']}</span>
+          </td>
+          <td style="padding:10px 8px;text-align:center;color:#64748b;font-size:11px">{checked}</td>
+          <td style="padding:10px 8px;text-align:center">
+            <button onclick="deleteMRFeed({f['id']})"
+              style="background:#7f1d1d;color:#fca5a5;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px">
+              Delete
+            </button>
+          </td>
+        </tr>"""
+
+    return f"""
+    <div style="padding:20px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
+        <h2 style="margin:0;color:#e2e8f0;font-size:18px">📊 Market Research Feeds</h2>
+        <span style="background:#1e293b;color:#60a5fa;padding:3px 10px;border-radius:12px;font-size:12px">{total_articles:,} articles</span>
+        <span style="background:#1e293b;color:#f59e0b;padding:3px 10px;border-radius:12px;font-size:12px">{pending_llm:,} pending LLM</span>
+        <button hx-post="/market-research/run-llm" hx-target="#mr-llm-result" hx-swap="innerHTML"
+          style="background:#1e293b;border:1px solid #6366f1;color:#a5b4fc;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px">
+          Run LLM Analysis
+        </button>
+        <div id="mr-llm-result" style="font-size:12px;color:#94a3b8"></div>
+      </div>
+
+      <!-- Add new feed form -->
+      <div style="background:#1e1e2e;border:1px solid #2d2d3f;border-radius:8px;padding:16px;margin-bottom:20px">
+        <div style="font-size:13px;color:#94a3b8;margin-bottom:10px;font-weight:600">Add Market Research Feed</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="mr-url" placeholder="RSS/Atom feed URL"
+            style="flex:2;min-width:260px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:13px"/>
+          <input id="mr-source" placeholder="Source name (e.g. SNS Insider)"
+            style="flex:1;min-width:160px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:13px"/>
+          <input id="mr-desc" placeholder="Description (optional)"
+            style="flex:2;min-width:200px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:13px"/>
+          <button onclick="addMRFeed()"
+            style="background:#4f46e5;color:#fff;border:none;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+            Add Feed
+          </button>
+        </div>
+        <div id="mr-add-result" style="margin-top:8px;font-size:12px;color:#94a3b8"></div>
+      </div>
+
+      <!-- Feed table -->
+      <table style="width:100%;border-collapse:collapse" id="mr-table">
+        <thead>
+          <tr style="border-bottom:1px solid #1e293b;color:#64748b;font-size:11px;text-transform:uppercase">
+            <th style="padding:8px;text-align:left">Source</th>
+            <th style="padding:8px;text-align:left">Feed URL</th>
+            <th style="padding:8px;text-align:center">Status</th>
+            <th style="padding:8px;text-align:center">Articles</th>
+            <th style="padding:8px;text-align:center">Last Checked</th>
+            <th style="padding:8px;text-align:center">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="mr-tbody">
+          {rows if rows else '<tr><td colspan="6" style="text-align:center;padding:40px;color:#64748b">No market research feeds yet. Add one above.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+
+    <script>
+    async function addMRFeed() {{
+      const url    = document.getElementById('mr-url').value.trim();
+      const source = document.getElementById('mr-source').value.trim();
+      const desc   = document.getElementById('mr-desc').value.trim();
+      if (!url) {{ document.getElementById('mr-add-result').textContent = 'URL required'; return; }}
+      const res = await fetch('/market-research/feeds', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: new URLSearchParams({{feed_url: url, source_name: source, description: desc}})
+      }});
+      const data = await res.json();
+      const el = document.getElementById('mr-add-result');
+      if (data.ok) {{
+        el.style.color = '#4ade80';
+        el.textContent = 'Feed added: ' + data.source_name;
+        document.getElementById('mr-url').value = '';
+        document.getElementById('mr-source').value = '';
+        document.getElementById('mr-desc').value = '';
+        htmx.ajax('GET', '/market-research', '#feed-panel');
+      }} else {{
+        el.style.color = '#ef4444';
+        el.textContent = data.error || 'Failed';
+      }}
+    }}
+
+    async function deleteMRFeed(id) {{
+      if (!confirm('Delete this market research feed?')) return;
+      const res = await fetch('/market-research/feeds/' + id, {{method: 'DELETE'}});
+      const data = await res.json();
+      if (data.ok) htmx.ajax('GET', '/market-research', '#feed-panel');
+    }}
+    </script>
+    """
+
+
+@app.post("/market-research/feeds")
+async def add_mr_feed(
+    feed_url: str = Form(...),
+    source_name: str = Form(""),
+    description: str = Form(""),
+):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO market_research_feeds (feed_url, source_name, description)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (feed_url) DO NOTHING
+                RETURNING id, source_name
+            """, (feed_url.strip(), source_name.strip(), description.strip()))
+            row = cur.fetchone()
+        conn.commit()
+        if row:
+            return {"ok": True, "id": row[0], "source_name": row[1] or feed_url}
+        return {"ok": False, "error": "Feed URL already exists"}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+@app.delete("/market-research/feeds/{feed_id}")
+def delete_mr_feed(feed_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM market_research_feeds WHERE id = %s", (feed_id,))
+        conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/market-research/run-llm", response_class=HTMLResponse)
+def run_mr_llm():
+    """Trigger macro_multiplier pipeline from admin UI."""
+    try:
+        from pipeline.macro_multiplier import run as mr_run
+        result = mr_run(limit=50)   # batch of 50 to avoid long blocking
+        return (
+            f'<span style="color:#4ade80">Done: {result["processed"]} processed, '
+            f'{result["industries_updated"]} industries updated, '
+            f'{result["duration_s"]}s</span>'
+        )
+    except Exception as e:
+        return f'<span style="color:#ef4444">Error: {e}</span>'
+
+
+# ── Market Scores (sectors_macro viewer) ──────────────────────────────────────
+
+@app.get("/market-scores", response_class=HTMLResponse)
+def market_scores_panel():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, sector_name, industry_name,
+                       macro_multiplier, rationale,
+                       last_llm_run_at, updated_at
+                FROM sectors_macro
+                ORDER BY macro_multiplier DESC, sector_name, industry_name
+            """)
+            rows = cur.fetchall()
+            total = len(rows)
+    finally:
+        conn.close()
+
+    def score_color(m):
+        m = float(m)
+        if m >= 1.040: return "#4ade80"   # strong green
+        if m >= 1.025: return "#86efac"   # light green
+        if m >= 1.010: return "#fbbf24"   # amber
+        return "#94a3b8"                   # gray/neutral
+
+    row_html = ""
+    for r in rows:
+        m = float(r["macro_multiplier"])
+        bar_pct = int((m - 1.000) / 0.050 * 100)   # 1.000=0%, 1.050=100%
+        bar_pct = max(0, min(100, bar_pct))
+        col = score_color(m)
+        ran = r["last_llm_run_at"].strftime("%Y-%m-%d %H:%M") if r["last_llm_run_at"] else "—"
+        upd = r["updated_at"].strftime("%Y-%m-%d") if r["updated_at"] else "—"
+        rationale_safe = (r["rationale"] or "").replace("<", "&lt;").replace(">", "&gt;")
+        row_html += f"""
+        <tr id="ms-row-{r['id']}" style="border-bottom:1px solid #1e2535">
+          <td style="padding:10px 12px">
+            <span style="font-size:11px;color:#94a3b8;background:#1e2535;padding:2px 7px;border-radius:4px">{r['sector_name']}</span>
+          </td>
+          <td style="padding:10px 12px;font-weight:600;color:#e2e8f0;font-size:13px">{r['industry_name']}</td>
+          <td style="padding:10px 12px;text-align:center">
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:1;height:6px;background:#1e2535;border-radius:3px;overflow:hidden">
+                <div style="width:{bar_pct}%;height:100%;background:{col};border-radius:3px"></div>
+              </div>
+              <span style="font-size:14px;font-weight:700;color:{col};min-width:48px;text-align:right">{m:.3f}×</span>
+            </div>
+          </td>
+          <td style="padding:10px 12px;font-size:12px;color:#94a3b8;max-width:340px">{rationale_safe or '—'}</td>
+          <td style="padding:10px 12px;text-align:center;font-size:11px;color:#475569">{ran}</td>
+          <td style="padding:10px 12px;text-align:center">
+            <button onclick="deleteMSRow({r['id']})"
+              style="background:#7f1d1d;color:#fca5a5;border:none;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">
+              Delete
+            </button>
+          </td>
+        </tr>"""
+
+    empty = '<tr><td colspan="6" style="text-align:center;padding:40px;color:#64748b">No market scores yet — run LLM Analysis from Market Research panel.</td></tr>'
+
+    return f"""
+    <div style="padding:20px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:20px;flex-wrap:wrap">
+        <h2 style="margin:0;color:#e2e8f0;font-size:18px">📈 Market Scores</h2>
+        <span style="background:#1e293b;color:#6ee7b7;padding:3px 10px;border-radius:12px;font-size:12px">{total} industries tracked</span>
+        <button onclick="deleteAllMS()"
+          style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;margin-left:auto">
+          🗑 Delete All Rankings
+        </button>
+        <div id="ms-action-result" style="font-size:12px;color:#94a3b8"></div>
+      </div>
+
+      <div style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow-y:auto;max-height:65vh">
+        <table style="width:100%;border-collapse:collapse" id="ms-table">
+          <thead>
+            <tr style="background:#1a2133;color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.5px">
+              <th style="padding:10px 12px;text-align:left">Sector</th>
+              <th style="padding:10px 12px;text-align:left">Industry</th>
+              <th style="padding:10px 12px;text-align:left;min-width:220px">Multiplier</th>
+              <th style="padding:10px 12px;text-align:left">LLM Rationale</th>
+              <th style="padding:10px 12px;text-align:center">Last LLM Run</th>
+              <th style="padding:10px 12px;text-align:center">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ms-tbody">
+            {row_html if row_html else empty}
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:12px;font-size:11px;color:#475569">
+        Multiplier scale: 1.000 = neutral · 1.010 = mild positive · 1.025 = moderate growth · 1.040 = strong · 1.050 = exceptional
+        &nbsp;·&nbsp; {total} total industries
+      </div>
+    </div>
+
+    <script>
+    async function deleteMSRow(id) {{
+      if (!confirm('Delete this industry ranking?')) return;
+      const res = await fetch('/market-scores/' + id, {{method: 'DELETE'}});
+      const data = await res.json();
+      if (data.ok) {{
+        const row = document.getElementById('ms-row-' + id);
+        if (row) row.remove();
+        document.getElementById('ms-action-result').textContent = 'Row deleted.';
+      }} else {{
+        document.getElementById('ms-action-result').textContent = data.error || 'Error';
+      }}
+    }}
+    async function deleteAllMS() {{
+      if (!confirm('Delete ALL market scores/rankings? This cannot be undone.')) return;
+      const res = await fetch('/market-scores/all', {{method: 'DELETE'}});
+      const data = await res.json();
+      const el = document.getElementById('ms-action-result');
+      if (data.ok) {{
+        document.getElementById('ms-tbody').innerHTML =
+          '<tr><td colspan="6" style="text-align:center;padding:40px;color:#64748b">All rankings deleted.</td></tr>';
+        el.style.color = '#4ade80';
+        el.textContent = 'Deleted ' + data.deleted + ' rows.';
+      }} else {{
+        el.style.color = '#ef4444';
+        el.textContent = data.error || 'Error';
+      }}
+    }}
+    </script>
+    """
+
+
+@app.delete("/market-scores/all")
+def delete_all_market_scores():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sectors_macro")
+            deleted = cur.rowcount
+        conn.commit()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+@app.delete("/market-scores/{row_id}")
+def delete_market_score(row_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sectors_macro WHERE id = %s", (row_id,))
+            deleted = cur.rowcount
+        conn.commit()
+        if deleted == 0:
+            return {"ok": False, "error": "Row not found"}
+        return {"ok": True}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
