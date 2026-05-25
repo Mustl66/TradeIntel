@@ -48,4 +48,15 @@ PIPELINES = {
 }
 
 # Ordered stage list — controls execution sequence
-STAGE_ORDER = ["rss", "html", "edgar", "sector_map", "market_research", "macro_multiplier"]
+STAGE_ORDER = ["rss", "html", "edgar", "sector_map", "market_research", "macro_multiplier", "sentiment"]
+
+# ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
+MAX_EVAL_ARTICLES        = 30      # rolling window per symbol (newest N articles)
+ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
+SUMMARY_LLM_MODEL        = "google/gemma-4-e2b"   # Stage 1 model (fast, small)
+SENTIMENT_LAMBDA         = 0.02    # time-decay lambda (per hour)
+
+# ── Phase 4: Orchestrator Intervals (seconds) ─────────────────────────────────
+WORKER1_INTERVAL = 60       # GlobeNewswire live tracker — every 1 minute
+WORKER2_INTERVAL = 3600     # Universal news pipeline   — every 1 hour
+WORKER3_INTERVAL = 86400    # Macro / market research   — every 24 hours

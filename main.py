@@ -120,9 +120,9 @@ def run_stage(name: str, args):
         from pipeline.macro_multiplier import run
         run(limit=args.limit, dry_run=getattr(args, "dry_run", False))
 
-    # elif name == "sentiment":
-    #     from pipeline.sentiment import run
-    #     run(exchange=args.exchange, limit=args.limit)
+    elif name == "sentiment":
+        from pipeline.sentiment_scoring import run
+        run(exchange=args.exchange, limit=args.limit)
 
     else:
         logger.warning(f"Unknown stage '{name}' - skipped.")

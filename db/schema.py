@@ -201,7 +201,8 @@ def create_tables() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(_DDL)
-            # Idempotent ALTER — add sector_id to symbols if not present
+
+            # sector_id on symbols
             cur.execute("""
                 DO $$
                 BEGIN
@@ -215,6 +216,76 @@ def create_tables() -> None:
                     END IF;
                 END$$;
             """)
+
+            # Phase 4: news_articles new columns
+            cur.execute("""
+                DO $$
+                DECLARE col TEXT;
+                BEGIN
+                    FOREACH col IN ARRAY ARRAY['sentiment_score','weighted_sentiment'] LOOP
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='news_articles' AND column_name=col
+                        ) THEN
+                            EXECUTE format('ALTER TABLE news_articles ADD COLUMN %I NUMERIC(5,4)', col);
+                        END IF;
+                    END LOOP;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='article_summary') THEN
+                        ALTER TABLE news_articles ADD COLUMN article_summary TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='master_summary_snapshot') THEN
+                        ALTER TABLE news_articles ADD COLUMN master_summary_snapshot TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='key_events') THEN
+                        ALTER TABLE news_articles ADD COLUMN key_events JSONB;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='pre_summary_data') THEN
+                        ALTER TABLE news_articles ADD COLUMN pre_summary_data JSONB;
+                    END IF;
+                END$$;
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_news_unscored
+                    ON news_articles (symbol_id, published_at DESC)
+                    WHERE sentiment_score IS NULL;
+            """)
+
+            # Phase 4: symbols TradingView metrics + narrative columns
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='industry') THEN ALTER TABLE symbols ADD COLUMN industry VARCHAR(200); END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='market_cap_formatted') THEN ALTER TABLE symbols ADD COLUMN market_cap_formatted VARCHAR(50); END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='close_price') THEN ALTER TABLE symbols ADD COLUMN close_price NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_change') THEN ALTER TABLE symbols ADD COLUMN price_change NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_earnings_ttm') THEN ALTER TABLE symbols ADD COLUMN price_earnings_ttm NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_sales_ratio') THEN ALTER TABLE symbols ADD COLUMN price_sales_ratio NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_book_ratio') THEN ALTER TABLE symbols ADD COLUMN price_book_ratio NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='earnings_per_share_basic_ttm') THEN ALTER TABLE symbols ADD COLUMN earnings_per_share_basic_ttm NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_earnings_growth_ttm') THEN ALTER TABLE symbols ADD COLUMN price_earnings_growth_ttm NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='total_revenue') THEN ALTER TABLE symbols ADD COLUMN total_revenue NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='net_income') THEN ALTER TABLE symbols ADD COLUMN net_income NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='gross_margin') THEN ALTER TABLE symbols ADD COLUMN gross_margin NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='operating_margin') THEN ALTER TABLE symbols ADD COLUMN operating_margin NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='net_margin') THEN ALTER TABLE symbols ADD COLUMN net_margin NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='return_on_equity') THEN ALTER TABLE symbols ADD COLUMN return_on_equity NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='debt_to_equity') THEN ALTER TABLE symbols ADD COLUMN debt_to_equity NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='current_ratio') THEN ALTER TABLE symbols ADD COLUMN current_ratio NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='rsi') THEN ALTER TABLE symbols ADD COLUMN rsi NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='sma200') THEN ALTER TABLE symbols ADD COLUMN sma200 NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='price_52_week_high') THEN ALTER TABLE symbols ADD COLUMN price_52_week_high NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='relative_volume_10d_calc') THEN ALTER TABLE symbols ADD COLUMN relative_volume_10d_calc NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='average_volume_30d_calc') THEN ALTER TABLE symbols ADD COLUMN average_volume_30d_calc NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='dividend_yield_recent') THEN ALTER TABLE symbols ADD COLUMN dividend_yield_recent NUMERIC; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='number_of_employees') THEN ALTER TABLE symbols ADD COLUMN number_of_employees INTEGER; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='earnings_release_date') THEN ALTER TABLE symbols ADD COLUMN earnings_release_date TIMESTAMPTZ; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='symbol_forecast_narrative') THEN ALTER TABLE symbols ADD COLUMN symbol_forecast_narrative TEXT; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='symbol_master_summary') THEN ALTER TABLE symbols ADD COLUMN symbol_master_summary TEXT; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='final_score') THEN ALTER TABLE symbols ADD COLUMN final_score NUMERIC(6,4); END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='score_updated_at') THEN ALTER TABLE symbols ADD COLUMN score_updated_at TIMESTAMPTZ; END IF;
+                END$$;
+            """)
+
         conn.commit()
         logger.info("Database schema verified / created successfully.")
     except Exception as e:

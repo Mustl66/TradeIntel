@@ -1,0 +1,29 @@
+# TradeIntel — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework & server
+fastapi
+uvicorn[standard]
+
+# Database
+psycopg2-binary
+
+# HTTP & scraping
+requests
+beautifulsoup4
+feedparser
+
+# Date parsing
+python-dateutil
+
+# Environment variables
+python-dotenv
+
+# LLM client (LM Studio / OpenAI-compatible API)
+openai
+
+# TradingView data
+tradingview-screener
+
+# Testing
+pytest
