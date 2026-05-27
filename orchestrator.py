@@ -35,7 +35,7 @@ import requests
 import psycopg2.extras
 from bs4 import BeautifulSoup
 
-from db.connection import get_connection
+from db.connection import get_conn
 from pipeline_config import (
     WORKER1_INTERVAL,
     WORKER2_INTERVAL,
@@ -158,7 +158,7 @@ def worker1_tick():
     if not articles:
         return
 
-    conn = get_connection()
+    conn = get_conn()
     new_count = 0
     try:
         for art in articles:

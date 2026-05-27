@@ -39,7 +39,7 @@ from typing import Optional
 from openai import OpenAI
 
 from config import LLM_CONFIG, LLM_TYPE
-from db.connection import get_connection
+from db.connection import get_conn
 from pipeline_config import (
     MAX_EVAL_ARTICLES,
     ENABLE_PRE_SUMMARIZATION,
@@ -446,7 +446,7 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     limit=0 → all symbols. limit=N → first N symbols only.
     """
     started_at = datetime.now(timezone.utc)
-    conn = get_connection()
+    conn = get_conn()
 
     symbols = _get_symbols_with_unscored(conn, exchange, limit)
     if not symbols:
@@ -489,7 +489,7 @@ def score_single_article(article_id: int, symbol_id: int) -> bool:
     Used by the GlobeNewswire live tracker (Worker 1).
     Returns True on success.
     """
-    conn = get_connection()
+    conn = get_conn()
     try:
         # Load symbol
         with conn.cursor() as cur:
