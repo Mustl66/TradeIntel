@@ -20,6 +20,9 @@ def get_connection():
     return conn
 
 
+get_conn = get_connection  # alias used throughout codebase
+
+
 def test_connection() -> bool:
     """Quick connectivity check. Returns True on success."""
     try:

@@ -31,9 +31,9 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import feedparser
 import requests
 import psycopg2.extras
-from bs4 import BeautifulSoup
 
 from db.connection import get_conn
 from pipeline_config import (
@@ -55,58 +55,70 @@ logger = logging.getLogger("orchestrator")
 # Worker 1 — GlobeNewswire Live Tracker (every 1 minute)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_GNW_URL = "https://www.globenewswire.com/en/search/exchange/nasdaq?pageSize=50&page=1"
-_GNW_HEADERS = {
+# Official GNW RSS feed — returns last 20 NASDAQ press releases, refreshed ~every minute
+_GNW_RSS_URL = "https://www.globenewswire.com/RssFeed/exchange/NASDAQ"
+_GNW_RSS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control":   "no-cache",
+    "Cache-Control": "no-cache",
 }
 
 
 def _fetch_gnw_articles() -> list[dict]:
-    """Scrape GlobeNewswire NASDAQ search page. Returns list of raw article dicts."""
+    """
+    Fetch GlobeNewswire NASDAQ RSS feed.
+    Tickers are in <category domain="...rss/stock">Nasdaq:CWST</category> tags.
+    Returns list of dicts with keys: title, url, tickers, pub_str.
+    """
     try:
-        resp = requests.get(_GNW_URL, headers=_GNW_HEADERS, timeout=15)
+        resp = requests.get(_GNW_RSS_URL, headers=_GNW_RSS_HEADERS, timeout=15)
         resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
     except Exception as e:
-        logger.warning(f"[Worker1] GNW fetch failed: {e}")
+        logger.warning(f"[Worker1] GNW RSS fetch failed: {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    if feed.bozo:
+        logger.warning(f"[Worker1] GNW RSS parse warning: {feed.bozo_exception}")
+
     articles = []
-
-    for item in soup.select("article.oc-repeater-item, div.oc-listing-item, li.article"):
+    for entry in feed.entries:
         try:
-            title_el = item.select_one("a.oc-listing-title, h3 a, .article-title a")
-            if not title_el:
+            title = entry.get("title", "").strip()
+            url   = entry.get("link", "").strip()
+            if not title or not url:
                 continue
-            title = title_el.get_text(strip=True)
-            url   = title_el.get("href", "")
-            if url and not url.startswith("http"):
-                url = "https://www.globenewswire.com" + url
 
-            # Ticker/company tags
-            ticker_els = item.select(".oc-ticker-label, .ticker-tag, span.org-label")
-            tickers = [t.get_text(strip=True).upper() for t in ticker_els]
+            # Extract tickers from category tags with domain ending in /rss/stock
+            tickers = []
+            for tag in entry.get("tags", []):
+                scheme = tag.get("scheme", "")
+                term   = tag.get("term", "")
+                if "rss/stock" in (scheme or "") and ":" in term:
+                    # Format: "Nasdaq:CWST" -> "CWST"
+                    ticker = term.split(":", 1)[1].strip().upper()
+                    if ticker:
+                        tickers.append(ticker)
 
-            # Published date
-            time_el = item.select_one("time")
-            pub_str = time_el.get("datetime") if time_el else None
+            # Published date as ISO string
+            pub_str = None
+            if entry.get("published"):
+                pub_str = entry["published"]
 
             articles.append({
-                "title":    title,
-                "url":      url,
-                "tickers":  tickers,
-                "pub_str":  pub_str,
+                "title":   title,
+                "url":     url,
+                "tickers": tickers,
+                "pub_str": pub_str,
             })
         except Exception:
             continue
 
+    logger.info(f"[Worker1] GNW RSS returned {len(articles)} articles")
     return articles
 
 
@@ -165,6 +177,7 @@ def worker1_tick():
             for ticker in art["tickers"]:
                 symbol_id = _resolve_symbol_id(conn, ticker)
                 if not symbol_id:
+                    logger.debug(f"[Worker1] ticker {ticker} not in DB — skipping")
                     continue
                 art_id = _insert_article_if_new(
                     conn, symbol_id, art["title"], art["url"], art["pub_str"]
@@ -180,6 +193,7 @@ def worker1_tick():
     finally:
         conn.close()
 
+    logger.info(f"[Worker1] tick done — fetched={len(articles)} new={new_count} symbol_matches={new_count}")
     if new_count:
         logger.info(f"[Worker1] {new_count} new GNW articles inserted + queued for scoring")
 
@@ -270,18 +284,19 @@ def main():
             daemon=True,
             name="Worker1-GNW",
         ),
-        threading.Thread(
-            target=_run_worker,
-            args=("Worker2", WORKER2_INTERVAL, worker2_tick),
-            daemon=True,
-            name="Worker2-News",
-        ),
-        threading.Thread(
-            target=_run_worker,
-            args=("Worker3", WORKER3_INTERVAL, worker3_tick),
-            daemon=True,
-            name="Worker3-Macro",
-        ),
+        # Worker2 and Worker3 disabled — will be enabled in a future phase
+        # threading.Thread(
+        #     target=_run_worker,
+        #     args=("Worker2", WORKER2_INTERVAL, worker2_tick),
+        #     daemon=True,
+        #     name="Worker2-News",
+        # ),
+        # threading.Thread(
+        #     target=_run_worker,
+        #     args=("Worker3", WORKER3_INTERVAL, worker3_tick),
+        #     daemon=True,
+        #     name="Worker3-Macro",
+        # ),
     ]
 
     for t in threads:

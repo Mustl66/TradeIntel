@@ -23,6 +23,119 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [3.0.1] – 2026-05-27 — Worker 1 GNW RSS Fix + Logging
+
+#### Problem
+Worker 1 was completely silent after startup. Two root causes:
+
+1. `_GNW_URL` pointed to a broken HTML page. The old scraper used guessed CSS selectors
+   (`article.oc-repeater-item`, `li.article`) that never matched real GlobeNewswire HTML.
+   Result: 0 articles fetched on every tick, silently.
+
+2. Key log lines were at `DEBUG` level — never shown at default `INFO` logging.
+   Worker 1 ticks produced zero output even when running correctly.
+
+3. `scheme = None` crash: when feedparser returns a link with no scheme,
+   `"rss/stock" in scheme` threw `TypeError: argument of type 'NoneType' is not iterable`.
+   Caught silently by `except Exception: continue` — every entry skipped.
+
+#### Fix: Official GNW RSS Feed
+Replaced the entire HTML scraper with the official GlobeNewswire NASDAQ RSS feed:
+```
+https://www.globenewswire.com/RssFeed/exchange/NASDAQ
+```
+Returns 20 real press releases per poll. Tickers are embedded as `<category>Nasdaq:CWST</category>`.
+Exchange prefix stripped before DB lookup (`CWST` not `Nasdaq:CWST`).
+No browser / Playwright / CSS selectors needed — pure feedparser.
+
+#### Fix: scheme=None TypeError
+```python
+# Before (crashes when scheme=None):
+if "rss/stock" in scheme:
+# After:
+if "rss/stock" in (scheme or ""):
+```
+
+#### Fix: Logging bumped to INFO
+Worker 1 now logs at INFO level on every tick:
+```
+[Worker1] GNW RSS returned 20 articles
+[Worker1] tick done — fetched=20 new=5 symbol_matches=12
+[Worker1] ticker CWST not found in DB symbols (skipped)
+```
+
+#### Workers 2 + 3 disabled
+Workers 2 and 3 are commented out in `orchestrator.py` `main()`.
+Code preserved — not deleted. Will be re-enabled in a later phase.
+
+#### Files Changed
+- `pipeline/orchestrator.py` — GNW URL replaced, feedparser RSS ingest, scheme fix, INFO logs
+- `pipeline/orchestrator.py` — worker2_tick + worker3_tick calls removed from `main()`
+
+---
+
+### [3.0.0] – 2026-05-27 — Phase 4: Live Orchestrator + Sentiment Scoring Foundation
+
+#### Architecture: Separate Orchestrator Process
+`orchestrator.py` introduced as a long-running background process, separate from `main.py`.
+`main.py` remains the one-shot batch pipeline. `orchestrator.py` is the live daemon.
+
+Three workers defined (W2+W3 disabled at launch — see v3.0.1):
+
+| Worker | Interval | Task |
+|--------|----------|------|
+| Worker 1 | 60s | GlobeNewswire live press releases → instant sentiment score |
+| Worker 2 | 1hr | RSS + HTML ingest → score unscored articles |
+| Worker 3 | 24hr | Market research ingest + macro multiplier LLM rerun |
+
+Worker 1 runs `score_single_article(art_id, symbol_id)` in a daemon thread
+immediately after each new article is inserted — sub-minute latency from publish to score.
+
+#### DB Schema (db/schema.py)
+New columns on `news_articles`:
+- `sentiment_score NUMERIC(5,3)` — raw LLM score (-1.000 to +1.000)
+- `weighted_sentiment NUMERIC(5,3)` — score × e^(−λt) time-decay
+- `article_summary TEXT` — Stage 1 LLM pre-summary (cached)
+- `master_summary_snapshot TEXT` — rolling symbol-level context snapshot at score time
+- `key_events JSONB` — structured events extracted by LLM
+- `pre_summary_data JSONB` — gemma pre-summary cache (avoids re-summarizing on rescore)
+
+New columns on `symbols`:
+- `final_score NUMERIC(8,4)` — aggregated weighted score across all articles
+- `score_updated_at TIMESTAMPTZ`
+- `symbol_master_summary TEXT` — latest rolling narrative for the symbol
+- `symbol_forecast_narrative TEXT` — forward-looking LLM output
+
+Partial index on `news_articles WHERE sentiment_score IS NULL` for fast unscored queries.
+
+#### pipeline/sentiment_scoring.py
+Two-stage LLM pipeline:
+- Stage 1: gemma-4b (fast, cheap) — pre-summarize article, cache in `pre_summary_data`
+- Stage 2: main LLM — stateful scoring with rolling `master_summary` context per symbol
+- Time-decay: `weighted = score × exp(−λ × t_hours)` where λ from `pipeline_config.py`
+- Public API: `run()` (batch all unscored), `score_single_article(art_id, symbol_id)` (fast path)
+
+#### pipeline_config.py additions
+```python
+WORKER1_INTERVAL = 60      # seconds
+WORKER2_INTERVAL = 3600
+WORKER3_INTERVAL = 86400
+MAX_EVAL_ARTICLES = 50
+ENABLE_PRE_SUMMARIZATION = True
+SUMMARY_LLM_MODEL = "google/gemma-4-e2b"
+SENTIMENT_LAMBDA = 0.05    # decay rate
+```
+
+#### Files Changed
+- `db/schema.py` — sentiment columns on news_articles + symbols, partial index
+- `pipeline/sentiment_scoring.py` — new file
+- `pipeline/orchestrator.py` — new file
+- `pipeline_config.py` — worker intervals + scoring config
+- `main.py` — `sentiment` stage wired in
+- `requirements.txt` — created
+
+---
+
 ### [2.1.0] – 2026-05-25 — Bug Fixes, Dev Controls, Market Scores Admin Panel
 
 #### Bug Fixes
