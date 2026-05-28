@@ -34,6 +34,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from openai import OpenAI
@@ -46,6 +47,26 @@ from pipeline_config import (
     SUMMARY_LLM_MODEL,
     SENTIMENT_LAMBDA,
 )
+
+# ── Load instruction JSONs ────────────────────────────────────────────────────
+
+_CONFIG_DIR = Path(__file__).parent.parent / "config"
+
+
+def _load_instruction(filename: str) -> str:
+    """Load a JSON instruction file and return its content as a formatted string."""
+    path = _CONFIG_DIR / filename
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[instructions] Failed to load {filename}: {e}")
+        return "{}"
+
+
+_STAGE1_INSTRUCTION_JSON = _load_instruction("stage1_instruction.json")
+_STAGE2_INSTRUCTION_JSON = _load_instruction("stage2_instruction.json")
 
 logger = logging.getLogger(__name__)
 
@@ -62,34 +83,31 @@ def _get_summary_client() -> OpenAI:
 
 # ── Stage 1: Pre-summarization prompt ─────────────────────────────────────────
 
-_STAGE1_SYSTEM = """You are a financial news extraction engine. Your ONLY job is to process raw news text and return structured JSON.
-
-Extract all hard business facts. Strip boilerplate, legal disclaimers, and website navigation noise.
-
-Return ONLY valid JSON — no markdown, no explanation:
-{
-  "extended_summary": "Dense multi-sentence summary preserving ALL event trajectories, market dynamics, financial figures, and operational details.",
-  "extracted_facts": {
-    "contracts": "Specific contract terms, counter-parties, dollar amounts. Null if none.",
-    "patents": "Patent numbers, descriptions, clinical phase clearings. Null if none.",
-    "mergers_acquisitions": "Target companies, acquisition stakes, joint-venture intents. Null if none.",
-    "sector_and_macro_tags": "Market conditions, supply chain shifts, regulatory changes. Null if none."
-  }
-}"""
+_STAGE1_SYSTEM = (
+    "You are a financial news extraction engine operating under the following instruction schema.\n\n"
+    + _STAGE1_INSTRUCTION_JSON
+    + "\n\nReturn ONLY valid JSON matching the output_schema above. No markdown, no explanation."
+)
 
 
 def _call_stage1(client: OpenAI, text: str) -> Optional[dict]:
     """Fast pre-summarization. Returns dict or None on failure."""
     try:
-        resp = client.chat.completions.create(
+        kwargs1 = dict(
             model=SUMMARY_LLM_MODEL,
             temperature=0.05,
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[
                 {"role": "system", "content": _STAGE1_SYSTEM},
-                {"role": "user",   "content": f"Extract facts from this article:\n\n{text[:3000]}"},
+                {"role": "user",   "content": f"Extract facts from this article:\n\n{text[:6000]}"},
             ],
         )
+        if LLM_TYPE == "ollama":
+            kwargs1["extra_body"] = {
+                "num_ctx": LLM_CONFIG.get("context_size", 16384),
+                "top_k":   LLM_CONFIG.get("top_k", 40),
+            }
+        resp = client.chat.completions.create(**kwargs1)
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -103,37 +121,11 @@ def _call_stage1(client: OpenAI, text: str) -> Optional[dict]:
 
 # ── Stage 2: Stateful sentiment prompt ────────────────────────────────────────
 
-_STAGE2_SYSTEM = """You are a professional financial analyst AI. You evaluate news articles in chronological sequence for a specific stock symbol.
-
-You receive:
-- A TradingView snapshot with fundamental/technical metrics
-- The current article (title + text)
-- Previous state: rolling master_summary and last sentiment score
-
-Your tasks:
-1. Score the article sentiment from -1.00 (very negative) to +1.00 (very positive)
-   - Consider the article in context of the master_summary history
-   - Weight operational/fundamental catalysts heavily
-   - Ignore routine press releases and promotional fluff
-2. Write a 1-sentence article_summary
-3. Extract key_events (contracts, patents, mergers, sector_impact) — null if none
-4. Update the master_summary: a dense rolling narrative of all significant events seen so far
-5. Write a forward-looking forecast until the next earnings date (if known)
-
-Return ONLY valid JSON — no markdown, no explanation:
-{
-  "sentiment_score": 0.65,
-  "article_summary": "One sentence summary.",
-  "key_events": {
-    "contracts": null,
-    "patents": null,
-    "mergers": null,
-    "sector_impact": null
-  },
-  "updated_master_summary": "Rolling cumulative narrative of all significant events.",
-  "forecast_until_earnings": "Forward outlook based on all evidence seen.",
-  "score_rationale": "Brief explanation of the sentiment score."
-}"""
+_STAGE2_SYSTEM = (
+    "You are a professional financial analyst AI operating under the following instruction schema.\n\n"
+    + _STAGE2_INSTRUCTION_JSON
+    + "\n\nReturn ONLY valid JSON matching the output_schema above. No markdown, no explanation."
+)
 
 
 def _build_stage2_prompt(
@@ -172,7 +164,7 @@ def _call_stage2(client: OpenAI, prompt: str) -> Optional[dict]:
     kwargs = {
         "model":             LLM_CONFIG["model"],
         "temperature":       LLM_CONFIG["temperature"],
-        "max_tokens":        min(LLM_CONFIG["max_tokens"], 2048),
+        "max_tokens":        LLM_CONFIG["max_tokens"],
         "top_p":             LLM_CONFIG["top_p"],
         "frequency_penalty": LLM_CONFIG["frequency_penalty"],
         "presence_penalty":  LLM_CONFIG["presence_penalty"],
@@ -182,7 +174,10 @@ def _call_stage2(client: OpenAI, prompt: str) -> Optional[dict]:
         ],
     }
     if LLM_TYPE == "ollama":
-        kwargs["extra_body"] = {"top_k": LLM_CONFIG.get("top_k", 40)}
+        kwargs["extra_body"] = {
+            "num_ctx": LLM_CONFIG.get("context_size", 16384),
+            "top_k":   LLM_CONFIG.get("top_k", 40),
+        }
     try:
         resp = client.chat.completions.create(**kwargs)
         raw = resp.choices[0].message.content.strip()
@@ -274,7 +269,7 @@ def _get_macro_multiplier(conn, industry: str) -> float:
 
 def _save_article_result(cur, article_id: int, result: dict,
                          master_snapshot: str, pre_summary: Optional[dict],
-                         published_at: datetime):
+                         published_at: datetime, stage2_prompt: str = ""):
     score = float(result.get("sentiment_score", 0.0))
     score = max(-1.0, min(1.0, score))
     weighted = _time_decay(score, published_at)
@@ -285,6 +280,9 @@ def _save_article_result(cur, article_id: int, result: dict,
         "article_summary":         (result.get("article_summary") or "")[:500],
         "master_summary_snapshot": master_snapshot,
         "key_events":              json.dumps(result.get("key_events") or {}),
+        "score_rationale":         (result.get("score_rationale") or "")[:1000],
+        "forecast_until_earnings": (result.get("forecast_until_earnings") or "")[:2000],
+        "stage2_prompt":           stage2_prompt,
     }
     if pre_summary:
         updates["pre_summary_data"] = json.dumps(pre_summary)
@@ -296,7 +294,10 @@ def _save_article_result(cur, article_id: int, result: dict,
             article_summary         = %(article_summary)s,
             master_summary_snapshot = %(master_summary_snapshot)s,
             key_events              = %(key_events)s::jsonb,
-            pre_summary_data        = COALESCE(%(pre_summary_data)s::jsonb, pre_summary_data)
+            pre_summary_data        = COALESCE(%(pre_summary_data)s::jsonb, pre_summary_data),
+            score_rationale         = %(score_rationale)s,
+            forecast_until_earnings = %(forecast_until_earnings)s,
+            stage2_prompt           = %(stage2_prompt)s
         WHERE id = %(id)s
     """, {**updates, "id": article_id,
           "pre_summary_data": json.dumps(pre_summary) if pre_summary else None})
@@ -407,15 +408,15 @@ def _process_symbol(
 
         raw_score = float(result.get("sentiment_score", 0.0))
         raw_score = max(-1.0, min(1.0, raw_score))
+
         weighted  = _time_decay(raw_score, published_at)
 
         # Save to DB
         with conn.cursor() as cur:
             _save_article_result(cur, art_id, result,
-                                 master_summary, stage1_result, published_at)
+                                 master_summary, stage1_result, published_at,
+                                 stage2_prompt=prompt)
         conn.commit()
-
-        # Advance state
         master_summary = result.get("updated_master_summary") or master_summary
         last_forecast  = result.get("forecast_until_earnings") or last_forecast
         last_score     = raw_score
@@ -549,7 +550,8 @@ def score_single_article(article_id: int, symbol_id: int) -> bool:
 
         with conn.cursor() as cur:
             _save_article_result(cur, article_id, result,
-                                 master_summary, stage1_result, article["published_at"])
+                                 master_summary, stage1_result, article["published_at"],
+                                 stage2_prompt=prompt)
             # Update symbol master_summary
             new_master = result.get("updated_master_summary") or master_summary
             cur.execute("""

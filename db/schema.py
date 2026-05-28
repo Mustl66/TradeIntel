@@ -242,6 +242,12 @@ def create_tables() -> None:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='pre_summary_data') THEN
                         ALTER TABLE news_articles ADD COLUMN pre_summary_data JSONB;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='score_rationale') THEN
+                        ALTER TABLE news_articles ADD COLUMN score_rationale TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='forecast_until_earnings') THEN
+                        ALTER TABLE news_articles ADD COLUMN forecast_until_earnings TEXT;
+                    END IF;
                 END$$;
             """)
             cur.execute("""

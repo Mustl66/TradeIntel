@@ -1,0 +1,17 @@
+Worker 2 Design Session — 2026-05-27
+======================================
+
+PURPOSE:
+Every 1 hour — run full RSS + HTML ingest for ALL symbols in DB,
+then score any unscored articles. Broader coverage than W1.
+W1 = GlobeNewswire NASDAQ only (60s).
+W2 = all rss_feeds in DB (Yahoo, Benzinga, Seeking Alpha, etc.).
+
+DECISIONS MADE:
+Q1: Overlap with W1 OK? YES — dedupe via article_hash prevents double-inserts.
+Q2: If W2 still running when 1hr timer fires? QUEUE another run (threading.Queue, FIFO consumer).
+Q3: Which pipeline stages? rss_ingest → html_ingest → sentiment_scoring. SKIP EDGAR + market research.
+Q4: Score all unscored or only recent? ALL unscored (sentiment_score IS NULL) — existing filter.
+Q5: Concurrency limit? — NOT ANSWERED YET (session saved here)
+
+NEXT SESSION: Answer Q5 (concurrency limit for symbols), then implement.

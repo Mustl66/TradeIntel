@@ -23,6 +23,90 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [3.0.3] – 2026-05-28 — LLM Instruction JSONs + Full Scoring Schema
+
+#### config/stage1_instruction.json
+Full extraction schema for Stage 1 (gemma-4-e2b). Replaces hardcoded system prompt.
+Fields now extracted per article:
+- extended_summary (4-8 dense analyst sentences)
+- financial_figures: revenue, EPS, guidance, deal_value
+- contracts: counterparty, value, duration, significance
+- patents_and_ip: patent numbers, clinical phase, regulatory status
+- mergers_and_acquisitions: type, target, stake, deal_value, expected_close
+- partnerships_and_collaborations: partner, purpose, revenue_share, exclusivity
+- management_changes: name, role, change_type, effective_date
+- legal_and_regulatory: type, authority, amount, status
+- product_and_technology: product_name, launch_status, target_market
+- connected_companies: all named companies for future relationship mapping
+- earnings_and_dates: next_earnings_date, dividend, buyback
+- industry_and_market: primary_industry, sub_sector, geographic_markets, macro_tags
+- sentiment_signals: tone, urgency, materiality, flags
+
+#### config/stage2_instruction.json
+Full scoring rubric + stateful analyst schema for Stage 2 (main LLM). Replaces hardcoded system prompt.
+Scoring rubric with explicit score ranges:
+- very_positive [0.70, 1.00]: earnings beat >10%, major acquisition, FDA approval, large contract
+- positive [0.30, 0.69]: in-line earnings + guidance, patent granted, Phase 3 trial success
+- mildly_positive [0.05, 0.29]: minor MOU, routine product update, small contract
+- neutral [-0.04, 0.04]: routine filings, boilerplate IR, no material content
+- mildly_negative [-0.29, -0.05]: guidance slight miss, minor delay, small fine
+- negative [-0.69, -0.30]: 5-15% miss, CEO departure, SEC investigation, product recall
+- very_negative [-1.00, -0.70]: >15% miss, bankruptcy, fraud, regulatory ban
+Adjustment factors: context_weight, materiality_weight, valuation_context, earnings_proximity
+Expanded key_events output: + management_change, legal_regulatory, product_launch, earnings_signal
+
+#### pipeline/sentiment_scoring.py
+- Instruction JSONs loaded at startup from config/ via _load_instruction()
+- _STAGE1_SYSTEM and _STAGE2_SYSTEM now built from JSON content
+- Hot-reloadable: edit JSON files, restart orchestrator — no code change needed
+- score_rationale now required to reference rubric category and adjustments applied
+
+### [3.0.2] – 2026-05-28 — Worker 2 Implementation + Per-Article Score Detail
+
+#### Worker 2: Full RSS + HTML + Scoring Pipeline
+Worker 2 is now live. Architecture: two threads per W2 lifecycle.
+
+- `Worker2-Scheduler` thread fires every 1 hour via `_run_worker`. It only enqueues
+  a timestamp token into `_w2_queue` — it never blocks.
+- `Worker2-Consumer` thread blocks on `_w2_queue.get()`. Processes one full run at a time.
+  If the 1-hour tick fires while a run is still in progress, the token queues up (FIFO).
+  Next run starts immediately after the current one finishes — no tick is ever lost.
+
+Worker 2 run sequence (3 steps):
+1. `pipeline.news_ingest.run(exchange="NASDAQ", limit=0)` — RSS/Atom feeds
+2. Random delay `RSS_DELAY_RANGE=(0.2, 1.0)s` between stages (humanization)
+3. `pipeline.html_ingest.run(exchange="NASDAQ", limit=0)` — HTML feeds
+4. `pipeline.sentiment_scoring.run(exchange="NASDAQ", limit=0)` — score ALL unscored articles
+
+Overlap with W1 is OK — `article_hash` dedupe prevents double-inserts.
+EDGAR + market research explicitly excluded (those belong to W3).
+
+#### Humanization
+- RSS stage: `random.uniform(*RSS_DELAY_RANGE)` — 0.2–1.0s between stage 1 and 2
+- HTML stage delay lives inside `html_ingest.py` (`HTML_DELAY_RANGE` configurable)
+- `pipeline_config.py` exposes `RSS_DELAY_RANGE` and `HTML_DELAY_RANGE` as tuples
+
+#### Per-Article Score Detail — New DB Columns
+Two new columns added to `news_articles`:
+- `score_rationale TEXT` — brief LLM explanation of why that sentiment score was assigned
+- `forecast_until_earnings TEXT` — per-article forward outlook extracted from Stage 2
+
+Previously these fields were returned by Stage 2 but only `forecast_until_earnings` was
+saved to `symbols.symbol_forecast_narrative` (symbol-level, not per-article).
+Now both are persisted per article, enabling future per-article drill-down in the admin UI.
+
+`_save_article_result()` in `sentiment_scoring.py` updated to write both columns.
+
+#### Files Changed
+- `orchestrator.py` — `worker2_tick` enqueues to `_w2_queue`; `_worker2_consumer` runs pipeline;
+  W2 scheduler + consumer threads added to `main()`; `queue` imported;
+  `RSS_DELAY_RANGE` + `HTML_DELAY_RANGE` imported from `pipeline_config`
+- `pipeline/sentiment_scoring.py` — `_save_article_result` saves `score_rationale` + `forecast_until_earnings`
+- `db/schema.py` — `score_rationale TEXT` + `forecast_until_earnings TEXT` columns added with
+  idempotent `ALTER TABLE IF NOT EXISTS` guards
+
+---
+
 ### [3.0.1] – 2026-05-27 — Worker 1 GNW RSS Fix + Logging
 
 #### Problem
@@ -73,6 +157,42 @@ Code preserved — not deleted. Will be re-enabled in a later phase.
 - `pipeline/orchestrator.py` — worker2_tick + worker3_tick calls removed from `main()`
 
 ---
+
+### [3.0.4] – 2026-05-28 — Ollama ctx fix, LLM debug tab, stage2_prompt saved
+
+#### Ollama `num_ctx` override
+Ollama defaults context window to 2048 tokens — silently truncating inputs.
+Both Stage 1 and Stage 2 now pass `num_ctx` via `extra_body` when `LLM_TYPE="ollama"`:
+```python
+extra_body = {"num_ctx": LLM_CONFIG["context_size"], "top_k": LLM_CONFIG["top_k"]}
+```
+Stage 1 article input limit also raised 3000 → 6000 chars. Stage 1 `max_tokens` 1024 → 2048.
+Stage 2 removed artificial `min(..., 2048)` cap — now uses full `LLM_CONFIG["max_tokens"]`.
+
+#### stage2_prompt saved per article
+New column `news_articles.stage2_prompt TEXT` — the exact JSON blob sent to the main LLM.
+Both `_process_symbol` and `score_single_article` now pass `stage2_prompt=prompt` to `_save_article_result`.
+Articles scored before v3.0.4 show "Not saved — scored before v3.0.4" in the debug view.
+
+#### Admin: 🔬 LLM Debug tab
+New tab on every symbol detail panel. Two views:
+- List view: all articles sorted newest first, score (+/-/unscored) color-coded, S1✓/PROMPT✓ chips
+- Detail view (click any article): full breakdown of every field:
+  - Sentiment score + weighted score + source
+  - Article summary, score rationale, forecast until earnings
+  - Key events JSON (Stage 2 output)
+  - Stage 1 pre_summary_data JSON
+  - Master summary snapshot (context at time of scoring)
+  - Full Stage 2 prompt (exact input sent to LLM)
+  - Raw article full_text (up to 5000 chars)
+
+#### Files Changed
+- `pipeline/sentiment_scoring.py` — Ollama num_ctx, Stage1 text limit, Stage2 max_tokens cap removed, stage2_prompt saved
+- `db/schema.py` (migration run) — `news_articles.stage2_prompt TEXT`
+- `admin.py` — import json added, 🔬 LLM Debug tab + route `/symbol/{id}/debug`
+
+---
+
 
 ### [3.0.0] – 2026-05-27 — Phase 4: Live Orchestrator + Sentiment Scoring Foundation
 

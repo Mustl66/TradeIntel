@@ -26,6 +26,7 @@ Config (pipeline_config.py):
 import hashlib
 import json
 import logging
+import queue
 import sys
 import threading
 import time
@@ -41,7 +42,13 @@ from pipeline_config import (
     WORKER2_INTERVAL,
     WORKER3_INTERVAL,
     SYMBOL_LIMIT,
+    RSS_DELAY_RANGE,
+    HTML_DELAY_RANGE,
 )
+
+# ── Worker 2 FIFO queue ────────────────────────────────────────────────────────
+# Each 1-hour tick enqueues a token. Consumer thread processes one run at a time.
+_w2_queue: queue.Queue = queue.Queue()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -203,24 +210,55 @@ def worker1_tick():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def worker2_tick():
-    """Run RSS + HTML ingest for symbols with new articles, then score them."""
-    from news_ingest_runner import run as news_run
+    """Called by the 1-hour scheduler — just enqueues a run token."""
+    qsize = _w2_queue.qsize()
+    _w2_queue.put(time.time())
+    logger.info(f"[Worker2] Tick enqueued (queue depth now {qsize + 1})")
+
+
+def _worker2_consumer():
+    """
+    Dedicated consumer thread — processes W2 run tokens one at a time (FIFO).
+    If the queue had backlog, runs immediately without waiting for the next tick.
+    """
+    import random
+    from pipeline.news_ingest import run as rss_run
+    from pipeline.html_ingest import run as html_run
     from pipeline.sentiment_scoring import run as sentiment_run
 
-    try:
-        logger.info("[Worker2] Starting RSS + HTML ingest...")
-        result = news_run(exchange="NASDAQ", limit=0, scrape_full_text=True)
-        new_articles = result.get("articles_new", 0) + result.get("html_new", 0)
-        logger.info(f"[Worker2] Ingest done — new={new_articles}")
+    logger.info("[Worker2-Consumer] Ready — waiting for ticks")
+    while True:
+        token = _w2_queue.get()  # blocks until a tick arrives
+        enqueued_at = datetime.fromtimestamp(token).strftime("%H:%M:%S")
+        logger.info(f"[Worker2] Run starting (enqueued at {enqueued_at}, "
+                    f"queue depth after dequeue={_w2_queue.qsize()})")
+        try:
+            # Step 1: RSS ingest (feed_type: rss/atom/unknown)
+            logger.info("[Worker2] Step 1/3 — RSS ingest")
+            rss_result = rss_run(exchange="NASDAQ", limit=0, scrape_full_text=True)
+            rss_new = rss_result.get("articles_new", 0)
+            logger.info(f"[Worker2] RSS done — new={rss_new}")
 
-        if new_articles > 0:
-            logger.info("[Worker2] Running sentiment scoring on new articles...")
+            # Humanization delay between stages
+            time.sleep(random.uniform(*RSS_DELAY_RANGE))
+
+            # Step 2: HTML ingest (feed_type: html)
+            logger.info("[Worker2] Step 2/3 — HTML ingest")
+            html_result = html_run(exchange="NASDAQ", limit=0, scrape_full_text=True)
+            html_new = html_result.get("articles_new", 0)
+            logger.info(f"[Worker2] HTML done — new={html_new}")
+
+            # Step 3: Score ALL unscored articles
+            logger.info("[Worker2] Step 3/3 — Sentiment scoring (all unscored)")
             score_result = sentiment_run(exchange="NASDAQ", limit=0)
             logger.info(f"[Worker2] Scoring done — {score_result}")
-        else:
-            logger.info("[Worker2] No new articles — skipping sentiment scoring")
-    except Exception as e:
-        logger.error(f"[Worker2] Error: {e}", exc_info=True)
+
+            logger.info(f"[Worker2] Run complete — rss_new={rss_new} html_new={html_new}")
+
+        except Exception as e:
+            logger.error(f"[Worker2] Run failed: {e}", exc_info=True)
+        finally:
+            _w2_queue.task_done()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,8 +311,8 @@ def main():
     logger.info("=" * 60)
     logger.info("TradeIntel Orchestrator starting")
     logger.info(f"  Worker1 (GlobeNewswire live): every {WORKER1_INTERVAL}s")
-    logger.info(f"  Worker2 (News pipeline):      every {WORKER2_INTERVAL}s")
-    logger.info(f"  Worker3 (Macro research):     every {WORKER3_INTERVAL}s")
+    logger.info(f"  Worker2 (News pipeline):      every {WORKER2_INTERVAL}s  [ACTIVE — FIFO queue]")
+    logger.info(f"  Worker3 (Macro research):     every {WORKER3_INTERVAL}s  [DISABLED]")
     logger.info("=" * 60)
 
     threads = [
@@ -284,13 +322,18 @@ def main():
             daemon=True,
             name="Worker1-GNW",
         ),
-        # Worker2 and Worker3 disabled — will be enabled in a future phase
-        # threading.Thread(
-        #     target=_run_worker,
-        #     args=("Worker2", WORKER2_INTERVAL, worker2_tick),
-        #     daemon=True,
-        #     name="Worker2-News",
-        # ),
+        threading.Thread(
+            target=_run_worker,
+            args=("Worker2", WORKER2_INTERVAL, worker2_tick),
+            daemon=True,
+            name="Worker2-Scheduler",
+        ),
+        threading.Thread(
+            target=_worker2_consumer,
+            daemon=True,
+            name="Worker2-Consumer",
+        ),
+        # Worker3 disabled — will be enabled in a future phase
         # threading.Thread(
         #     target=_run_worker,
         #     args=("Worker3", WORKER3_INTERVAL, worker3_tick),

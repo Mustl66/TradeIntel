@@ -18,6 +18,7 @@ Features:
 
 import sys
 import os
+import json
 import webbrowser
 import threading
 import logging
@@ -463,6 +464,8 @@ async def symbol_feeds(sym_id: int):
         onclick="switchTab({sym_id},'news')">News</button>
       <button class="tab-btn" id="tab-sec-{sym_id}"
         onclick="switchTab({sym_id},'sec')">SEC Filings</button>
+      <button class="tab-btn" id="tab-debug-{sym_id}"
+        onclick="switchTab({sym_id},'debug')">🔬 LLM Debug</button>
     </div>
     <div id="tab-content-{sym_id}" class="panel-body" style="padding-bottom:20px">
     """
@@ -542,6 +545,7 @@ async def symbol_feeds(sym_id: int):
       document.getElementById('tab-feeds-' + symId).classList.toggle('active', tab === 'feeds');
       document.getElementById('tab-news-' + symId).classList.toggle('active', tab === 'news');
       document.getElementById('tab-sec-' + symId).classList.toggle('active', tab === 'sec');
+      document.getElementById('tab-debug-' + symId).classList.toggle('active', tab === 'debug');
       const content = document.getElementById('tab-content-' + symId);
       if (tab === 'news') {{
         content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
@@ -549,6 +553,9 @@ async def symbol_feeds(sym_id: int):
       }} else if (tab === 'sec') {{
         content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
         htmx.ajax('GET', '/symbol/' + symId + '/sec?page=1', content);
+      }} else if (tab === 'debug') {{
+        content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
+        htmx.ajax('GET', '/symbol/' + symId + '/debug?page=1', content);
       }} else {{
         htmx.ajax('GET', '/symbol/' + symId + '/feeds', '#feed-panel');
       }}
@@ -1043,6 +1050,171 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
 
     return HTMLResponse(html)
 
+
+
+
+# ── LLM Debug route ───────────────────────────────────────────────────────────
+
+@app.get("/symbol/{sym_id}/debug", response_class=HTMLResponse)
+async def symbol_debug(sym_id: int, page: int = 1, art_id: int = 0):
+    """Show full LLM input/output for scored articles. art_id=0 → list view."""
+    per_page = 15
+    offset   = (page - 1) * per_page
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # If specific article requested, show full detail
+            if art_id:
+                cur.execute("""
+                    SELECT id, title, url, published_at, source_name,
+                           sentiment_score, weighted_sentiment,
+                           article_summary, score_rationale, forecast_until_earnings,
+                           stage2_prompt, pre_summary_data, key_events,
+                           master_summary_snapshot, full_text
+                    FROM news_articles WHERE id = %s AND symbol_id = %s
+                """, (art_id, sym_id))
+                art = cur.fetchone()
+                if not art:
+                    return HTMLResponse('<div class="empty-state">Article not found.</div>')
+
+                def esc(s):
+                    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+                score = art["sentiment_score"]
+                score_color = "#4ade80" if (score or 0) > 0.1 else "#f87171" if (score or 0) < -0.1 else "#fbbf24"
+                pub = art["published_at"].strftime("%Y-%m-%d %H:%M") if art["published_at"] else "?"
+
+                html = f"""
+                <div style="padding:14px 16px">
+                  <button class="btn btn-ghost" style="margin-bottom:12px"
+                    hx-get="/symbol/{sym_id}/debug?page={page}"
+                    hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Back to list</button>
+
+                  <div style="font-weight:700;font-size:1rem;color:#e2e8f0;margin-bottom:4px">{esc(art['title'])}</div>
+                  <div style="font-size:0.72rem;color:#475569;margin-bottom:12px">📅 {pub} &nbsp;·&nbsp; <a href="{art['url'] or '#'}" target="_blank" style="color:#60a5fa">source ↗</a></div>
+
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:16px">
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px">
+                      <div style="font-size:0.65rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Sentiment Score</div>
+                      <div style="font-size:1.6rem;font-weight:800;color:{score_color}">{f"{score:+.3f}" if score is not None else "unscored"}</div>
+                    </div>
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px">
+                      <div style="font-size:0.65rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Weighted (decay)</div>
+                      <div style="font-size:1.6rem;font-weight:800;color:#94a3b8">{f"{art['weighted_sentiment']:+.3f}" if art['weighted_sentiment'] is not None else "—"}</div>
+                    </div>
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px">
+                      <div style="font-size:0.65rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Source</div>
+                      <div style="font-size:0.9rem;font-weight:700;color:#60a5fa">{esc(art['source_name'] or '?')}</div>
+                    </div>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#60a5fa;font-weight:700;margin-bottom:4px">SUMMARY</div>
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.82rem;color:#e2e8f0;line-height:1.6">{esc(art['article_summary'] or '—')}</div>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#f59e0b;font-weight:700;margin-bottom:4px">SCORE RATIONALE</div>
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.82rem;color:#e2e8f0;line-height:1.6">{esc(art['score_rationale'] or '—')}</div>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#a78bfa;font-weight:700;margin-bottom:4px">FORECAST UNTIL EARNINGS</div>
+                    <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.82rem;color:#e2e8f0;line-height:1.6">{esc(art['forecast_until_earnings'] or '—')}</div>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#34d399;font-weight:700;margin-bottom:4px">KEY EVENTS (JSON)</div>
+                    <pre style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.75rem;color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto">{esc(json.dumps(art['key_events'], indent=2, ensure_ascii=False) if art['key_events'] else '{}')}</pre>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#38bdf8;font-weight:700;margin-bottom:4px">STAGE 1 OUTPUT (pre_summary_data)</div>
+                    <pre style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.75rem;color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto">{esc(json.dumps(art['pre_summary_data'], indent=2, ensure_ascii=False) if art['pre_summary_data'] else 'Stage 1 not run / no data')}</pre>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#fb923c;font-weight:700;margin-bottom:4px">MASTER SUMMARY SNAPSHOT (at time of scoring)</div>
+                    <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.78rem;color:#94a3b8;white-space:pre-wrap;max-height:150px;overflow-y:auto">{esc(art['master_summary_snapshot'] or '—')}</div>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#f87171;font-weight:700;margin-bottom:4px">FULL STAGE 2 PROMPT (sent to LLM)</div>
+                    <pre style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto">{esc(art['stage2_prompt'] or 'Not saved — scored before v3.0.4')}</pre>
+                  </div>
+
+                  <div style="margin-bottom:12px">
+                    <div style="font-size:0.72rem;color:#475569;font-weight:700;margin-bottom:4px">RAW ARTICLE TEXT (full_text)</div>
+                    <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;max-height:300px;overflow-y:auto">{esc((art['full_text'] or 'No full text scraped — title-only article')[:5000])}</div>
+                  </div>
+                </div>
+                """
+                return HTMLResponse(html)
+
+            # List view: articles with scoring info
+            cur.execute("""
+                SELECT COUNT(*) AS total FROM news_articles
+                WHERE symbol_id = %s
+            """, (sym_id,))
+            total = cur.fetchone()["total"]
+
+            cur.execute("""
+                SELECT id, title, published_at, source_name,
+                       sentiment_score, weighted_sentiment,
+                       article_summary, score_rationale,
+                       CASE WHEN stage2_prompt IS NOT NULL AND stage2_prompt != '' THEN TRUE ELSE FALSE END as has_prompt,
+                       CASE WHEN pre_summary_data IS NOT NULL THEN TRUE ELSE FALSE END as has_stage1
+                FROM news_articles
+                WHERE symbol_id = %s
+                ORDER BY published_at DESC NULLS LAST
+                LIMIT %s OFFSET %s
+            """, (sym_id, per_page, offset))
+            articles = cur.fetchall()
+    finally:
+        conn.close()
+
+    html = f'<div style="padding:10px 16px 0;font-size:0.72rem;color:#475569">{total} total articles</div>'
+
+    if not articles:
+        html += '<div class="empty-state">No articles yet.</div>'
+        return HTMLResponse(html)
+
+    for a in articles:
+        score = a["sentiment_score"]
+        score_str = f"{score:+.3f}" if score is not None else "unscored"
+        score_color = "#4ade80" if (score or 0) > 0.1 else "#f87171" if (score or 0) < -0.1 else "#fbbf24" if score is not None else "#475569"
+        pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "?"
+        stage1_chip = '<span class="chip chip-green" title="Stage1 ran">S1✓</span>' if a["has_stage1"] else '<span class="chip chip-gray" title="No Stage1">S1✗</span>'
+        prompt_chip = '<span class="chip chip-blue" title="Prompt saved">PROMPT✓</span>' if a["has_prompt"] else '<span class="chip chip-gray" title="Prompt not saved">PROMPT✗</span>'
+        rationale = (a["score_rationale"] or "")[:120]
+
+        html += f"""
+        <div class="news-card" style="cursor:pointer"
+          hx-get="/symbol/{sym_id}/debug?art_id={a['id']}&page={page}"
+          hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div class="news-title" style="flex:1">{(a['title'] or 'Untitled')[:120]}</div>
+            <div style="font-size:1.1rem;font-weight:800;color:{score_color};white-space:nowrap">{score_str}</div>
+          </div>
+          <div class="news-meta">
+            <span class="news-date">📅 {pub}</span>
+            <span class="chip chip-gray">{a['source_name'] or '?'}</span>
+            {stage1_chip}{prompt_chip}
+          </div>
+          {'<div class="news-preview">' + rationale + ('…' if len(a["score_rationale"] or '') > 120 else '') + '</div>' if rationale else ''}
+        </div>"""
+
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    if total_pages > 1:
+        html += '<div class="pagination">'
+        if page > 1:
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/debug?page={page-1}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Prev</button>'
+        html += f'<span style="color:#475569;font-size:.8rem;padding:5px 10px">Page {page} / {total_pages}</span>'
+        if page < total_pages:
+            html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/debug?page={page+1}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">Next →</button>'
+        html += '</div>'
+
+    return HTMLResponse(html)
 
 
 
