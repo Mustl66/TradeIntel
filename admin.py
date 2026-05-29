@@ -289,6 +289,14 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       onclick="this.textContent='Running…'">
       🌐 Dedup Languages
     </button>
+    <button
+      hx-delete="/admin/sec/all"
+      hx-target="#dedup-result"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #ef4444;color:#fca5a5;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px"
+      onclick="if(!confirm('Delete ALL SEC filings from the entire DB? Cannot be undone.')) return false; this.textContent='Deleting…'">
+      🗑️ Delete All SEC (Global)
+    </button>
   </div>
 </div>
 <div class="layout">
@@ -1102,6 +1110,24 @@ async def delete_all_sec(sym_id: int):
     """)
 
 
+# ── Global delete ALL SEC filings ─────────────────────────────────────────────
+
+@app.delete("/admin/sec/all", response_class=HTMLResponse)
+async def delete_all_sec_global():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM news_articles WHERE source_name = 'edgar_8k'")
+            deleted = cur.rowcount
+            conn.commit()
+    finally:
+        conn.close()
+    color = "#4ade80" if deleted > 0 else "#94a3b8"
+    return HTMLResponse(f"""
+    <div style="padding:12px 16px;background:#1e1e2e;border-radius:8px;border:1px solid #333;font-family:monospace;font-size:13px">
+      <div style="color:#888;margin-bottom:4px">Global SEC delete complete</div>
+      <div>Deleted: <b style="color:{color}">{deleted:,}</b> SEC filings across all symbols</div>
+    </div>""")
 
 
 @app.get("/symbol/{sym_id}/debug", response_class=HTMLResponse)

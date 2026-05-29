@@ -81,3 +81,7 @@ _LLM_PROFILES = {
 }
 
 LLM_CONFIG: dict = _LLM_PROFILES.get(LLM_TYPE, _LLM_PROFILES["local"])
+
+# Optional: set GPU_VRAM_GB=16 in .env to skip local nvidia-smi detection
+# (required when Ollama runs on a remote server)
+GPU_VRAM_GB: float = float(os.getenv("GPU_VRAM_GB", "0"))

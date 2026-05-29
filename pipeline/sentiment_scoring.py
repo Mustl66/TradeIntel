@@ -32,14 +32,19 @@ Usage:
 import json
 import logging
 import math
+import platform
+import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests
 from openai import OpenAI
 
-from config import LLM_CONFIG, LLM_TYPE
+from config import LLM_CONFIG, LLM_TYPE, GPU_VRAM_GB
 from db.connection import get_conn
 from pipeline_config import (
     MAX_EVAL_ARTICLES,
@@ -139,11 +144,12 @@ def _extract_json(raw: str) -> Optional[dict]:
             return None
 
 
-def _call_stage1(client: OpenAI, text: str) -> Optional[dict]:
+def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optional[dict]:
     """Fast pre-summarization. Returns dict or None on failure."""
+    model = model_override or SUMMARY_LLM_MODEL
     try:
         kwargs1 = dict(
-            model=SUMMARY_LLM_MODEL,
+            model=model,
             temperature=0.05,
             max_tokens=4096,          # was 2048 — too small, caused truncated JSON
             messages=[
@@ -204,8 +210,8 @@ def _build_stage2_prompt(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _call_stage2(client: OpenAI, prompt: str) -> Optional[dict]:
-    """Main sentiment LLM call. Returns parsed dict or None."""
+def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict]:
+    """Main sentiment LLM call. Returns parsed dict or None. Retries on bad JSON."""
     kwargs = {
         "model":             LLM_CONFIG["model"],
         "temperature":       LLM_CONFIG["temperature"],
@@ -222,17 +228,20 @@ def _call_stage2(client: OpenAI, prompt: str) -> Optional[dict]:
         kwargs["extra_body"] = {
             "num_ctx": LLM_CONFIG.get("context_size", 16384),
             "top_k":   LLM_CONFIG.get("top_k", 40),
+            "format":  "json",   # force valid JSON output
         }
-    try:
-        resp = client.chat.completions.create(**kwargs)
-        raw = resp.choices[0].message.content.strip()
-        result = _extract_json(raw)
-        if result is None:
-            logger.warning(f"[Stage2] Failed: could not parse JSON from response (len={len(raw)})")
-        return result
-    except Exception as e:
-        logger.warning(f"[Stage2] Failed: {e}")
-        return None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            raw = resp.choices[0].message.content.strip()
+            result = _extract_json(raw)
+            if result is not None:
+                return result
+            logger.warning(f"[Stage2] Attempt {attempt}/{retries}: could not parse JSON (len={len(raw)})")
+        except Exception as e:
+            logger.warning(f"[Stage2] Attempt {attempt}/{retries}: {e}")
+    logger.warning(f"[Stage2] All {retries} attempts failed — using neutral fallback")
+    return None
 
 
 # ── Time-decay ────────────────────────────────────────────────────────────────
@@ -243,6 +252,227 @@ def _time_decay(score: float, published_at: datetime, lam: float = SENTIMENT_LAM
         published_at = published_at.replace(tzinfo=timezone.utc)
     t_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
     return round(score * math.exp(-lam * t_hours), 6)
+
+
+# ── Cross-language dedup ───────────────────────────────────────────────────────
+
+def _dedup_languages(conn) -> int:
+    """
+    Before scoring, remove cross-language duplicate articles.
+    Groups by (symbol_id, 5-min bucket, source_name).
+    Keeps: English URL (/0/en/) > highest sentiment_score > lowest id.
+    Scored articles are never deleted (sentinel: scored articles are always kept
+    as the 'winner' if present, so we never discard already-scored work).
+    Returns number of rows deleted.
+    """
+    import psycopg2.extras as _extras
+    try:
+        with conn.cursor(cursor_factory=_extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    symbol_id,
+                    DATE_TRUNC('hour', published_at)            AS hour_bucket,
+                    EXTRACT(MINUTE FROM published_at)::int / 5  AS min_bucket,
+                    source_name,
+                    ARRAY_AGG(id ORDER BY
+                        CASE WHEN sentiment_score IS NOT NULL THEN 0 ELSE 1 END,
+                        CASE WHEN url ~ '/0/en/' THEN 0 ELSE 1 END,
+                        COALESCE(sentiment_score, -99) DESC,
+                        id ASC
+                    ) AS ids
+                FROM news_articles
+                WHERE published_at IS NOT NULL
+                GROUP BY symbol_id, hour_bucket, min_bucket, source_name
+                HAVING COUNT(*) > 1
+            """)
+            groups = cur.fetchall()
+
+        ids_to_delete = []
+        for g in groups:
+            ids_to_delete.extend(g["ids"][1:])  # first id is the keeper
+
+        deleted = 0
+        if ids_to_delete:
+            with conn.cursor() as cur2:
+                cur2.execute(
+                    "DELETE FROM news_articles WHERE id = ANY(%s)",
+                    (ids_to_delete,)
+                )
+                deleted = cur2.rowcount
+                conn.commit()
+
+        if deleted:
+            logger.info(f"[dedup_languages] Removed {deleted} cross-language duplicates "
+                        f"across {len(groups)} groups before scoring.")
+        else:
+            logger.info("[dedup_languages] No cross-language duplicates found.")
+        return deleted
+    except Exception as e:
+        logger.warning(f"[dedup_languages] Failed (non-fatal): {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+# ── VRAM detection & worker sizing ────────────────────────────────────────────
+
+def _get_free_vram_gb() -> tuple[float, float]:
+    """
+    Returns (total_gb, free_gb).
+    1. If GPU_VRAM_GB is set in .env, use it directly (remote Ollama server case).
+    2. Otherwise tries nvidia-smi (local GPU), then macOS unified memory.
+    Returns (0, 0) on failure.
+    """
+    # Manual override — required when Ollama is on a remote machine
+    if GPU_VRAM_GB > 0:
+        logger.info(f"[vram] Using GPU_VRAM_GB override: {GPU_VRAM_GB:.1f} GB")
+        return GPU_VRAM_GB, GPU_VRAM_GB
+
+    # NVIDIA via nvidia-smi
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            line = out.stdout.strip().splitlines()[0]
+            total_mb, free_mb = [float(p.strip()) for p in line.split(",")]
+            return total_mb / 1024.0, free_mb / 1024.0
+    except Exception:
+        pass
+
+    # macOS unified memory (no true free_gb — report 85% of total as usable)
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["system_profiler", "SPHardwareDataType"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in out.stdout.splitlines():
+                if "Memory:" in line:
+                    parts = line.strip().split()
+                    val = float(parts[1])
+                    unit = parts[2].upper() if len(parts) > 2 else "GB"
+                    if unit == "TB":
+                        val *= 1024
+                    return val, val * 0.85
+        except Exception:
+            pass
+
+    return 0.0, 0.0
+
+
+def _get_ollama_model_size_gb(model_name: str) -> float:
+    """
+    Query Ollama /api/show for the on-disk/VRAM size of a model.
+    Returns size in GB, or 0.0 on failure.
+    """
+    base_url = LLM_CONFIG.get("base_url", "http://localhost:11434/v1")
+    # Strip /v1 suffix to get Ollama root
+    ollama_root = base_url.rstrip("/")
+    for suffix in ("/v1", "/api"):
+        if ollama_root.endswith(suffix):
+            ollama_root = ollama_root[: -len(suffix)]
+            break
+    try:
+        resp = requests.post(
+            f"{ollama_root}/api/show",
+            json={"name": model_name},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            size_bytes = data.get("size", 0)
+            if size_bytes:
+                return size_bytes / (1024 ** 3)
+            # Fallback: estimate from parameter count (fp16 = 2 bytes/param)
+            params = (data.get("model_info") or {}).get("general.parameter_count", 0)
+            if params:
+                return (params * 2) / (1024 ** 3)
+    except Exception as e:
+        logger.warning(f"[vram] Could not fetch model size for '{model_name}': {e}")
+    return 0.0
+
+
+def _compute_worker_count() -> int:
+    """
+    Detect free VRAM, query both model sizes via Ollama, compute N workers.
+    Formula: floor((free_vram * 0.90) / (stage1_gb + stage2_gb)), min 1.
+    Prints a clear startup banner to console.
+    """
+    total_gb, free_gb = _get_free_vram_gb()
+
+    if free_gb == 0.0:
+        logger.warning("[vram] VRAM detection failed — defaulting to 1 worker")
+        print("\n┌─ GPU WORKER SIZING ────────────────────────────┐")
+        print("│  VRAM detection failed                         │")
+        print("│  Workers: 1 (safe default)                     │")
+        print("└────────────────────────────────────────────────┘\n")
+        return 1, False
+
+    stage1_gb = _get_ollama_model_size_gb(SUMMARY_LLM_MODEL)
+    stage2_gb = _get_ollama_model_size_gb(LLM_CONFIG["model"])
+
+    if stage1_gb == 0.0 or stage2_gb == 0.0:
+        logger.warning(
+            f"[vram] Model size unknown (stage1={stage1_gb:.2f}GB stage2={stage2_gb:.2f}GB) "
+            f"— defaulting to 1 worker"
+        )
+        print("\n┌─ GPU WORKER SIZING ────────────────────────────┐")
+        print(f"│  GPU Total : {total_gb:6.1f} GB                        │")
+        print(f"│  GPU Free  : {free_gb:6.1f} GB                        │")
+        print("│  Model sizes unknown (Ollama /api/show failed) │")
+        print("│  Workers: 1 (safe default)                     │")
+        print("└────────────────────────────────────────────────┘\n")
+        return 1, False
+
+    usable_gb     = free_gb * 0.90
+    per_worker_gb = stage1_gb + stage2_gb
+    workers       = max(1, int(usable_gb / per_worker_gb))
+
+    # If only 1 worker fits both models, check if single-model mode fits more workers
+    single_model_workers = max(1, int(usable_gb / stage2_gb))
+    use_single_model = (workers == 1 and single_model_workers > 1) or (stage1_gb + stage2_gb > usable_gb)
+
+    if use_single_model:
+        workers = single_model_workers
+        headroom_gb = free_gb - (workers * stage2_gb)
+        print("\n┌─ GPU WORKER SIZING ──────────────────────────────────┐")
+        print(f"│  GPU Total      : {total_gb:6.1f} GB                          │")
+        print(f"│  GPU Free       : {free_gb:6.1f} GB  (10% headroom reserved) │")
+        print(f"│  Usable VRAM    : {usable_gb:6.2f} GB                          │")
+        print(f"│  NOTE: Both models don't fit — using stage-2 only    │")
+        print(f"│  Model          : {stage2_gb:6.2f} GB  ({LLM_CONFIG['model']}){'':>5}│")
+        print(f"│  Per-worker     : {stage2_gb:6.2f} GB                          │")
+        print(f"│  ── WORKERS     :   {workers:<4d} (headroom {headroom_gb:.2f} GB)         │")
+        print("└──────────────────────────────────────────────────────┘\n")
+        logger.info(
+            f"[vram] single-model mode: total={total_gb:.1f}GB free={free_gb:.1f}GB "
+            f"stage2={stage2_gb:.2f}GB workers={workers}"
+        )
+        return workers, True   # (workers, single_model_mode)
+
+    headroom_gb   = free_gb - (workers * per_worker_gb)
+
+    print("\n┌─ GPU WORKER SIZING ──────────────────────────────────┐")
+    print(f"│  GPU Total      : {total_gb:6.1f} GB                          │")
+    print(f"│  GPU Free       : {free_gb:6.1f} GB  (10% headroom reserved) │")
+    print(f"│  Usable VRAM    : {usable_gb:6.2f} GB                          │")
+    print(f"│  Stage-1 model  : {stage1_gb:6.2f} GB  ({SUMMARY_LLM_MODEL}){'':>5}│")
+    print(f"│  Stage-2 model  : {stage2_gb:6.2f} GB  ({LLM_CONFIG['model']}){'':>5}│")
+    print(f"│  Per-worker     : {per_worker_gb:6.2f} GB                          │")
+    print(f"│  ── WORKERS     :   {workers:<4d} (headroom {headroom_gb:.2f} GB)         │")
+    print("└──────────────────────────────────────────────────────┘\n")
+
+    logger.info(
+        f"[vram] total={total_gb:.1f}GB free={free_gb:.1f}GB "
+        f"stage1={stage1_gb:.2f}GB stage2={stage2_gb:.2f}GB "
+        f"workers={workers}"
+    )
+    return workers, False  # (workers, single_model_mode)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -320,14 +550,21 @@ def _save_article_result(cur, article_id: int, result: dict,
     score = max(-1.0, min(1.0, score))
     weighted = _time_decay(score, published_at)
 
+    def _to_str(v, limit):
+        if v is None:
+            return ""
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v)
+        return str(v)[:limit]
+
     updates = {
         "sentiment_score":         score,
         "weighted_sentiment":      weighted,
-        "article_summary":         (result.get("article_summary") or "")[:500],
+        "article_summary":         _to_str(result.get("article_summary"), 500),
         "master_summary_snapshot": master_snapshot,
         "key_events":              json.dumps(result.get("key_events") or {}),
-        "score_rationale":         (result.get("score_rationale") or "")[:1000],
-        "forecast_until_earnings": (result.get("forecast_until_earnings") or "")[:2000],
+        "score_rationale":         _to_str(result.get("score_rationale"), 1000),
+        "forecast_until_earnings": _to_str(result.get("forecast_until_earnings"), 2000),
         "stage2_prompt":           stage2_prompt,
     }
     if pre_summary:
@@ -375,6 +612,7 @@ def _process_symbol(
     main_client: OpenAI,
     summary_client: OpenAI,
     sym: dict,
+    single_model_mode: bool = False,
 ) -> dict:
     symbol   = sym["symbol"]
     sym_id   = sym["id"]
@@ -431,7 +669,10 @@ def _process_symbol(
             else:
                 raw_text = (article.get("full_text") or article.get("summary") or "")
                 if raw_text.strip():
-                    stage1_result = _call_stage1(summary_client, raw_text)
+                    stage1_result = _call_stage1(
+                        summary_client, raw_text,
+                        model_override=LLM_CONFIG["model"] if single_model_mode else None
+                    )
 
         # Stage 2: stateful scoring
         prompt = _build_stage2_prompt(
@@ -491,9 +732,13 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     """
     Score all symbols with unscored articles.
     limit=0 → all symbols. limit=N → first N symbols only.
+    Worker count is auto-sized from free VRAM at startup.
     """
     started_at = datetime.now(timezone.utc)
     conn = get_conn()
+
+    # ── Auto-dedup cross-language articles before scoring ──────────────────────
+    _dedup_languages(conn)
 
     symbols = _get_symbols_with_unscored(conn, exchange, limit)
     if not symbols:
@@ -504,26 +749,74 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     logger.info(f"[sentiment_scoring] {len(symbols)} symbols to score "
                 f"(pre_summarization={'ON' if ENABLE_PRE_SUMMARIZATION else 'OFF'})")
 
+    # ── VRAM-based worker sizing ───────────────────────────────────────────────
+    n_workers, single_model_mode = _compute_worker_count()
+
+    # Warmup models before spawning threads
     main_client    = _get_main_client()
-    summary_client = _get_summary_client()
+    if single_model_mode:
+        summary_client = main_client  # reuse same client, same model, no load/unload
+        logger.info("[vram] Single-model mode: stage-1 will use stage-2 model (no swap)")
+    else:
+        summary_client = _get_summary_client()
     _warmup_models(main_client, summary_client)
 
-    total_scored = 0
-    results = []
-    for sym in symbols:
-        try:
-            r = _process_symbol(conn, main_client, summary_client, sym)
-            results.append(r)
-            total_scored += r["scored"]
-        except Exception as e:
-            logger.error(f"[{sym['symbol']}] Unhandled error: {e}", exc_info=True)
-            try:
-                conn.rollback()   # reset aborted tx so next symbol can query
-            except Exception:
-                pass
+    # ── Semaphore caps concurrent Ollama requests ──────────────────────────────
+    semaphore = threading.Semaphore(n_workers)
 
-    conn.close()
+    # Progress tracking
+    total_symbols  = len(symbols)
+    done_count     = [0]  # mutable counter shared across threads
+    done_lock      = threading.Lock()
+
+    def _worker(sym: dict) -> dict:
+        with semaphore:
+            # Each worker gets its own DB connection (thread-safe)
+            w_conn = get_conn()
+            try:
+                result = _process_symbol(w_conn, main_client, summary_client, sym, single_model_mode)
+            except Exception as e:
+                logger.error(f"[{sym['symbol']}] Unhandled error: {e}", exc_info=True)
+                try:
+                    w_conn.rollback()
+                except Exception:
+                    pass
+                result = {"symbol": sym["symbol"], "scored": 0, "skipped": 0}
+            finally:
+                w_conn.close()
+
+            with done_lock:
+                done_count[0] += 1
+                pct = done_count[0] / total_symbols * 100
+                print(
+                    f"  [{done_count[0]:>{len(str(total_symbols))}}/{total_symbols}] "
+                    f"({pct:5.1f}%)  {sym['symbol']:10s}  "
+                    f"scored={result.get('scored',0)}  "
+                    f"skipped={result.get('skipped',0)}",
+                    flush=True,
+                )
+            return result
+
+    conn.close()  # main conn no longer needed — workers use their own
+
+    print(f"\n  Scoring {total_symbols} symbols with {n_workers} parallel worker(s)...\n")
+
+    results      = []
+    total_scored = 0
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            try:
+                r = future.result()
+                results.append(r)
+                total_scored += r.get("scored", 0)
+            except Exception as e:
+                logger.error(f"[run] Future raised: {e}", exc_info=True)
+
     duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+    print(f"\n  Done — symbols={len(results)}, articles_scored={total_scored}, "
+          f"duration={duration:.1f}s\n")
     logger.info(f"[sentiment_scoring] Done — symbols={len(results)}, "
                 f"articles_scored={total_scored}, duration={duration:.1f}s")
     return {
