@@ -271,13 +271,15 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
                   SELECT 1 FROM news_articles na
                   WHERE na.symbol_id = s.id AND na.sentiment_score IS NULL
               )
-            ORDER BY s.symbol
         """
         if limit:
             q += f" LIMIT {limit}"
         cur.execute(q, (exchange,))
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    import random
+    random.shuffle(rows)
+    return rows
 
 
 def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:

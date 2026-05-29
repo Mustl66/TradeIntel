@@ -281,6 +281,14 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       🧹 Dedup Articles
     </button>
     <div id="dedup-result" style="font-size:12px;color:#94a3b8"></div>
+    <button
+      hx-post="/admin/dedup-lang"
+      hx-target="#dedup-result"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #a855f7;color:#d8b4fe;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px"
+      onclick="this.textContent='Running…'">
+      🌐 Dedup Languages
+    </button>
   </div>
 </div>
 <div class="layout">
@@ -1014,7 +1022,7 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
 
     q_safe = keyword.replace('"', '&quot;')
     html = f"""
-    <div style="padding:12px 16px 0">
+    <div style="padding:12px 16px 0;display:flex;gap:8px;align-items:center">
       <input type="text" id="sec-search-{sym_id}" placeholder="Search SEC filings (merger, acquisition, CEO…)"
         value="{q_safe}"
         hx-get="/symbol/{sym_id}/sec"
@@ -1023,8 +1031,14 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
         hx-include="#sec-search-{sym_id}"
         name="q"
         autocomplete="off"
-        style="width:100%"
+        style="flex:1"
       />
+      <button class="btn btn-danger"
+        onclick="if(!confirm('Delete ALL {total} SEC filings for this symbol? Cannot be undone.')) return false;"
+        hx-delete="/symbol/{sym_id}/sec/all"
+        hx-target="#tab-content-{sym_id}"
+        hx-swap="innerHTML"
+        style="white-space:nowrap">🗑 Delete All ({total})</button>
     </div>
     """
 
@@ -1066,9 +1080,29 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
     return HTMLResponse(html)
 
 
+# ── Delete all SEC filings for a symbol ───────────────────────────────────────
+
+@app.delete("/symbol/{sym_id}/sec/all", response_class=HTMLResponse)
+async def delete_all_sec(sym_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM news_articles WHERE symbol_id = %s AND source_name = 'edgar_8k'",
+                (sym_id,)
+            )
+            deleted = cur.rowcount
+            conn.commit()
+    finally:
+        conn.close()
+    return HTMLResponse(f"""
+    <div style="padding:40px 16px;text-align:center;color:#4ade80;font-size:0.9rem">
+      🗑 Deleted {deleted} SEC filings.
+    </div>
+    """)
 
 
-# ── LLM Debug route ───────────────────────────────────────────────────────────
+
 
 @app.get("/symbol/{sym_id}/debug", response_class=HTMLResponse)
 async def symbol_debug(sym_id: int, page: int = 1, art_id: int = 0):
@@ -1312,7 +1346,71 @@ async def run_dedup():
     </div>"""
 
 
-# ── Market Research Feeds ─────────────────────────────────────────────────────
+# ── Cross-language dedup route ─────────────────────────────────────────────────
+# Groups articles by (symbol_id, published_at rounded to 5 min, source_name).
+# Within each group keeps: English URL (/0/en/) preferring highest sentiment_score,
+# then any scored article, else keep_id = MIN(id). Deletes the rest.
+
+@app.post("/admin/dedup-lang", response_class=HTMLResponse)
+async def run_dedup_lang():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Find groups with >1 article at same (symbol, ~time, source)
+            cur.execute("""
+                SELECT
+                    symbol_id,
+                    DATE_TRUNC('hour', published_at) AS hour_bucket,
+                    EXTRACT(MINUTE FROM published_at)::int / 5 AS min_bucket,
+                    source_name,
+                    COUNT(*) as cnt,
+                    ARRAY_AGG(id ORDER BY
+                        CASE WHEN url ~ '/0/en/' THEN 0 ELSE 1 END,
+                        COALESCE(sentiment_score, -99) DESC,
+                        id ASC
+                    ) AS ids
+                FROM news_articles
+                WHERE published_at IS NOT NULL
+                GROUP BY symbol_id, hour_bucket, min_bucket, source_name
+                HAVING COUNT(*) > 1
+            """)
+            groups = cur.fetchall()
+
+        total_groups = len(groups)
+        ids_to_delete = []
+        for g in groups:
+            # First id in the ordered array is the keeper
+            keep = g["ids"][0]
+            ids_to_delete.extend(g["ids"][1:])
+
+        deleted = 0
+        if ids_to_delete:
+            with conn.cursor() as cur2:
+                cur2.execute(
+                    "DELETE FROM news_articles WHERE id = ANY(%s)",
+                    (ids_to_delete,)
+                )
+                deleted = cur2.rowcount
+                conn.commit()
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as total FROM news_articles")
+            total = cur.fetchone()["total"]
+    finally:
+        conn.close()
+
+    color = "#22c55e" if deleted == 0 else "#a855f7"
+    return f"""
+    <div style="padding:16px;background:#1e1e2e;border-radius:8px;border:1px solid #333;font-family:monospace;font-size:13px">
+      <div style="color:#888;margin-bottom:8px">Language dedup complete</div>
+      <div>Cross-language groups found: <b style="color:{color}">{total_groups}</b></div>
+      <div>Rows deleted: <b style="color:{color}">{deleted}</b></div>
+      <div>Total articles remaining: <b style="color:#60a5fa">{total:,}</b></div>
+      <div style="color:#888;margin-top:8px;font-size:11px">Kept English (/0/en/) or highest-scored per group.</div>
+    </div>"""
+
+
+
 
 @app.get("/market-research", response_class=HTMLResponse)
 def market_research_panel(request: Request):
