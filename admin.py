@@ -258,6 +258,21 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       📈 Market Scores
     </button>
     <button
+      hx-get="/sentiment-leaderboard"
+      hx-target="#feed-panel"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #f59e0b;color:#fcd34d;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+      🏆 Sentiment Scores
+    </button>
+    <button
+      onclick="if(!confirm('Reset ALL sentiment scores? This cannot be undone.')) return false;"
+      hx-post="/admin/reset-scores"
+      hx-target="#feed-panel"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #ef4444;color:#fca5a5;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+      🗑️ Reset Scores
+    </button>
+    <button
       hx-post="/admin/dedup"
       hx-target="#dedup-result"
       hx-swap="innerHTML"
@@ -1653,6 +1668,158 @@ def delete_market_score(row_id: int):
         return {"ok": False, "error": str(e)}
     finally:
         conn.close()
+
+
+# ── Reset all sentiment scores ────────────────────────────────────────────────
+
+@app.post("/admin/reset-scores", response_class=HTMLResponse)
+def reset_scores():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE news_articles SET
+                    sentiment_score          = NULL,
+                    weighted_sentiment       = NULL,
+                    article_summary          = NULL,
+                    score_rationale          = NULL,
+                    key_events               = NULL,
+                    pre_summary_data         = NULL,
+                    master_summary_snapshot  = NULL,
+                    forecast_until_earnings  = NULL
+            """)
+            articles_reset = cur.rowcount
+            cur.execute("""
+                UPDATE symbols SET
+                    final_score              = NULL,
+                    score_updated_at         = NULL,
+                    symbol_master_summary    = NULL
+            """)
+            symbols_reset = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return f"""
+    <div style="background:#0f172a;border:1px solid #ef4444;border-radius:10px;padding:24px;color:#f1f5f9;text-align:center">
+      <div style="font-size:2rem;margin-bottom:8px">🗑️</div>
+      <div style="font-size:1.1rem;font-weight:700;color:#f87171;margin-bottom:8px">Scores Reset</div>
+      <div style="color:#94a3b8;font-size:0.9rem">{articles_reset} articles cleared &nbsp;·&nbsp; {symbols_reset} symbol scores cleared</div>
+      <div style="margin-top:16px;color:#64748b;font-size:0.8rem">Ready for a fresh sentiment scoring run.</div>
+    </div>
+    """
+
+
+# ── Sentiment leaderboard ──────────────────────────────────────────────────────
+
+@app.get("/sentiment-leaderboard", response_class=HTMLResponse)
+def sentiment_leaderboard(sort: str = "final_score", dir: str = "desc", limit: int = 320):
+    """Top symbols by final_score — shows all 320 scored articles aggregate."""
+    allowed_sort = {"final_score", "symbol", "score_updated_at", "industry"}
+    sort = sort if sort in allowed_sort else "final_score"
+    order = "DESC" if dir != "asc" else "ASC"
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT symbol, company_name, industry, final_score,
+                       score_updated_at, exchange,
+                       (SELECT COUNT(*) FROM news_articles na
+                        WHERE na.symbol_id = s.id AND na.sentiment_score IS NOT NULL) AS scored_count,
+                       (SELECT COUNT(*) FROM news_articles na
+                        WHERE na.symbol_id = s.id) AS total_count
+                FROM symbols s
+                WHERE final_score IS NOT NULL AND status = TRUE
+                ORDER BY {sort} {order}
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+            total = len(rows)
+            # summary stats
+            cur.execute("""
+                SELECT COUNT(*) AS n,
+                       AVG(final_score) AS avg_fs,
+                       MAX(final_score) AS max_fs,
+                       MIN(final_score) AS min_fs,
+                       COUNT(CASE WHEN final_score > 0.05 THEN 1 END) AS bullish,
+                       COUNT(CASE WHEN final_score < -0.05 THEN 1 END) AS bearish
+                FROM symbols WHERE final_score IS NOT NULL AND status = TRUE
+            """)
+            stats = cur.fetchone()
+    finally:
+        conn.close()
+
+    def score_color(s):
+        s = float(s or 0)
+        if s >  0.30: return "#4ade80"
+        if s >  0.10: return "#86efac"
+        if s >  0.05: return "#fbbf24"
+        if s < -0.30: return "#f87171"
+        if s < -0.10: return "#fca5a5"
+        if s < -0.05: return "#fb923c"
+        return "#94a3b8"
+
+    def fmt_score(s):
+        return f"{float(s):+.4f}" if s is not None else "—"
+
+    def th(label, col):
+        arrow = " ▼" if (sort == col and dir == "desc") else " ▲" if (sort == col and dir == "asc") else ""
+        nd = "asc" if (sort == col and dir == "desc") else "desc"
+        return (f'<th style="padding:9px 12px;text-align:left;cursor:pointer" '
+                f'hx-get="/sentiment-leaderboard?sort={col}&dir={nd}&limit={limit}" '
+                f'hx-target="#sent-panel" hx-swap="innerHTML">{label}{arrow}</th>')
+
+    rows_html = ""
+    for i, r in enumerate(rows, 1):
+        sc = r["final_score"]
+        col = score_color(sc)
+        upd = r["score_updated_at"].strftime("%m-%d %H:%M") if r["score_updated_at"] else "—"
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #1e2535">
+          <td style="padding:8px 12px;color:#64748b;font-size:12px">{i}</td>
+          <td style="padding:8px 12px;font-weight:700;color:#60a5fa;font-size:13px">{r['symbol']}</td>
+          <td style="padding:8px 12px;font-size:12px;color:#94a3b8;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{r.get('company_name') or '—'}</td>
+          <td style="padding:8px 12px;font-size:11px;color:#64748b">{r.get('industry') or '—'}</td>
+          <td style="padding:8px 12px;text-align:right">
+            <span style="font-size:14px;font-weight:800;color:{col}">{fmt_score(sc)}</span>
+          </td>
+          <td style="padding:8px 12px;text-align:center;font-size:11px;color:#64748b">{r.get('scored_count',0)}/{r.get('total_count',0)}</td>
+          <td style="padding:8px 12px;text-align:center;font-size:11px;color:#475569">{upd}</td>
+        </tr>"""
+
+    avg_s = stats["avg_fs"]
+    avg_col = score_color(avg_s)
+
+    return f"""
+    <div id="sent-panel" style="padding:20px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
+        <h2 style="margin:0;color:#e2e8f0;font-size:18px">🏆 Sentiment Leaderboard</h2>
+        <span style="background:#1e293b;color:#fcd34d;padding:3px 10px;border-radius:12px;font-size:12px">{total} symbols scored</span>
+        <span style="background:#1e293b;color:#4ade80;padding:3px 10px;border-radius:12px;font-size:12px">🟢 {stats['bullish']} bullish</span>
+        <span style="background:#1e293b;color:#f87171;padding:3px 10px;border-radius:12px;font-size:12px">🔴 {stats['bearish']} bearish</span>
+        <span style="background:#1e293b;color:{avg_col};padding:3px 10px;border-radius:12px;font-size:12px">avg {fmt_score(avg_s)}</span>
+        <span style="background:#1e293b;color:#86efac;padding:3px 10px;border-radius:12px;font-size:12px">max {fmt_score(stats['max_fs'])}</span>
+        <span style="background:#1e293b;color:#fca5a5;padding:3px 10px;border-radius:12px;font-size:12px">min {fmt_score(stats['min_fs'])}</span>
+      </div>
+      <div style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow-y:auto;max-height:70vh">
+        <table style="width:100%;border-collapse:collapse">
+          <thead style="background:#1a2133;color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;position:sticky;top:0">
+            <tr>
+              {th('#', 'final_score')}
+              {th('Symbol', 'symbol')}
+              <th style="padding:9px 12px">Name</th>
+              {th('Industry', 'industry')}
+              {th('Final Score', 'final_score')}
+              <th style="padding:9px 12px;text-align:center">Articles</th>
+              {th('Updated', 'score_updated_at')}
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows_html) if rows_html else '<tr><td colspan="7" style="text-align:center;padding:40px;color:#64748b">No symbols scored yet — run sentiment_scoring.py</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
 
 
 

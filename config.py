@@ -33,13 +33,14 @@ RSS_WORKERS      = int(os.getenv("RSS_WORKERS",  8))
 # ollama → Remote Ollama server (e.g. http://10.11.12.8:11434/v1)
 # api    → OpenAI / Anthropic / other hosted API
 
-LLM_TYPE = os.getenv("LLM_TYPE", "local").lower()   # local | ollama | api
+LLM_TYPE = os.getenv("LLM_TYPE", "ollama").lower()   # local | ollama | api
 
 _LLM_PROFILES = {
     "local": {
         "base_url":          os.getenv("LLM_BASE_URL",   "http://127.0.0.1:1234/v1"),
         "api_key":           os.getenv("LLM_API_KEY",    "lm-studio"),
         "model":             os.getenv("LLM_MODEL",      "google/gemma-4-e4b"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "google/gemma-4-e2b"),
         "temperature":       0.1,
         "context_size":      16384,
         "max_tokens":        12228,
@@ -53,6 +54,7 @@ _LLM_PROFILES = {
         "base_url":          os.getenv("LLM_BASE_URL",   "http://10.11.12.8:11434/v1"),
         "api_key":           os.getenv("LLM_API_KEY",    "ollama"),
         "model":             os.getenv("LLM_MODEL",      "gemma4:e4b"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "gemma4:e2b"),
         "temperature":       0.1,
         "context_size":      16384,
         "max_tokens":        12228,

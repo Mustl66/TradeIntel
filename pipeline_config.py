@@ -18,7 +18,7 @@ START_FROM = None   # e.g. "html"  or  "sector_map"
 
 # Limit symbols processed per run. False = all symbols. Integer = first N symbols only.
 # Useful for quick test runs without waiting for the full 2800-symbol pipeline.
-SYMBOL_LIMIT = False   # e.g. 100  or  False
+SYMBOL_LIMIT = 10   # e.g. 100  or  False
 
 PIPELINES = {
     "rss": {
@@ -50,10 +50,12 @@ PIPELINES = {
 # Ordered stage list — controls execution sequence
 STAGE_ORDER = ["rss", "html", "edgar", "sector_map", "market_research", "macro_multiplier", "sentiment"]
 
+from config import LLM_CONFIG
+
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
 MAX_EVAL_ARTICLES        = 30      # rolling window per symbol (newest N articles)
 ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
-SUMMARY_LLM_MODEL        = "google/gemma-4-e2b"   # Stage 1 model (fast, small)
+SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
 SENTIMENT_LAMBDA         = 0.02    # time-decay lambda (per hour)
 
 # ── Stage 1 parallel workers (gemma-4-e2b pre-summarization) ──────────────────

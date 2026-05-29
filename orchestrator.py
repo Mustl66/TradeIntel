@@ -2,7 +2,7 @@
 orchestrator.py — Phase 4: Parallel Background Worker Orchestrator
 ===================================================================
 Runs as a SEPARATE process alongside admin.py.
-Three concurrent workers on different intervals:
+Three concurrent workers on different ls:
 
   Worker 1 (every 1 min):  GlobeNewswire live tracker — NASDAQ latest 50 articles
   Worker 2 (every 1 hour): Universal news pipeline    — RSS + HTML for all symbols
@@ -44,7 +44,9 @@ from pipeline_config import (
     SYMBOL_LIMIT,
     RSS_DELAY_RANGE,
     HTML_DELAY_RANGE,
+    SUMMARY_LLM_MODEL,
 )
+from config import LLM_CONFIG
 
 # ── Worker 2 FIFO queue ────────────────────────────────────────────────────────
 # Each 1-hour tick enqueues a token. Consumer thread processes one run at a time.
@@ -307,6 +309,27 @@ def _run_worker(name: str, interval: int, tick_fn):
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _warmup_models():
+    """Pre-load both LLM models into VRAM before any pipeline work starts."""
+    from openai import OpenAI
+    base_url = LLM_CONFIG["base_url"]
+    api_key  = LLM_CONFIG["api_key"]
+    main_model    = LLM_CONFIG["model"]
+    summary_model = SUMMARY_LLM_MODEL
+
+    for label, model in [("summary", summary_model), ("main", main_model)]:
+        try:
+            client = OpenAI(base_url=base_url, api_key=api_key)
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            logger.info(f"[warmup] {label} model ({model}) loaded OK")
+        except Exception as e:
+            logger.warning(f"[warmup] {label} model ({model}) failed: {e}")
+
+
 def main():
     logger.info("=" * 60)
     logger.info("TradeIntel Orchestrator starting")
@@ -314,6 +337,8 @@ def main():
     logger.info(f"  Worker2 (News pipeline):      every {WORKER2_INTERVAL}s  [ACTIVE — FIFO queue]")
     logger.info(f"  Worker3 (Macro research):     every {WORKER3_INTERVAL}s  [DISABLED]")
     logger.info("=" * 60)
+
+    _warmup_models()
 
     threads = [
         threading.Thread(

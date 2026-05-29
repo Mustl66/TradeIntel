@@ -81,6 +81,23 @@ def _get_summary_client() -> OpenAI:
     return OpenAI(base_url=LLM_CONFIG["base_url"], api_key=LLM_CONFIG["api_key"])
 
 
+def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
+    """Send a tiny request to both models so LM Studio loads both into VRAM before processing starts."""
+    for client, model, label in [
+        (summary_client, SUMMARY_LLM_MODEL,    "summary (e2b)"),
+        (main_client,    LLM_CONFIG["model"],  "main (e4b)"),
+    ]:
+        try:
+            client.chat.completions.create(
+                model=model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            logger.info(f"[warmup] {label} loaded OK")
+        except Exception as e:
+            logger.warning(f"[warmup] {label} warmup failed (non-fatal): {e}")
+
+
 # ── Stage 1: Pre-summarization prompt ─────────────────────────────────────────
 
 _STAGE1_SYSTEM = (
@@ -90,13 +107,45 @@ _STAGE1_SYSTEM = (
 )
 
 
+def _extract_json(raw: str) -> Optional[dict]:
+    """Robust JSON extraction: strip markdown fences, find outermost { }, parse."""
+    raw = raw.strip()
+    # strip ```json ... ``` or ``` ... ```
+    if raw.startswith("```"):
+        # take content between first ``` and last ```
+        inner = raw.split("```")
+        # parts[0]="", parts[1]="json\n{...}", parts[-1]="" or trailing text
+        for part in inner[1:]:
+            candidate = part.lstrip("json").lstrip("\n").strip()
+            if candidate.startswith("{"):
+                raw = candidate
+                break
+    # find outermost { ... } in case LLM prepended/appended prose
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # last-ditch: truncated JSON — try to close unclosed braces/brackets
+        # count open vs close
+        opens  = raw.count("{") - raw.count("}")
+        aopens = raw.count("[") - raw.count("]")
+        patched = raw.rstrip(",\n\r\t ") + ("]" * max(0, aopens)) + ("}" * max(0, opens))
+        try:
+            return json.loads(patched)
+        except Exception:
+            return None
+
+
 def _call_stage1(client: OpenAI, text: str) -> Optional[dict]:
     """Fast pre-summarization. Returns dict or None on failure."""
     try:
         kwargs1 = dict(
             model=SUMMARY_LLM_MODEL,
             temperature=0.05,
-            max_tokens=2048,
+            max_tokens=4096,          # was 2048 — too small, caused truncated JSON
             messages=[
                 {"role": "system", "content": _STAGE1_SYSTEM},
                 {"role": "user",   "content": f"Extract facts from this article:\n\n{text[:6000]}"},
@@ -109,11 +158,7 @@ def _call_stage1(client: OpenAI, text: str) -> Optional[dict]:
             }
         resp = client.chat.completions.create(**kwargs1)
         raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
+        return _extract_json(raw)
     except Exception as e:
         logger.warning(f"[Stage1] Failed: {e}")
         return None
@@ -181,11 +226,10 @@ def _call_stage2(client: OpenAI, prompt: str) -> Optional[dict]:
     try:
         resp = client.chat.completions.create(**kwargs)
         raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
+        result = _extract_json(raw)
+        if result is None:
+            logger.warning(f"[Stage2] Failed: could not parse JSON from response (len={len(raw)})")
+        return result
     except Exception as e:
         logger.warning(f"[Stage2] Failed: {e}")
         return None
@@ -460,6 +504,7 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
 
     main_client    = _get_main_client()
     summary_client = _get_summary_client()
+    _warmup_models(main_client, summary_client)
 
     total_scored = 0
     results = []
@@ -470,6 +515,10 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
             total_scored += r["scored"]
         except Exception as e:
             logger.error(f"[{sym['symbol']}] Unhandled error: {e}", exc_info=True)
+            try:
+                conn.rollback()   # reset aborted tx so next symbol can query
+            except Exception:
+                pass
 
     conn.close()
     duration = (datetime.now(timezone.utc) - started_at).total_seconds()
