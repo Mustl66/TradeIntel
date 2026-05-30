@@ -69,14 +69,31 @@ _LLM_PROFILES = {
         "base_url":          os.getenv("LLM_BASE_URL",   "https://api.openai.com/v1"),
         "api_key":           os.getenv("LLM_API_KEY",    ""),   # set in .env
         "model":             os.getenv("LLM_MODEL",      "gpt-4o-mini"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "gpt-4o-mini"),
         "temperature":       0.1,
         "context_size":      16384,
         "max_tokens":        12228,
         "top_p":             0.9,
-        "top_k":             40,
         "frequency_penalty": 0.2,
         "presence_penalty":  0.1,
         "reasoning_mode":    False,
+        # Number of parallel symbol workers for API mode (no VRAM limit — rate-limit aware)
+        "api_parallel_workers": int(os.getenv("API_PARALLEL_WORKERS", "5")),
+    },
+    "anthropic": {
+        # Claude via Anthropic API — set LLM_TYPE=anthropic + ANTHROPIC_API_KEY in .env
+        "base_url":          "https://api.anthropic.com/v1",
+        "api_key":           os.getenv("ANTHROPIC_API_KEY", ""),
+        "model":             os.getenv("LLM_MODEL",         "claude-haiku-4-5"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "claude-haiku-4-5"),
+        "temperature":       0.1,
+        "context_size":      16384,
+        "max_tokens":        8192,
+        "top_p":             0.9,
+        "frequency_penalty": 0.0,
+        "presence_penalty":  0.0,
+        "reasoning_mode":    False,
+        "api_parallel_workers": int(os.getenv("API_PARALLEL_WORKERS", "10")),
     },
 }
 

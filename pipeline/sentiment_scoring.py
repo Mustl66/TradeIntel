@@ -87,7 +87,11 @@ def _get_summary_client() -> OpenAI:
 
 
 def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
-    """Send a tiny request to both models so LM Studio loads both into VRAM before processing starts."""
+    """Send a tiny request to both models so LM Studio loads both into VRAM before processing starts.
+    Skipped for API mode — wastes tokens and the model is always available remotely."""
+    if LLM_TYPE in ("api", "anthropic"):
+        logger.info("[warmup] API mode — skipping warmup (no local model to load)")
+        return
     for client, model, label in [
         (summary_client, SUMMARY_LLM_MODEL,    "summary (e2b)"),
         (main_client,    LLM_CONFIG["model"],  "main (e4b)"),
@@ -161,7 +165,10 @@ def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optio
             kwargs1["extra_body"] = {
                 "num_ctx": LLM_CONFIG.get("context_size", 16384),
                 "top_k":   LLM_CONFIG.get("top_k", 40),
+                "format":  "json",
             }
+        elif LLM_TYPE in ("api", "anthropic"):
+            kwargs1["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs1)
         raw = resp.choices[0].message.content.strip()
         return _extract_json(raw)
@@ -230,6 +237,8 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
             "top_k":   LLM_CONFIG.get("top_k", 40),
             "format":  "json",   # force valid JSON output
         }
+    elif LLM_TYPE in ("api", "anthropic"):
+        kwargs["response_format"] = {"type": "json_object"}
     for attempt in range(1, retries + 1):
         try:
             resp = client.chat.completions.create(**kwargs)
@@ -401,8 +410,21 @@ def _compute_worker_count() -> int:
     """
     Detect free VRAM, query both model sizes via Ollama, compute N workers.
     Formula: floor((free_vram * 0.90) / (stage1_gb + stage2_gb)), min 1.
+    For API mode: skip VRAM entirely, use API_PARALLEL_WORKERS from config.
     Prints a clear startup banner to console.
     """
+    # API mode — no local GPU, parallelism limited by rate limits not VRAM
+    if LLM_TYPE in ("api", "anthropic"):
+        workers = LLM_CONFIG.get("api_parallel_workers", 5)
+        provider = "Anthropic Claude" if LLM_TYPE == "anthropic" else "OpenAI / hosted API"
+        print("\n┌─ GPU WORKER SIZING ──────────────────────────────────┐")
+        print(f"│  Mode: API ({provider:<29})│")
+        print(f"│  Workers: {workers:<4d}  (set API_PARALLEL_WORKERS in .env)  │")
+        print("│  No VRAM detection needed — model runs remotely      │")
+        print("└──────────────────────────────────────────────────────┘\n")
+        logger.info(f"[vram] API mode — using {workers} parallel workers (no VRAM sizing)")
+        return workers, False
+
     total_gb, free_gb = _get_free_vram_gb()
 
     if free_gb == 0.0:

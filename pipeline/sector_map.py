@@ -14,10 +14,9 @@ Usage:
 
 import json
 import logging
-import time
 from datetime import datetime, timezone, date
 
-from tradingview_screener import Query, Column
+from tradingview_screener import Query
 from db.connection import get_connection
 
 logger = logging.getLogger(__name__)
@@ -27,31 +26,31 @@ TV_SECTOR   = "sector"
 TV_INDUSTRY = "industry"
 
 # TV field → DB column mapping for metrics
+# NOTE: only include fields verified valid by TV screener API
 TV_METRIC_FIELDS: dict[str, str] = {
-    "close":                        "close_price",
-    "change":                       "price_change",
-    "price_earnings_ttm":           "price_earnings_ttm",
-    "price_sales_ttm":              "price_sales_ratio",
-    "price_book_fq":                "price_book_ratio",
+    "close":                          "close_price",
+    "change":                         "price_change",
+    "price_earnings_ttm":             "price_earnings_ttm",
+    "price_book_fq":                  "price_book_ratio",
     "earnings_per_share_diluted_ttm": "earnings_per_share_basic_ttm",
-    "price_earnings_growth_ttm":    "price_earnings_growth_ttm",
-    "total_revenue":                "total_revenue",
-    "net_income":                   "net_income",
-    "gross_margin":                 "gross_margin",
-    "operating_margin":             "operating_margin",
-    "net_margin":                   "net_margin",
-    "return_on_equity":             "return_on_equity",
-    "debt_to_equity":               "debt_to_equity",
-    "current_ratio_mrq":            "current_ratio",
-    "RSI":                          "rsi",
-    "SMA200":                       "sma200",
-    "High.52W":                     "price_52_week_high",
-    "relative_volume_10d_calc":     "relative_volume_10d_calc",
-    "average_volume_30d_calc":      "average_volume_30d_calc",
-    "earnings_release_next_date":   "earnings_release_date",
-    "Dividends.Yield.Current":      "dividend_yield_recent",
-    "number_of_employees":          "number_of_employees",
-    "market_cap_calc":              "market_cap_formatted",
+    "price_earnings_growth_ttm":      "price_earnings_growth_ttm",
+    "total_revenue":                  "total_revenue",
+    "net_income":                     "net_income",
+    "gross_margin":                   "gross_margin",
+    "operating_margin":               "operating_margin",
+    "net_margin":                     "net_margin",
+    "return_on_equity":               "return_on_equity",
+    "debt_to_equity":                 "debt_to_equity",
+    "current_ratio_mrq":              "current_ratio",
+    "RSI":                            "rsi",
+    "SMA200":                         "sma200",
+    "High.52W":                       "price_52_week_high",
+    "relative_volume_10d_calc":       "relative_volume_10d_calc",
+    "average_volume_30d_calc":        "average_volume_30d_calc",
+    "earnings_release_next_date":     "earnings_release_date",
+    "Dividends.Yield.Current":        "dividend_yield_recent",
+    "number_of_employees":            "number_of_employees",
+    "market_cap_calc":                "market_cap_formatted",
 }
 
 ALL_TV_FIELDS = [TV_SECTOR, TV_INDUSTRY] + list(TV_METRIC_FIELDS.keys())
@@ -62,29 +61,26 @@ ALL_TV_FIELDS = [TV_SECTOR, TV_INDUSTRY] + list(TV_METRIC_FIELDS.keys())
 def _fetch_tv_data(symbols: list[str]) -> dict[str, dict]:
     """
     Query TradingView Screener for sector, industry, and all metrics.
+    ONE request — fetch all US stocks, filter locally against our symbol set.
     Returns {ticker: {field: value, ...}}.
     """
+    want = set(symbols)
     result = {}
-    chunk_size = 500
-
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i:i + chunk_size]
-        try:
-            _, df = (
-                Query()
-                .select(*ALL_TV_FIELDS)
-                .where(Column("name").isin(chunk))
-                .get_scanner_data()
-            )
-            for _, row in df.iterrows():
-                ticker = row.get("name") or row.get("ticker", "")
-                if ":" in ticker:
-                    ticker = ticker.split(":", 1)[1]
-                if ticker:
-                    result[ticker] = {col: row.get(col) for col in ALL_TV_FIELDS}
-        except Exception as e:
-            logger.warning(f"TradingView batch {i//chunk_size} failed: {e}")
-        time.sleep(0.5)
+    try:
+        _, df = (
+            Query()
+            .select(*ALL_TV_FIELDS)
+            .limit(25000)
+            .get_scanner_data()
+        )
+        for _, row in df.iterrows():
+            ticker = row.get("name") or row.get("ticker", "")
+            if ":" in ticker:
+                ticker = ticker.split(":", 1)[1]
+            if ticker and ticker in want:
+                result[ticker] = {col: row.get(col) for col in ALL_TV_FIELDS}
+    except Exception as e:
+        logger.error(f"TradingView fetch failed: {e}")
 
     return result
 
