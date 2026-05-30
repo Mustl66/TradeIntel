@@ -1,9 +1,10 @@
 """
-pipeline/sector_map.py — Phase 3: Sector & Industry Mapping
+pipeline/sector_map.py — Phase 3: Sector & Industry Mapping + TV Data Refresh
 =============================================================
-Fetches sector/industry for every symbol via TradingView Screener,
-inserts new industries into sectors_macro (multiplier=1.000 default),
-then maps sector_id back onto every symbols row.
+Fetches sector/industry + all TradingView metrics for every symbol.
+Inserts new industries into sectors_macro (multiplier=1.000 default),
+maps sector_id back onto every symbols row, updates all TV metric columns,
+and saves one daily snapshot per symbol into symbol_daily_snapshots.
 
 Usage:
     python -m pipeline.sector_map                  # all exchanges
@@ -11,9 +12,10 @@ Usage:
     python -m pipeline.sector_map --limit 50       # dev/test
 """
 
+import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 from tradingview_screener import Query, Column
 from db.connection import get_connection
@@ -24,14 +26,43 @@ logger = logging.getLogger(__name__)
 TV_SECTOR   = "sector"
 TV_INDUSTRY = "industry"
 
+# TV field → DB column mapping for metrics
+TV_METRIC_FIELDS: dict[str, str] = {
+    "close":                        "close_price",
+    "change":                       "price_change",
+    "price_earnings_ttm":           "price_earnings_ttm",
+    "price_sales_ttm":              "price_sales_ratio",
+    "price_book_fq":                "price_book_ratio",
+    "earnings_per_share_diluted_ttm": "earnings_per_share_basic_ttm",
+    "price_earnings_growth_ttm":    "price_earnings_growth_ttm",
+    "total_revenue":                "total_revenue",
+    "net_income":                   "net_income",
+    "gross_margin":                 "gross_margin",
+    "operating_margin":             "operating_margin",
+    "net_margin":                   "net_margin",
+    "return_on_equity":             "return_on_equity",
+    "debt_to_equity":               "debt_to_equity",
+    "current_ratio_mrq":            "current_ratio",
+    "RSI":                          "rsi",
+    "SMA200":                       "sma200",
+    "High.52W":                     "price_52_week_high",
+    "relative_volume_10d_calc":     "relative_volume_10d_calc",
+    "average_volume_30d_calc":      "average_volume_30d_calc",
+    "earnings_release_next_date":   "earnings_release_date",
+    "Dividends.Yield.Current":      "dividend_yield_recent",
+    "number_of_employees":          "number_of_employees",
+    "market_cap_calc":              "market_cap_formatted",
+}
+
+ALL_TV_FIELDS = [TV_SECTOR, TV_INDUSTRY] + list(TV_METRIC_FIELDS.keys())
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _fetch_tv_sectors(symbols: list[str]) -> dict[str, dict]:
+def _fetch_tv_data(symbols: list[str]) -> dict[str, dict]:
     """
-    Query TradingView Screener for sector + industry for a batch of tickers.
-    Returns {ticker: {"sector": ..., "industry": ...}}.
-    Batches in chunks of 500 to stay within API limits.
+    Query TradingView Screener for sector, industry, and all metrics.
+    Returns {ticker: {field: value, ...}}.
     """
     result = {}
     chunk_size = 500
@@ -41,22 +72,19 @@ def _fetch_tv_sectors(symbols: list[str]) -> dict[str, dict]:
         try:
             _, df = (
                 Query()
-                .select(TV_SECTOR, TV_INDUSTRY)
+                .select(*ALL_TV_FIELDS)
                 .where(Column("name").isin(chunk))
                 .get_scanner_data()
             )
             for _, row in df.iterrows():
                 ticker = row.get("name") or row.get("ticker", "")
-                # TV returns "NASDAQ:AAPL" — strip exchange prefix
                 if ":" in ticker:
                     ticker = ticker.split(":", 1)[1]
-                sector   = (row.get(TV_SECTOR)   or "").strip()
-                industry = (row.get(TV_INDUSTRY) or "").strip()
-                if ticker and sector and industry:
-                    result[ticker] = {"sector": sector, "industry": industry}
+                if ticker:
+                    result[ticker] = {col: row.get(col) for col in ALL_TV_FIELDS}
         except Exception as e:
             logger.warning(f"TradingView batch {i//chunk_size} failed: {e}")
-        time.sleep(0.5)   # polite rate limit
+        time.sleep(0.5)
 
     return result
 
@@ -64,7 +92,6 @@ def _fetch_tv_sectors(symbols: list[str]) -> dict[str, dict]:
 def _upsert_industry(cur, sector: str, industry: str) -> int:
     """
     Insert industry if not present. Returns sectors_macro.id.
-    Multiplier left at default 1.000 — macro_multiplier.py updates it later.
     """
     cur.execute("""
         INSERT INTO sectors_macro (sector_name, industry_name, macro_multiplier, updated_at)
@@ -75,7 +102,6 @@ def _upsert_industry(cur, sector: str, industry: str) -> int:
     row = cur.fetchone()
     if row:
         return row[0]
-    # Already existed — fetch id
     cur.execute(
         "SELECT id FROM sectors_macro WHERE sector_name=%s AND industry_name=%s",
         (sector, industry)
@@ -83,8 +109,51 @@ def _upsert_industry(cur, sector: str, industry: str) -> int:
     return cur.fetchone()[0]
 
 
+def _safe_numeric(v):
+    """Convert TV value to float, or None."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(v):
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_date(v):
+    """Parse TV earnings date to date string or None."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            # TV sometimes returns Unix timestamp in ms
+            return datetime.fromtimestamp(v / 1000, tz=timezone.utc).isoformat()
+        return str(v)
+    except Exception:
+        return None
+
+
+def _upsert_daily_snapshot(cur, symbol_id: int, snap_date: date, data: dict):
+    """Save/update daily TV snapshot (one row per symbol per day)."""
+    # Clean: only store non-None values
+    clean = {k: v for k, v in data.items() if v is not None}
+    cur.execute("""
+        INSERT INTO symbol_daily_snapshots (symbol_id, snapshot_date, data)
+        VALUES (%s, %s, %s::jsonb)
+        ON CONFLICT (symbol_id, snapshot_date) DO UPDATE
+            SET data = EXCLUDED.data, created_at = NOW()
+    """, (symbol_id, snap_date, json.dumps(clean)))
+
+
 def _get_all_symbols(cur, exchange: str | None, limit: int) -> list[dict]:
-    """Fetch all active symbols we want to map."""
     q = "SELECT id, symbol, exchange FROM symbols"
     args = []
     if exchange:
@@ -102,13 +171,12 @@ def _get_all_symbols(cur, exchange: str | None, limit: int) -> list[dict]:
 
 def run(exchange: str | None = None, limit: int = 0) -> dict:
     """
-    Full sector mapping run.
-    Returns stats dict: {mapped, new_industries, missing, duration_s}
+    Full sector mapping + TV data refresh run.
     """
     started_at = datetime.now(timezone.utc)
-    conn = get_connection()
+    today      = started_at.date()
+    conn       = get_connection()
 
-    # Log pipeline start
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO pipeline_runs (step, exchange, started_at, status)
@@ -117,7 +185,7 @@ def run(exchange: str | None = None, limit: int = 0) -> dict:
         run_id = cur.fetchone()[0]
     conn.commit()
 
-    stats = {"mapped": 0, "new_industries": 0, "missing": 0, "duration_s": 0}
+    stats = {"mapped": 0, "new_industries": 0, "missing": 0, "snapshots": 0, "duration_s": 0}
 
     try:
         with conn.cursor() as cur:
@@ -127,48 +195,79 @@ def run(exchange: str | None = None, limit: int = 0) -> dict:
             logger.warning("No symbols found to map.")
             return stats
 
-        logger.info(f"Fetching sectors for {len(symbols)} symbols from TradingView...")
-        tickers = [s["symbol"] for s in symbols]
-        tv_data = _fetch_tv_sectors(tickers)
+        logger.info(f"Fetching TV data for {len(symbols)} symbols...")
+        tickers  = [s["symbol"] for s in symbols]
+        tv_data  = _fetch_tv_data(tickers)
         logger.info(f"TradingView returned data for {len(tv_data)} tickers.")
 
-        # Build symbol_id lookup
         sym_by_ticker = {s["symbol"]: s["id"] for s in symbols}
 
         with conn.cursor() as cur:
             for ticker, info in tv_data.items():
-                sector   = info["sector"]
-                industry = info["industry"]
+                sector   = (info.get(TV_SECTOR) or "").strip()
+                industry = (info.get(TV_INDUSTRY) or "").strip()
                 sym_id   = sym_by_ticker.get(ticker)
                 if not sym_id:
                     continue
 
-                # Upsert industry
-                sector_id = _upsert_industry(cur, sector, industry)
-                if sector_id:
-                    stats["new_industries"] += 1   # crude — refined below
+                # ── sector_id + industry column ───────────────────────────────
+                sector_id = None
+                if sector and industry:
+                    sector_id = _upsert_industry(cur, sector, industry)
 
-                # Map sector_id onto symbol
-                cur.execute("""
-                    UPDATE symbols SET sector_id = %s, last_updated_at = NOW()
-                    WHERE id = %s AND (sector_id IS DISTINCT FROM %s)
-                """, (sector_id, sym_id, sector_id))
-                stats["mapped"] += 1  # count all TV-matched symbols, not just changed rows
+                # Build metric update dict
+                metric_updates = {}
+                for tv_col, db_col in TV_METRIC_FIELDS.items():
+                    val = info.get(tv_col)
+                    if db_col == "market_cap_formatted":
+                        metric_updates[db_col] = str(val)[:50] if val is not None else None
+                    elif db_col in ("number_of_employees",):
+                        metric_updates[db_col] = _safe_int(val)
+                    elif db_col == "earnings_release_date":
+                        metric_updates[db_col] = _safe_date(val)
+                    else:
+                        metric_updates[db_col] = _safe_numeric(val)
+
+                # Dynamic UPDATE for metrics
+                set_parts = ["last_updated_at = NOW()"]
+                vals = []
+                if industry:
+                    set_parts.append("industry = %s")
+                    vals.append(industry)
+                if sector_id:
+                    set_parts.append("sector_id = %s")
+                    vals.append(sector_id)
+                for db_col, val in metric_updates.items():
+                    if val is not None:
+                        set_parts.append(f"{db_col} = %s")
+                        vals.append(val)
+
+                vals.append(sym_id)
+                cur.execute(
+                    f"UPDATE symbols SET {', '.join(set_parts)} WHERE id = %s",
+                    vals
+                )
+                stats["mapped"] += 1
+
+                # ── Daily snapshot ─────────────────────────────────────────────
+                snap_data = {
+                    "sector": sector, "industry": industry,
+                    **{db_col: val for db_col, val in metric_updates.items() if val is not None}
+                }
+                _upsert_daily_snapshot(cur, sym_id, today, snap_data)
+                stats["snapshots"] += 1
 
             conn.commit()
 
-        # Count truly new industries (inserted this run)
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM sectors_macro
-                WHERE last_llm_run_at IS NULL
-            """)
+            cur.execute("SELECT COUNT(*) FROM sectors_macro WHERE last_llm_run_at IS NULL")
             stats["new_industries"] = cur.fetchone()[0]
 
         stats["missing"] = len(symbols) - len(tv_data)
         logger.info(
             f"Sector map complete — mapped={stats['mapped']}, "
-            f"new_industries={stats['new_industries']}, missing={stats['missing']}"
+            f"snapshots={stats['snapshots']}, new_industries={stats['new_industries']}, "
+            f"missing={stats['missing']}"
         )
 
     except Exception as e:
@@ -194,7 +293,9 @@ def run(exchange: str | None = None, limit: int = 0) -> dict:
             """, (
                 len(symbols),
                 stats["mapped"],
-                f'{{"new_industries":{stats["new_industries"]},"missing":{stats["missing"]}}}',
+                json.dumps({"new_industries": stats["new_industries"],
+                            "missing": stats["missing"],
+                            "snapshots": stats["snapshots"]}),
                 run_id
             ))
         conn.commit()

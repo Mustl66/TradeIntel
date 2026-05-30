@@ -607,6 +607,31 @@ def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
 
 # ── Per-symbol processor ──────────────────────────────────────────────────────
 
+def _get_daily_snapshot(conn, symbol_id: int, article_date) -> dict:
+    """
+    Get the best TV snapshot for a given article date.
+    Looks for snapshot on same day, then searches backwards (most recent ≤ article_date).
+    Falls back to most recent snapshot available. Returns empty dict if none.
+    """
+    try:
+        snap_date = article_date.date() if hasattr(article_date, "date") else article_date
+        with conn.cursor() as cur:
+            # Best: same day or earlier (most recent ≤ article date)
+            cur.execute("""
+                SELECT data FROM symbol_daily_snapshots
+                WHERE symbol_id = %s AND snapshot_date <= %s
+                ORDER BY snapshot_date DESC
+                LIMIT 1
+            """, (symbol_id, snap_date))
+            row = cur.fetchone()
+            if row:
+                data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                return {**data, "_snapshot_date": str(snap_date)}
+    except Exception as e:
+        logger.debug(f"[snapshot] Could not fetch daily snapshot: {e}")
+    return {}
+
+
 def _process_symbol(
     conn,
     main_client: OpenAI,
@@ -622,8 +647,16 @@ def _process_symbol(
     if not articles:
         return {"symbol": symbol, "scored": 0, "skipped": 0}
 
-    # TradingView snapshot (only non-None fields)
-    tv_fields = [
+    macro_mult     = _get_macro_multiplier(conn, industry)
+    master_summary = sym.get("symbol_master_summary") or ""
+    last_score     = 0.0
+    weighted_scores = []
+    last_forecast  = ""
+    scored = 0
+    skipped = 0
+
+    # Fallback TV snapshot from symbols row (used when no daily snapshot exists)
+    tv_fields_fallback = [
         "close_price", "price_change", "price_earnings_ttm", "price_sales_ratio",
         "price_book_ratio", "earnings_per_share_basic_ttm", "price_earnings_growth_ttm",
         "total_revenue", "net_income", "gross_margin", "operating_margin", "net_margin",
@@ -632,22 +665,17 @@ def _process_symbol(
         "earnings_release_date", "dividend_yield_recent", "number_of_employees",
         "industry", "market_cap_formatted",
     ]
-    tv_snapshot = {k: sym[k] for k in tv_fields
-                   if sym.get(k) is not None}
-    if "earnings_release_date" in tv_snapshot and hasattr(tv_snapshot["earnings_release_date"], "isoformat"):
-        tv_snapshot["earnings_release_date"] = tv_snapshot["earnings_release_date"].isoformat()
-
-    macro_mult   = _get_macro_multiplier(conn, industry)
-    master_summary = sym.get("symbol_master_summary") or ""
-    last_score     = 0.0
-    weighted_scores = []
-    last_forecast  = ""
-    scored = 0
-    skipped = 0
+    tv_snapshot_fallback = {k: sym[k] for k in tv_fields_fallback if sym.get(k) is not None}
+    if "earnings_release_date" in tv_snapshot_fallback and hasattr(tv_snapshot_fallback["earnings_release_date"], "isoformat"):
+        tv_snapshot_fallback["earnings_release_date"] = tv_snapshot_fallback["earnings_release_date"].isoformat()
 
     for article in articles:
         art_id      = article["id"]
         published_at = article["published_at"]
+
+        # Get date-matched daily snapshot for this article; fall back to symbols row
+        daily_snap = _get_daily_snapshot(conn, sym_id, published_at)
+        tv_snapshot = daily_snap if daily_snap else tv_snapshot_fallback
 
         # Already scored — use its weighted score for final calc but skip LLM
         if article["sentiment_score"] is not None:

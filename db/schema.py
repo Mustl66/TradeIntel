@@ -292,6 +292,20 @@ def create_tables() -> None:
                 END$$;
             """)
 
+            # symbol_daily_snapshots — one TV snapshot row per symbol per day
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_daily_snapshots (
+                    id            SERIAL PRIMARY KEY,
+                    symbol_id     INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    snapshot_date DATE    NOT NULL,
+                    data          JSONB   NOT NULL,
+                    created_at    TIMESTAMPTZ DEFAULT NOW(),
+                    CONSTRAINT uq_symbol_snapshot_date UNIQUE (symbol_id, snapshot_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_date
+                    ON symbol_daily_snapshots (symbol_id, snapshot_date DESC);
+            """)
+
         conn.commit()
         logger.info("Database schema verified / created successfully.")
     except Exception as e:
