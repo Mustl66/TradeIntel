@@ -75,7 +75,11 @@ print(f"Articles in DB before run: {before} news + {before_edgar} SEC filings\n"
 from pipeline_config import PIPELINES
 
 rss_feeds  = [f for f in feeds if f['feed_type'] in ('rss', 'atom', 'unknown') and f['is_active']]
-html_feeds = [f for f in feeds if f['feed_type'] in ('html', 'api') and f['is_active']]
+html_feeds = [
+    {**dict(f), "feed_id": f["id"]}
+    for f in feeds
+    if f['feed_type'] in ('html', 'api') and f['is_active']
+]
 
 # ── RSS pipeline ──────────────────────────────────────────────────────────────
 if PIPELINES['rss']['active'] and rss_feeds:
@@ -104,7 +108,7 @@ else:
 # ── HTML pipeline ─────────────────────────────────────────────────────────────
 if PIPELINES['html']['active'] and html_feeds:
     print(f"── HTML pipeline ({len(html_feeds)} feed(s)) ─────────────────────────────")
-    from pipeline.html_ingest import _process_html_feed, _insert_articles as _html_insert
+    from pipeline.html_ingest import _process_html_feed, _save_articles as _html_insert
     conn = get_conn()
     for feed in html_feeds:
         print(f"  Fetching: {feed['feed_url']}")

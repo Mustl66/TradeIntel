@@ -248,6 +248,12 @@ def create_tables() -> None:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='forecast_until_earnings') THEN
                         ALTER TABLE news_articles ADD COLUMN forecast_until_earnings TEXT;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='stage2_prompt') THEN
+                        ALTER TABLE news_articles ADD COLUMN stage2_prompt TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='company_connections') THEN
+                        ALTER TABLE news_articles ADD COLUMN company_connections JSONB;
+                    END IF;
                 END$$;
             """)
             cur.execute("""
@@ -314,3 +320,8 @@ def create_tables() -> None:
         raise
     finally:
         conn.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+    create_tables()

@@ -18,7 +18,7 @@ START_FROM = None   # e.g. "html"  or  "sector_map"
 
 # Limit symbols processed per run. False = all symbols. Integer = first N symbols only.
 # Useful for quick test runs without waiting for the full 2800-symbol pipeline.
-SYMBOL_LIMIT = 10   # e.g. 100  or  False
+SYMBOL_LIMIT = False   # e.g. 100  or  False
 
 PIPELINES = {
     "rss": {
@@ -56,7 +56,8 @@ from config import LLM_CONFIG
 MAX_EVAL_ARTICLES        = 30      # rolling window per symbol (newest N articles)
 ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
-SENTIMENT_LAMBDA         = 0.02    # time-decay lambda (per hour)
+SENTIMENT_LAMBDA         = 0.001   # time-decay lambda (per hour) — applied only AFTER grace period
+DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this many months
 
 # ── Stage 1 parallel workers (gemma-4-e2b pre-summarization) ──────────────────
 # Stage 1 is stateless per article — safe to run in parallel.

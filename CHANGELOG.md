@@ -158,6 +158,99 @@ Code preserved — not deleted. Will be re-enabled in a later phase.
 
 ---
 
+### [3.0.5] – 2026-05-31 — Score Math Fixes, Context Window, Viewer Detail Page, Company Connections
+
+#### Bug Fix: `if scored > 0` → `if weighted_scores`
+When all articles for a symbol were already scored in a previous run, `scored=0` caused
+`_save_symbol_scores` to be skipped entirely. Time-decay was recalculated correctly but
+the result was thrown away. Fix: guard now checks `if weighted_scores` — symbol final_score
+refreshes on every run regardless of whether new LLM calls were made.
+- `pipeline/sentiment_scoring.py`
+
+#### Bug Fix: JSON Parse Failures (Stage 2 returning markdown prose)
+Model ignored `format: json` and returned markdown headers/emoji instead of JSON.
+Three root causes fixed:
+1. `json_repair` promoted to pass 2 (runs before manual brace patching)
+2. On retry 2+, conversation now shows the model its own bad response with explicit correction
+3. Debug log promoted to WARNING — raw output (first 400 chars) now always visible on failure
+- `pipeline/sentiment_scoring.py`
+
+#### Bug Fix: Truncated JSON (open string, no closing brace)
+Model output ending mid-sentence (no closing `}`) caused `rfind("}")` to return -1,
+silently skipping the repair path. `json_repair` with `return_objects=True` then returned
+a non-dict and was rejected. Fix: `repair_json` now called as string output then re-parsed
+via `json.loads` — handles open strings and truncated values reliably.
+- `pipeline/sentiment_scoring.py`
+
+#### Time-Decay Overhaul — Grace Period + Gentler Lambda
+Old: λ=0.02/hr → half-life 34.7 hours. Earnings from 3 months ago decayed to ~0.
+New: grace period (default 6 months) where NO decay is applied. After grace, gentler
+λ=0.001/hr (half-life ~29 days). The older the news, the more it decays — but recent
+same-year reports retain full weight.
+New config vars in `pipeline_config.py`:
+  DECAY_GRACE_MONTHS = 6      # no decay inside this window
+  SENTIMENT_LAMBDA = 0.001    # decay rate after grace period
+- `pipeline_config.py`, `pipeline/sentiment_scoring.py`
+
+#### Ollama Context: Persistent Modelfiles (16k)
+Ollama defaults context to 4096 tokens (silently truncating inputs).
+Created persistent Modelfiles on remote Debian server (10.11.12.8):
+  gemma4:e2b-ctx16k — Stage 1 model, num_ctx=16384
+  gemma4:e4b-ctx16k — Stage 2 model, num_ctx=16384
+`config.py` STAGE1_MODEL + STAGE2_MODEL updated to point to ctx16k variants.
+- `config.py`
+
+#### single_model_mode Disabled
+VRAM check was sometimes falling back to single-model mode (stage1 reuses stage2 model).
+`use_single_model` hardcoded to False — both models always loaded independently.
+- `pipeline/sentiment_scoring.py`
+
+#### Per-Article Timing Log
+Each article now logs: symbol, article_id, score, s1 time, s2 time, headline.
+Example: `[AAPL] article=1234 score=+0.72 s1=4.2s s2=9.1s | Apple Reports Record Q2...`
+s1=0.0s means Stage 1 was cached (pre_summary_data already in DB).
+- `pipeline/sentiment_scoring.py`
+
+#### Company Connections Extracted by Stage 2 LLM
+Stage 2 now extracts structured company relationships per article:
+  {"competitors": ["ABBV","MRK"], "partners": ["RHHBY"], "suppliers": []}
+Stored in new `news_articles.company_connections JSONB` column.
+Aggregated across all articles on the viewer detail page.
+- `pipeline/stage2_instruction.json`, `pipeline/sentiment_scoring.py`, `db/schema.py`
+
+#### Viewer: Full Symbol Detail Page
+Clicking a symbol in the leaderboard opens a full detail page /symbol/{id}:
+- Score hero + TV screener grid (price, volume, margins, ratios, next earnings date)
+- Symbol forecast narrative (full text)
+- Master summary
+- Company connections (aggregated: competitors, partners, suppliers)
+- Sector macro context + market research articles
+- All scored articles with expandable LLM input (collapsible): master_summary,
+  pre_summary_data, TV data, stage2_prompt, key_events, forecast, rationale
+- Industry pulled from symbol_daily_snapshots
+- `viewer.py`
+
+#### Admin: Intelligence Tab
+New 🧠 Intelligence tab on every symbol panel:
+- Industry/sector from symbol_daily_snapshots
+- TradingView data grid
+- Full forecast narrative
+- Master summary
+- Company connections (competitors/partners/suppliers)
+- Sector macro rationale
+- `admin.py`
+
+#### Files Changed
+- `pipeline/sentiment_scoring.py` — decay fix, JSON parse, timing log, connections save, single_model forced off
+- `pipeline_config.py` — DECAY_GRACE_MONTHS, SENTIMENT_LAMBDA updated
+- `pipeline/stage2_instruction.json` — company_connections added to output schema
+- `db/schema.py` — company_connections JSONB column migration
+- `config.py` — STAGE1_MODEL + STAGE2_MODEL → ctx16k
+- `viewer.py` — symbol detail page
+- `admin.py` — Intelligence tab
+
+---
+
 ### [3.0.4] – 2026-05-28 — Ollama ctx fix, LLM debug tab, stage2_prompt saved
 
 #### Ollama `num_ctx` override

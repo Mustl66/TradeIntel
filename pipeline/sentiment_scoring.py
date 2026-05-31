@@ -31,6 +31,7 @@ Usage:
 
 import json
 import logging
+from decimal import Decimal
 import math
 import platform
 import subprocess
@@ -46,12 +47,38 @@ from openai import OpenAI
 
 from config import LLM_CONFIG, LLM_TYPE, GPU_VRAM_GB
 from db.connection import get_conn
-from pipeline_config import (
+from pipeline_config import (  # noqa — patched below
     MAX_EVAL_ARTICLES,
     ENABLE_PRE_SUMMARIZATION,
     SUMMARY_LLM_MODEL,
     SENTIMENT_LAMBDA,
+    DECAY_GRACE_MONTHS,
 )
+
+# ── JSON helper — handles Decimal / NaN from psycopg2 ─────────────────────────
+
+class _SafeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return float(o)
+        return super().default(o)
+
+    def iterencode(self, o, _one_shot=False):
+        # replace NaN/Inf floats with None before encoding
+        def _clean(v):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return None
+            if isinstance(v, dict):
+                return {k: _clean(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_clean(x) for x in v]
+            return v
+        return super().iterencode(_clean(o), _one_shot)
+
+
+def _json_dumps(obj, **kwargs):
+    return json.dumps(obj, cls=_SafeEncoder, ensure_ascii=False, **kwargs)
+
 
 # ── Load instruction JSONs ────────────────────────────────────────────────────
 
@@ -118,34 +145,63 @@ _STAGE1_SYSTEM = (
 
 def _extract_json(raw: str) -> Optional[dict]:
     """Robust JSON extraction: strip markdown fences, find outermost { }, parse."""
+    from json_repair import repair_json
+
     raw = raw.strip()
+
     # strip ```json ... ``` or ``` ... ```
     if raw.startswith("```"):
-        # take content between first ``` and last ```
         inner = raw.split("```")
-        # parts[0]="", parts[1]="json\n{...}", parts[-1]="" or trailing text
         for part in inner[1:]:
             candidate = part.lstrip("json").lstrip("\n").strip()
             if candidate.startswith("{"):
                 raw = candidate
                 break
-    # find outermost { ... } in case LLM prepended/appended prose
+
+    # find outermost { ... } — skip if no closing } (truncated output)
     start = raw.find("{")
     end   = raw.rfind("}")
     if start != -1 and end != -1 and end > start:
         raw = raw[start:end + 1]
+    elif start != -1:
+        # truncated: no closing } — take from { onward and let json_repair fix it
+        raw = raw[start:]
+
+    # pass 1: standard json.loads (fast path)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # last-ditch: truncated JSON — try to close unclosed braces/brackets
-        # count open vs close
+        pass
+
+    # pass 2: json_repair as string -> json.loads (handles truncation, open strings, trailing commas)
+    try:
+        repaired_str = repair_json(raw)
+        if repaired_str:
+            parsed = json.loads(repaired_str)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+    except Exception:
+        pass
+
+    # pass 3: json_repair with return_objects=True (direct dict, no re-parse)
+    try:
+        repaired = repair_json(raw, return_objects=True)
+        if isinstance(repaired, dict) and repaired:
+            return repaired
+    except Exception:
+        pass
+
+    # pass 4: manual brace-patch then json.loads (last resort)
+    try:
         opens  = raw.count("{") - raw.count("}")
         aopens = raw.count("[") - raw.count("]")
         patched = raw.rstrip(",\n\r\t ") + ("]" * max(0, aopens)) + ("}" * max(0, opens))
-        try:
-            return json.loads(patched)
-        except Exception:
-            return None
+        return json.loads(patched)
+    except Exception:
+        pass
+
+    logger.warning(f"[_extract_json] All parse attempts failed. Raw (first 400): {raw[:400]!r}")
+    return None
 
 
 def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optional[dict]:
@@ -196,7 +252,7 @@ def _build_stage2_prompt(
 ) -> str:
     # Article text: use Stage 1 output if available, else raw text
     if stage1_result:
-        text_block = json.dumps(stage1_result, ensure_ascii=False)
+        text_block = _json_dumps(stage1_result)
     else:
         raw = (article.get("full_text") or article.get("summary") or "")[:3000]
         text_block = raw
@@ -214,7 +270,7 @@ def _build_stage2_prompt(
             "last_article_score": last_score,
         },
     }
-    return json.dumps(payload, ensure_ascii=False)
+    return _json_dumps(payload)
 
 
 def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict]:
@@ -239,14 +295,30 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
         }
     elif LLM_TYPE in ("api", "anthropic"):
         kwargs["response_format"] = {"type": "json_object"}
+    last_raw = None
     for attempt in range(1, retries + 1):
         try:
+            # On retry: inject corrective turn showing model what it did wrong
+            if attempt > 1 and last_raw is not None:
+                kwargs["messages"] = [
+                    kwargs["messages"][0],  # system
+                    kwargs["messages"][1],  # original user prompt
+                    {"role": "assistant", "content": last_raw},
+                    {"role": "user", "content": (
+                        "Your previous response was NOT valid JSON. "
+                        "You returned markdown/prose. "
+                        "Return ONLY a raw JSON object — no markdown fences, no explanation, no preamble. "
+                        "Start your response with { and end with }."
+                    )},
+                ]
             resp = client.chat.completions.create(**kwargs)
             raw = resp.choices[0].message.content.strip()
             result = _extract_json(raw)
             if result is not None:
                 return result
+            last_raw = raw
             logger.warning(f"[Stage2] Attempt {attempt}/{retries}: could not parse JSON (len={len(raw)})")
+            logger.warning(f"[Stage2] Attempt {attempt} raw (first 300): {raw[:300]!r}")
         except Exception as e:
             logger.warning(f"[Stage2] Attempt {attempt}/{retries}: {e}")
     logger.warning(f"[Stage2] All {retries} attempts failed — using neutral fallback")
@@ -256,10 +328,19 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
 # ── Time-decay ────────────────────────────────────────────────────────────────
 
 def _time_decay(score: float, published_at: datetime, lam: float = SENTIMENT_LAMBDA) -> float:
+    """
+    Grace period: no decay for articles younger than DECAY_GRACE_MONTHS.
+    After grace period: exponential decay kicks in, measured from grace cutoff.
+    Lambda=0.001/hr → half-life ~29 days after grace ends.
+    """
     now = datetime.now(timezone.utc)
     if published_at.tzinfo is None:
         published_at = published_at.replace(tzinfo=timezone.utc)
-    t_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
+    age_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
+    grace_hours = DECAY_GRACE_MONTHS * 30.44 * 24  # avg days per month
+    if age_hours <= grace_hours:
+        return round(score, 6)  # no decay inside grace window
+    t_hours = age_hours - grace_hours  # decay only from grace cutoff onward
     return round(score * math.exp(-lam * t_hours), 6)
 
 
@@ -457,7 +538,7 @@ def _compute_worker_count() -> int:
 
     # If only 1 worker fits both models, check if single-model mode fits more workers
     single_model_workers = max(1, int(usable_gb / stage2_gb))
-    use_single_model = (workers == 1 and single_model_workers > 1) or (stage1_gb + stage2_gb > usable_gb)
+    use_single_model = False  # Always load both stage-1 and stage-2 models
 
     if use_single_model:
         workers = single_model_workers
@@ -588,6 +669,7 @@ def _save_article_result(cur, article_id: int, result: dict,
         "score_rationale":         _to_str(result.get("score_rationale"), 1000),
         "forecast_until_earnings": _to_str(result.get("forecast_until_earnings"), 2000),
         "stage2_prompt":           stage2_prompt,
+        "company_connections":     json.dumps(result.get("company_connections") or {"competitors": [], "partners": [], "suppliers": []}),
     }
     if pre_summary:
         updates["pre_summary_data"] = json.dumps(pre_summary)
@@ -602,7 +684,8 @@ def _save_article_result(cur, article_id: int, result: dict,
             pre_summary_data        = COALESCE(%(pre_summary_data)s::jsonb, pre_summary_data),
             score_rationale         = %(score_rationale)s,
             forecast_until_earnings = %(forecast_until_earnings)s,
-            stage2_prompt           = %(stage2_prompt)s
+            stage2_prompt           = %(stage2_prompt)s,
+            company_connections     = %(company_connections)s::jsonb
         WHERE id = %(id)s
     """, {**updates, "id": article_id,
           "pre_summary_data": json.dumps(pre_summary) if pre_summary else None})
@@ -712,6 +795,7 @@ def _process_symbol(
 
         # Stage 1: pre-summarization
         stage1_result = None
+        t_s1 = 0.0
         if ENABLE_PRE_SUMMARIZATION:
             # Use cached pre_summary_data if available
             if article.get("pre_summary_data"):
@@ -719,17 +803,21 @@ def _process_symbol(
             else:
                 raw_text = (article.get("full_text") or article.get("summary") or "")
                 if raw_text.strip():
+                    _t0 = time.time()
                     stage1_result = _call_stage1(
                         summary_client, raw_text,
                         model_override=LLM_CONFIG["model"] if single_model_mode else None
                     )
+                    t_s1 = round(time.time() - _t0, 1)
 
         # Stage 2: stateful scoring
         prompt = _build_stage2_prompt(
             symbol, tv_snapshot, article,
             master_summary, last_score, stage1_result
         )
+        _t0 = time.time()
         result = _call_stage2(main_client, prompt)
+        t_s2 = round(time.time() - _t0, 1)
 
         if result is None:
             # Fallback: neutral score, preserve master_summary
@@ -760,10 +848,16 @@ def _process_symbol(
         weighted_scores.append(weighted)
         scored += 1
 
+        title_short = (article.get("title") or "")[:60]
+        logger.info(
+            f"[{symbol}] article={art_id} score={raw_score:+.2f} "
+            f"s1={t_s1}s s2={t_s2}s | {title_short}"
+        )
+
         time.sleep(0.3)  # brief pause between articles
 
     # Save symbol-level scores
-    if scored > 0:
+    if weighted_scores:
         with conn.cursor() as cur:
             _save_symbol_scores(cur, sym_id, master_summary,
                                 last_forecast, weighted_scores, macro_mult)

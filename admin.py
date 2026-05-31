@@ -348,7 +348,7 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       }}
     </script>
     <div class="panel-body" id="sym-list"
-      hx-get="/symbols" hx-trigger="load" hx-target="#sym-list" hx-swap="innerHTML"
+      hx-get="/symbols" hx-trigger="load, every 30s" hx-target="#sym-list" hx-swap="innerHTML"
       hx-include="#sym-search, #sym-filter, #sym-sort">
       <div class="empty-state"><span class="spinner"></span></div>
     </div>
@@ -497,6 +497,8 @@ async def symbol_feeds(sym_id: int):
         onclick="switchTab({sym_id},'sec')">SEC Filings</button>
       <button class="tab-btn" id="tab-debug-{sym_id}"
         onclick="switchTab({sym_id},'debug')">🔬 LLM Debug</button>
+      <button class="tab-btn" id="tab-intel-{sym_id}"
+        onclick="switchTab({sym_id},'intel')">🧠 Intelligence</button>
     </div>
     <div id="tab-content-{sym_id}" class="panel-body" style="padding-bottom:20px">
     """
@@ -577,6 +579,7 @@ async def symbol_feeds(sym_id: int):
       document.getElementById('tab-news-' + symId).classList.toggle('active', tab === 'news');
       document.getElementById('tab-sec-' + symId).classList.toggle('active', tab === 'sec');
       document.getElementById('tab-debug-' + symId).classList.toggle('active', tab === 'debug');
+      document.getElementById('tab-intel-' + symId).classList.toggle('active', tab === 'intel');
       const content = document.getElementById('tab-content-' + symId);
       if (tab === 'news') {{
         content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
@@ -587,6 +590,9 @@ async def symbol_feeds(sym_id: int):
       }} else if (tab === 'debug') {{
         content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
         htmx.ajax('GET', '/symbol/' + symId + '/debug?page=1', content);
+      }} else if (tab === 'intel') {{
+        content.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
+        htmx.ajax('GET', '/symbol/' + symId + '/intel', content);
       }} else {{
         htmx.ajax('GET', '/symbol/' + symId + '/feeds', '#feed-panel');
       }}
@@ -1323,6 +1329,201 @@ def _feed_card_html(f) -> str:
         <div id="edit-val-{fid}"></div>
       </div>
     </div>"""
+
+
+# ── Symbol Intelligence tab ───────────────────────────────────────────────────
+
+@app.get("/symbol/{sym_id}/intel", response_class=HTMLResponse)
+async def symbol_intel(sym_id: int):
+    import json as _json
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT s.id, s.symbol, s.company_name, s.industry, s.exchange,
+                       s.final_score, s.score_updated_at,
+                       s.symbol_master_summary, s.symbol_forecast_narrative,
+                       s.close_price, s.price_change, s.market_cap_formatted,
+                       s.rsi, s.sma200, s.price_52_week_high,
+                       s.average_volume_30d_calc, s.relative_volume_10d_calc,
+                       s.price_earnings_ttm, s.price_book_ratio, s.price_sales_ratio,
+                       s.gross_margin, s.operating_margin, s.net_margin,
+                       s.return_on_equity, s.debt_to_equity, s.current_ratio,
+                       s.earnings_per_share_basic_ttm, s.earnings_release_date,
+                       s.dividend_yield_recent, s.number_of_employees,
+                       s.total_revenue, s.net_income,
+                       sm.macro_multiplier, sm.rationale AS sector_rationale, sm.sector_name
+                FROM symbols s
+                LEFT JOIN sectors_macro sm ON sm.id = s.sector_id
+                WHERE s.id = %s
+            """, (sym_id,))
+            sym = cur.fetchone()
+            if not sym:
+                return HTMLResponse('<div class="empty-state">Symbol not found.</div>')
+
+            # Latest TV snapshot
+            cur.execute("""
+                SELECT data FROM symbol_daily_snapshots
+                WHERE symbol_id = %s ORDER BY snapshot_date DESC LIMIT 1
+            """, (sym_id,))
+            snap_row = cur.fetchone()
+            tv_snap = snap_row["data"] if snap_row else {}
+
+            # Scored articles for connections
+            cur.execute("""
+                SELECT company_connections FROM news_articles
+                WHERE symbol_id = %s AND sentiment_score IS NOT NULL
+                  AND company_connections IS NOT NULL
+            """, (sym_id,))
+            cc_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def fmt(v, suffix="", decimals=2, prefix=""):
+        if v is None: return "—"
+        try: return f"{prefix}{float(v):.{decimals}f}{suffix}"
+        except: return str(v)
+
+    def pct(v):
+        if v is None: return "—"
+        try: return f"{float(v)*100:.1f}%"
+        except: return str(v)
+
+    def vol_fmt(v):
+        if v is None: return "—"
+        try:
+            v = float(v)
+            if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+            if v >= 1_000: return f"{v/1_000:.0f}K"
+            return str(int(v))
+        except: return str(v)
+
+    # TradingView grid
+    earnings_date = sym["earnings_release_date"].strftime("%Y-%m-%d") if sym.get("earnings_release_date") else "—"
+    tv_rows = [
+        ("Price", fmt(sym.get("close_price"), prefix="$")),
+        ("Change", fmt(sym.get("price_change"), suffix="%")),
+        ("Market Cap", sym.get("market_cap_formatted") or "—"),
+        ("Next Earnings", earnings_date),
+        ("RSI", fmt(sym.get("rsi"))),
+        ("SMA 200", fmt(sym.get("sma200"), prefix="$")),
+        ("52W High", fmt(sym.get("price_52_week_high"), prefix="$")),
+        ("Avg Vol 30d", vol_fmt(sym.get("average_volume_30d_calc"))),
+        ("Rel Vol", fmt(sym.get("relative_volume_10d_calc"))),
+        ("P/E TTM", fmt(sym.get("price_earnings_ttm"))),
+        ("P/B", fmt(sym.get("price_book_ratio"))),
+        ("P/S", fmt(sym.get("price_sales_ratio"))),
+        ("EPS TTM", fmt(sym.get("earnings_per_share_basic_ttm"), prefix="$")),
+        ("Gross Margin", pct(sym.get("gross_margin"))),
+        ("Op Margin", pct(sym.get("operating_margin"))),
+        ("Net Margin", pct(sym.get("net_margin"))),
+        ("ROE", pct(sym.get("return_on_equity"))),
+        ("D/E", fmt(sym.get("debt_to_equity"))),
+        ("Current Ratio", fmt(sym.get("current_ratio"))),
+        ("Div Yield", pct(sym.get("dividend_yield_recent"))),
+        ("Employees", f"{sym['number_of_employees']:,}" if sym.get("number_of_employees") else "—"),
+        ("Sector Mult", fmt(sym.get("macro_multiplier"))),
+    ]
+    tv_html = "".join(
+        f'<div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:10px 12px">'
+        f'<div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:3px">{lbl}</div>'
+        f'<div style="font-size:14px;font-weight:700;color:#e2e8f0">{val}</div></div>'
+        for lbl, val in tv_rows if val != "—"
+    )
+
+    # Company connections
+    all_conn = {"competitors": set(), "partners": set(), "suppliers": set()}
+    for row in cc_rows:
+        cc = row.get("company_connections") or {}
+        if isinstance(cc, str):
+            try: cc = _json.loads(cc)
+            except: cc = {}
+        for k in ("competitors", "partners", "suppliers"):
+            for item in (cc.get(k) or []):
+                if item and str(item).strip():
+                    all_conn[k].add(str(item).strip())
+
+    def conn_tags(items, color):
+        if not items: return '<span style="color:#475569">None identified</span>'
+        return " ".join(f'<span style="background:#1e293b;color:{color};padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;display:inline-block;margin:2px">{i}</span>' for i in sorted(items))
+
+    forecast = (sym.get("symbol_forecast_narrative") or "").replace("<","&lt;")
+    master   = (sym.get("symbol_master_summary") or "").replace("<","&lt;")
+    sector_rat = (sym.get("sector_rationale") or "").replace("<","&lt;")
+    industry = sym.get("industry") or "—"
+    sector   = sym.get("sector_name") or "—"
+
+    _score_col = "#4ade80" if (sym.get("final_score") or 0) > 0.05 else "#f87171" if (sym.get("final_score") or 0) < -0.05 else "#fbbf24"
+    _base_avg  = fmt(round(sym["final_score"] / sym["macro_multiplier"], 6) if sym.get("macro_multiplier") and sym["macro_multiplier"] != 0 else sym.get("final_score"))
+    _mult_val  = fmt(sym.get("macro_multiplier"))
+    _mult_boost = fmt(round((sym["macro_multiplier"]-1)*100, 2)) if sym.get("macro_multiplier") else "0.00"
+    _final_str = f'{sym["final_score"]:+.4f}' if sym.get("final_score") is not None else "—"
+    _score_breakdown = f'''<div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;margin-bottom:16px">
+        <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:8px">📐 Score Breakdown</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+          <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Base Avg (decayed)</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#fcd34d">{_base_avg}</div>
+          </div>
+          <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Sector Mult ×</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#34d399">{_mult_val}</div>
+            <div style="font-size:10px;color:#475569">+{_mult_boost}% boost</div>
+          </div>
+          <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Final Score</div>
+            <div style="font-size:1.4rem;font-weight:800;color:{_score_col}">{_final_str}</div>
+          </div>
+        </div>
+      </div>''' if sym.get("macro_multiplier") and sym.get("final_score") is not None else ""
+
+    html = f"""
+    <div style="padding:16px">
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+        <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px">
+          <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Industry</div>
+          <div style="font-size:14px;color:#60a5fa;font-weight:700">{industry}</div>
+        </div>
+        <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px">
+          <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Sector</div>
+          <div style="font-size:14px;color:#60a5fa;font-weight:700">{sector}</div>
+        </div>
+      </div>
+
+      <!-- Score breakdown -->
+      {_score_breakdown}
+
+
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535">📊 TradingView Screener Data</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-bottom:16px">
+        {tv_html}
+      </div>
+
+      {"<div style='font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535'>🔮 Symbol Forecast</div><div style='background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap;margin-bottom:16px'>" + forecast + "</div>" if forecast else ""}
+
+      {"<div style='font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535'>📋 Master Summary</div><div style='background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap;margin-bottom:16px'>" + master + "</div>" if master else ""}
+
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535">🔗 Company Connections</div>
+      <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:14px;margin-bottom:16px">
+        <div style="margin-bottom:12px">
+          <div style="font-size:11px;font-weight:700;color:#f87171;margin-bottom:6px">⚔ Competitors</div>
+          {conn_tags(all_conn['competitors'], '#f87171')}
+        </div>
+        <div style="margin-bottom:12px">
+          <div style="font-size:11px;font-weight:700;color:#4ade80;margin-bottom:6px">🤝 Partners / Customers</div>
+          {conn_tags(all_conn['partners'], '#4ade80')}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#fbbf24;margin-bottom:6px">📦 Suppliers</div>
+          {conn_tags(all_conn['suppliers'], '#fbbf24')}
+        </div>
+      </div>
+
+      {"<div style='font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535'>🌐 Sector Macro Context</div><div style='background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:13px;color:#94a3b8;line-height:1.6;margin-bottom:16px'>" + sector_rat + "</div>" if sector_rat else ""}
+
+    </div>"""
+    return HTMLResponse(html)
 
 
 # ── Global dedup route ────────────────────────────────────────────────────────

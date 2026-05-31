@@ -58,18 +58,52 @@ ALL_TV_FIELDS = [TV_SECTOR, TV_INDUSTRY] + list(TV_METRIC_FIELDS.keys())
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _probe_valid_fields() -> list[str]:
+    """
+    Auto-detect which fields TV accepts. Start with ALL_TV_FIELDS, strip any
+    field that causes a 400 error, retry until the request succeeds or no
+    fields remain. Returns the validated field list.
+    """
+    fields = list(ALL_TV_FIELDS)
+    while fields:
+        try:
+            Query().select(*fields).limit(1).get_scanner_data()
+            logger.info(f"TV field probe OK — {len(fields)} valid fields")
+            return fields
+        except Exception as e:
+            msg = str(e)
+            # Extract the bad field name from TV error body
+            import re
+            m = re.search(r'Unknown field \\"([^\\"]+)\\"', msg)
+            if m:
+                bad = m.group(1)
+                logger.warning(f"TV field rejected: '{bad}' — removing and retrying")
+                fields = [f for f in fields if f != bad]
+            else:
+                # Unknown error format — abort probe
+                logger.error(f"TV field probe failed with unexpected error: {e}")
+                return []
+    logger.error("TV field probe: no valid fields remain")
+    return []
+
+
 def _fetch_tv_data(symbols: list[str]) -> dict[str, dict]:
     """
     Query TradingView Screener for sector, industry, and all metrics.
     ONE request — fetch all US stocks, filter locally against our symbol set.
+    Auto-probes valid fields before fetching so bad field names never block the run.
     Returns {ticker: {field: value, ...}}.
     """
     want = set(symbols)
     result = {}
     try:
+        valid_fields = _probe_valid_fields()
+        if not valid_fields:
+            logger.error("No valid TV fields found — skipping TV fetch")
+            return result
         _, df = (
             Query()
-            .select(*ALL_TV_FIELDS)
+            .select(*valid_fields)
             .limit(25000)
             .get_scanner_data()
         )
@@ -78,7 +112,7 @@ def _fetch_tv_data(symbols: list[str]) -> dict[str, dict]:
             if ":" in ticker:
                 ticker = ticker.split(":", 1)[1]
             if ticker and ticker in want:
-                result[ticker] = {col: row.get(col) for col in ALL_TV_FIELDS}
+                result[ticker] = {col: row.get(col) for col in valid_fields}
     except Exception as e:
         logger.error(f"TradingView fetch failed: {e}")
 
@@ -137,10 +171,22 @@ def _safe_date(v):
         return None
 
 
+def _sanitize_for_json(obj):
+    """Recursively replace float NaN/Inf with None so PostgreSQL JSONB accepts it."""
+    import math
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _upsert_daily_snapshot(cur, symbol_id: int, snap_date: date, data: dict):
     """Save/update daily TV snapshot (one row per symbol per day)."""
-    # Clean: only store non-None values
-    clean = {k: v for k, v in data.items() if v is not None}
+    # Clean: only store non-None values, sanitize NaN/Inf
+    clean = _sanitize_for_json({k: v for k, v in data.items() if v is not None})
     cur.execute("""
         INSERT INTO symbol_daily_snapshots (symbol_id, snapshot_date, data)
         VALUES (%s, %s, %s::jsonb)
@@ -174,6 +220,20 @@ def run(exchange: str | None = None, limit: int = 0) -> dict:
     conn       = get_connection()
 
     with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_daily_snapshots (
+                id            SERIAL PRIMARY KEY,
+                symbol_id     INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                snapshot_date DATE    NOT NULL,
+                data          JSONB   NOT NULL DEFAULT '{}',
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (symbol_id, snapshot_date)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sds_symbol_date
+            ON symbol_daily_snapshots (symbol_id, snapshot_date DESC)
+        """)
         cur.execute("""
             INSERT INTO pipeline_runs (step, exchange, started_at, status)
             VALUES ('sector_map', %s, NOW(), 'running') RETURNING id

@@ -53,8 +53,8 @@ _LLM_PROFILES = {
     "ollama": {
         "base_url":          os.getenv("LLM_BASE_URL",   "http://10.11.12.8:11434/v1"),
         "api_key":           os.getenv("LLM_API_KEY",    "ollama"),
-        "model":             os.getenv("LLM_MODEL",      "gemma4:e4b"),
-        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "gemma4:e2b"),
+        "model":             os.getenv("LLM_MODEL",      "gemma4:e4b-ctx16k"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "gemma4:e2b-ctx16k"),
         "temperature":       0.1,
         "context_size":      16384,
         "max_tokens":        12228,

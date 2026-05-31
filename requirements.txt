@@ -27,3 +27,4 @@ tradingview-screener
 
 # Testing
 pytest
+json_repair
