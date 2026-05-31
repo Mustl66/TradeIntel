@@ -612,6 +612,18 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     import random
     random.shuffle(rows)
+    # Pull priority queue and move those symbols to the front (preserving their rank order)
+    try:
+        with conn.cursor() as pq_cur:
+            pq_cur.execute("SELECT symbol_id FROM priority_queue ORDER BY rank ASC")
+            priority_ids = [r[0] for r in pq_cur.fetchall()]
+        if priority_ids:
+            prio_map = {sid: i for i, sid in enumerate(priority_ids)}
+            priority_rows = sorted([r for r in rows if r["id"] in prio_map], key=lambda r: prio_map[r["id"]])
+            normal_rows   = [r for r in rows if r["id"] not in prio_map]
+            rows = priority_rows + normal_rows
+    except Exception:
+        pass  # priority_queue table may not exist yet on older installs
     return rows
 
 

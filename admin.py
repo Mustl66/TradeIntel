@@ -46,6 +46,22 @@ def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
 
+def _ensure_priority_queue_table():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS priority_queue (
+                    symbol_id INT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+                    rank      INT NOT NULL,
+                    added_at  TIMESTAMP DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── HTML shell ────────────────────────────────────────────────────────────────
 
 def page(body: str, title: str = "TradeIntel Admin") -> str:
@@ -236,6 +252,19 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
     background: none; color: #475569; cursor: pointer;
   }}
   .sort-btn.active {{ color: #60a5fa; border-color: #3b82f6; background: #1e3a5f; }}
+  .prio-btn {{
+    font-size: 0.75rem; padding: 2px 6px; border-radius: 99px;
+    background: none; border: 1px solid transparent;
+    color: #475569; cursor: pointer; transition: all .15s; line-height: 1.4;
+  }}
+  .prio-btn:hover {{ color: #fbbf24; border-color: #fbbf24; }}
+  .prio-btn.prio-active {{ color: #fbbf24; border-color: #b45309; background: #451a0333; }}
+  .prio-rank {{
+    font-size: 0.65rem; font-weight: 800; color: #fbbf24;
+    background: #451a0344; border: 1px solid #b4530966;
+    padding: 1px 5px; border-radius: 99px;
+    display: inline-block; min-width: 18px; text-align: center;
+  }}
 </style>
 </head>
 <body>
@@ -249,6 +278,13 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       hx-swap="innerHTML"
       style="background:#1e293b;border:1px solid #6366f1;color:#a5b4fc;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
       📊 Market Research
+    </button>
+    <button
+      hx-get="/priority-panel"
+      hx-target="#feed-panel"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #fbbf24;color:#fcd34d;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+      ⭐ Priority Queue
     </button>
     <button
       hx-get="/market-scores"
@@ -323,6 +359,7 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       <button class="filter-btn warn"   onclick="setFilter(this,'low')"  title="1-4 articles — might be broken">Low &lt;5</button>
       <button class="filter-btn"        onclick="setFilter(this,'ok')"   title="5+ articles">OK</button>
       <button class="filter-btn"        onclick="setFilter(this,'nofeed')" title="No feed URL at all">No feed</button>
+      <button class="filter-btn"        onclick="setFilter(this,'priority')" title="Priority queue only">⭐ Priority</button>
     </div>
     <!-- sort bar -->
     <div class="sort-bar">
@@ -397,6 +434,8 @@ async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
                 having_clause = "HAVING COUNT(na.id) >= 5"
             elif filter == "nofeed":
                 having_clause = "HAVING COUNT(f.id) = 0"
+            elif filter == "priority":
+                having_clause = "HAVING COUNT(pq.symbol_id) > 0"
 
             # sort
             order = {
@@ -409,10 +448,12 @@ async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
                 SELECT s.id, s.symbol, s.company_name,
                        COUNT(DISTINCT f.id) FILTER (WHERE f.is_active) AS active_feeds,
                        COUNT(DISTINCT f.id) AS total_feeds,
-                       COUNT(DISTINCT na.id) AS article_count
+                       COUNT(DISTINCT na.id) AS article_count,
+                       MAX(pq.rank) AS prio_rank
                 FROM symbols s
                 LEFT JOIN rss_feeds f   ON f.symbol_id  = s.id
                 LEFT JOIN news_articles na ON na.symbol_id = s.id
+                LEFT JOIN priority_queue pq ON pq.symbol_id = s.id
                 {where_sql}
                 GROUP BY s.id
                 {having_clause}
@@ -437,6 +478,10 @@ async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
         else:
             art_cls = "art-count art-ok"
         art_label = str(art) if art < 1000 else f"{art//1000}k"
+        prio_rank = r.get('prio_rank')
+        prio_badge = f'<span class="prio-rank" title="Priority #{prio_rank}">#{prio_rank}</span>' if prio_rank else ''
+        prio_btn_cls = "prio-btn prio-active" if prio_rank else "prio-btn"
+        prio_title = "Remove from priority queue" if prio_rank else "Add to priority queue"
         html += f"""
         <div class="sym-row"
           hx-get="/symbol/{r['id']}/feeds"
@@ -445,12 +490,21 @@ async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
           onclick="document.querySelectorAll('.sym-row').forEach(e=>e.classList.remove('active'));this.classList.add('active')"
         >
           <div>
-            <div class="sym-ticker">{r['symbol']}</div>
+            <div class="sym-ticker">{r['symbol']} {prio_badge}</div>
             <div class="sym-name">{r['company_name'] or '—'}</div>
           </div>
           <div style="display:flex;gap:5px;align-items:center;">
             <span class="{art_cls}" title="{art} articles">{art_label}</span>
             <span class="feed-count">{feeds_label}</span>
+            <button
+              class="{prio_btn_cls}"
+              title="{prio_title}"
+              hx-post="/priority/toggle/{r['id']}"
+              hx-target="#sym-list"
+              hx-swap="innerHTML"
+              hx-include="#sym-search, #sym-filter, #sym-sort"
+              onclick="event.stopPropagation()"
+            >⭐</button>
             <button
               class="fetch-btn"
               title="Fetch news for {r['symbol']}"
@@ -2150,9 +2204,125 @@ def sentiment_leaderboard(sort: str = "final_score", dir: str = "desc", limit: i
 
 
 
+# ── Priority Queue routes ─────────────────────────────────────────────────────
+
+@app.post("/priority/toggle/{sym_id}", response_class=HTMLResponse)
+async def priority_toggle(sym_id: int, q: str = "", filter: str = "all", sort: str = "alpha"):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT symbol_id FROM priority_queue WHERE symbol_id = %s", (sym_id,))
+            exists = cur.fetchone()
+            if exists:
+                cur.execute("DELETE FROM priority_queue WHERE symbol_id = %s", (sym_id,))
+                # Compact ranks after removal
+                cur.execute("""
+                    WITH ranked AS (
+                        SELECT symbol_id, ROW_NUMBER() OVER (ORDER BY rank, added_at) AS new_rank
+                        FROM priority_queue
+                    )
+                    UPDATE priority_queue pq SET rank = ranked.new_rank
+                    FROM ranked WHERE pq.symbol_id = ranked.symbol_id
+                """)
+            else:
+                cur.execute("SELECT COALESCE(MAX(rank), 0) + 1 AS next_rank FROM priority_queue")
+                next_rank = cur.fetchone()["next_rank"]
+                cur.execute(
+                    "INSERT INTO priority_queue (symbol_id, rank) VALUES (%s, %s) ON CONFLICT (symbol_id) DO NOTHING",
+                    (sym_id, next_rank)
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    # Re-render the symbol list with current filters
+    from fastapi import Request
+    from fastapi.responses import RedirectResponse
+    # Delegate to the symbols endpoint
+    return await symbols(q=q, filter=filter, sort=sort)
+
+
+@app.get("/priority-panel", response_class=HTMLResponse)
+async def priority_panel():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT pq.rank, pq.symbol_id, s.symbol, s.company_name,
+                       COUNT(na.id) FILTER (WHERE na.sentiment_score IS NULL) AS unscored,
+                       COUNT(na.id) AS total_articles
+                FROM priority_queue pq
+                JOIN symbols s ON s.id = pq.symbol_id
+                LEFT JOIN news_articles na ON na.symbol_id = pq.symbol_id
+                GROUP BY pq.rank, pq.symbol_id, s.symbol, s.company_name
+                ORDER BY pq.rank ASC
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        queue_html = '<div style="color:#475569;font-size:13px;padding:20px;text-align:center">No symbols in priority queue.<br>Click ⭐ next to any symbol in the list to add it.</div>'
+    else:
+        queue_html = ""
+        for r in rows:
+            queue_html += f"""
+            <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid #1e2535">
+              <span class="prio-rank">#{r['rank']}</span>
+              <div style="flex:1">
+                <span style="font-weight:700;color:#60a5fa;font-size:14px">{r['symbol']}</span>
+                <span style="color:#64748b;font-size:12px;margin-left:8px">{r['company_name'] or ''}</span>
+              </div>
+              <span style="font-size:11px;color:#475569">{r['unscored']} unscored / {r['total_articles']} total</span>
+              <button
+                class="btn btn-danger"
+                style="font-size:11px;padding:3px 9px"
+                hx-post="/priority/toggle/{r['symbol_id']}"
+                hx-target="#feed-panel"
+                hx-swap="innerHTML"
+                hx-vals='{{"filter":"priority"}}'
+              >Remove</button>
+            </div>"""
+
+    return HTMLResponse(f"""
+    <div style="padding:20px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
+        <h2 style="margin:0;color:#fcd34d;font-size:18px">⭐ Priority Queue</h2>
+        <span style="background:#451a0344;color:#fbbf24;border:1px solid #b4530966;padding:3px 10px;border-radius:12px;font-size:12px">{len(rows)} symbols</span>
+        <button
+          hx-post="/priority/clear"
+          hx-target="#feed-panel"
+          hx-swap="innerHTML"
+          hx-confirm="Reset entire priority queue?"
+          class="btn btn-danger"
+          style="margin-left:auto;font-size:12px"
+        >🗑 Reset All Priority</button>
+      </div>
+      <div style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow:hidden">
+        <div style="padding:10px 16px;background:#1a2133;border-bottom:1px solid #1e2535;font-size:11px;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">
+          These symbols will be scored first on the next (and current) sentiment scoring run, in rank order.
+        </div>
+        {queue_html}
+      </div>
+    </div>
+    """)
+
+
+@app.post("/priority/clear", response_class=HTMLResponse)
+async def priority_clear():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM priority_queue")
+        conn.commit()
+    finally:
+        conn.close()
+    return await priority_panel()
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _ensure_priority_queue_table()
     port = 8055
     def _open():
         time.sleep(1.2)
