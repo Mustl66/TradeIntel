@@ -273,7 +273,11 @@ def _build_stage2_prompt(
             "master_summary":    master_summary or "",
             "last_article_score": last_score,
         },
-        "available_sectors": available_sectors or [],
+        # Send only "sector_name | industry_name" strings — saves ~8KB per call
+        "available_sectors": [
+            f"{s['sector_name']} | {s['industry_name']}"
+            for s in (available_sectors or [])
+        ],
     }
     return _json_dumps(payload)
 
