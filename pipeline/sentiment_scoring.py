@@ -53,6 +53,9 @@ from pipeline_config import (  # noqa — patched below
     SUMMARY_LLM_MODEL,
     SENTIMENT_LAMBDA,
     DECAY_GRACE_MONTHS,
+    STAGE1_PARALLEL_WORKERS,
+    STAGE2_PARALLEL_WORKERS,
+    SKIP_WORKER_COUNT_DETECTION,
 )
 
 # ── JSON helper — handles Decimal / NaN from psycopg2 ─────────────────────────
@@ -663,7 +666,7 @@ def _save_article_result(cur, article_id: int, result: dict,
                          published_at: datetime, stage2_prompt: str = ""):
     score = float(result.get("sentiment_score", 0.0))
     outlook_bonus = float(result.get("outlook_bonus", 0.0))
-    outlook_bonus = max(0.0, min(0.05, outlook_bonus))  # clamp bonus 0..0.15
+    outlook_bonus = max(0.0, min(0.15, outlook_bonus))  # clamp bonus 0..0.15
     score = max(-1.0, min(1.0, score + outlook_bonus))  # add bonus then clamp
     weighted = _time_decay(score, published_at)
 
@@ -847,7 +850,7 @@ def _process_symbol(
 
         raw_score = float(result.get("sentiment_score", 0.0))
         _ob = float(result.get("outlook_bonus", 0.0))
-        _ob = max(0.0, min(0.05, _ob))
+        _ob = max(0.0, min(0.15, _ob))
         raw_score = max(-1.0, min(1.0, raw_score + _ob))
 
         weighted  = _time_decay(raw_score, published_at)
@@ -910,7 +913,14 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
                 f"(pre_summarization={'ON' if ENABLE_PRE_SUMMARIZATION else 'OFF'})")
 
     # ── VRAM-based worker sizing ───────────────────────────────────────────────
-    n_workers, single_model_mode = _compute_worker_count()
+    if SKIP_WORKER_COUNT_DETECTION:
+        n_workers       = max(STAGE1_PARALLEL_WORKERS, STAGE2_PARALLEL_WORKERS)
+        single_model_mode = False
+        print(f"\n[worker sizing] SKIP_WORKER_COUNT_DETECTION=True — "
+              f"using config workers={n_workers}, single_model_mode=False\n")
+        logger.info(f"[vram] detection skipped — workers={n_workers} (from pipeline_config)")
+    else:
+        n_workers, single_model_mode = _compute_worker_count()
 
     # Warmup models before spawning threads
     main_client    = _get_main_client()
