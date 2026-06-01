@@ -54,7 +54,7 @@ from config import LLM_CONFIG
 
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
 MAX_EVAL_ARTICLES        = 30      # rolling window per symbol (newest N articles)
-ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
+ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
 SENTIMENT_LAMBDA         = 0.001   # time-decay lambda (per hour) — applied only AFTER grace period
 DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this many months
@@ -70,7 +70,7 @@ STAGE1_PARALLEL_WORKERS  = 1       # e.g. 3 to test parallel Stage 1
 # parallelised ACROSS symbols. Each worker takes a different symbol.
 # Set >1 only if LM Studio handles concurrent main-model requests.
 # Set to 1 to disable (recommended until tested).
-STAGE2_PARALLEL_WORKERS  = 2       # e.g. 2 to test parallel Stage 2 across symbols
+STAGE2_PARALLEL_WORKERS  = 1       # e.g. 2 to test parallel Stage 2 across symbols
 
 # ── Worker count detection bypass ─────────────────────────────────────────────
 # When True: skip _compute_worker_count() VRAM probe entirely.

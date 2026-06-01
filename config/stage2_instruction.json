@@ -80,10 +80,11 @@
     "1. Assess the article using the scoring rubric. Identify the primary signal category and apply adjustment factors.",
     "2. Write article_summary: exactly ONE sentence, analyst-grade, states what happened and why it matters. No fluff.",
     "3. Extract key_events: populate only fields that have explicit data. Null for anything not mentioned.",
-    "4. Update master_summary: dense rolling narrative of ALL significant events for this symbol across all articles seen so far. Max 600 words. Preserve prior material facts. Add new material facts from this article. Remove outdated minor details if space needed.",
+    "4. Update master_summary: dense rolling narrative of ALL significant events for this symbol across all articles seen so far. Max 600 words. Preserve prior material facts. Add new material facts from this article. Remove outdated minor details if space needed. IMPORTANT: at the END of updated_master_summary, append a 'Sector Analysis:' line that extracts the 1-3 primary industry themes present in the accumulated news (e.g. 'Sector Analysis: AI Optical Interconnects, Photonic Integration, Hyperscale Data Center Supply Chain').",
     "5. Write forecast_until_earnings: forward outlook based on accumulated evidence. Include: expected price direction, key risks, key catalysts, and confidence level (low/medium/high). Reference earnings_release_date if known.",
     "6. Write score_rationale: 2-3 sentences. Name the specific signals that drove the score. Reference the rubric category used. State which adjustment factors were applied.",
-    "7. Extract company_connections: identify competitors, partners/customers, and suppliers mentioned in the article or implied by context. Use ticker symbols where known, otherwise company names."
+    "7. Extract company_connections: identify competitors, partners/customers, and suppliers mentioned in the article or implied by context. Use ticker symbols where known, otherwise company names.",
+    "8. Assign ai_sector_pick: from the 'available_sectors' list injected in the input payload, select the SINGLE best matching entry (format 'sector_name | industry_name') based on the company's business and this article's content. If no entry matches well, pick the closest one available. Never invent a sector not in the list."
   ],
 
   "output_schema": {
@@ -100,7 +101,8 @@
     "updated_master_summary": "A cohesive, chronological, and dense corporate history narrative (Max 600 words). You MUST merge the new article facts into the existing 'master_summary' input text. Do not drop historical milestones or numbers from the past state. Clean up overlapping old news but ensure the core timeline remains unbroken.",
     "forecast_until_earnings": "An actionable, forward-looking operational outlook (Max 200 words). Must explicitly state a directional bias (Bullish | Bearish | Neutral), key operational catalysts to watch, near-term risks, and an analyst confidence level (Low | Medium | High).",
     "outlook_bonus": 0.00,
-    "outlook_bonus_rationale": "1-2 sentences. State exactly which forward-looking statements qualified for the bonus and cite the specific evidence (numbers, contracts, dates) found in the article. If bonus is 0.00, state why (e.g., 'No substantiated forward claims found' or 'Article is negative')."
+    "outlook_bonus_rationale": "1-2 sentences. State exactly which forward-looking statements qualified for the bonus and cite the specific evidence (numbers, contracts, dates) found in the article. If bonus is 0.00, state why (e.g., 'No substantiated forward claims found' or 'Article is negative').",
+    "ai_sector_pick": "sector_name | industry_name — pick the single best match from the 'available_sectors' list provided in the input."
   },
   "rules": [
     "Return ONLY a clean JSON object. Zero markdown formatting, zero explanatory text outside the JSON structure.",
@@ -112,6 +114,7 @@
     "If article is clearly promotional IR fluff with zero material content, assign 0.00.",
     "forecast_until_earnings must be actionable — include a directional bias (bullish/bearish/neutral) and confidence level.",
     "company_connections arrays must contain only string values. Use empty arrays [] if no connections found. Never null.",
-    "outlook_bonus must be a pure floating-point number between 0.00 and 0.05. It is ADDED to sentiment_score by the post-processing engine — do not add it yourself to sentiment_score. Award it ONLY for substantiated forward-looking claims with concrete evidence in the article. Vague optimism = 0.00."
+    "outlook_bonus must be a pure floating-point number between 0.00 and 0.05. It is ADDED to sentiment_score by the post-processing engine — do not add it yourself to sentiment_score. Award it ONLY for substantiated forward-looking claims with concrete evidence in the article. Vague optimism = 0.00.",
+    "ai_sector_pick must be a string in 'sector_name | industry_name' format, chosen ONLY from the 'available_sectors' array in the input. Never invent a new sector. Never return null — always pick the closest available entry."
   ]
 }

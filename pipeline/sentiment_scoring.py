@@ -217,10 +217,10 @@ def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optio
             max_tokens=4096,          # was 2048 — too small, caused truncated JSON
             messages=[
                 {"role": "system", "content": _STAGE1_SYSTEM},
-                {"role": "user",   "content": f"Extract facts from this article:\n\n{text[:6000]}"},
+                {"role": "user",   "content": f"Extract facts from this article:\n\n{text}"},
             ],
         )
-        if LLM_TYPE == "ollama":
+        if LLM_TYPE in ("ollama", "local"):
             kwargs1["extra_body"] = {
                 "num_ctx": LLM_CONFIG.get("context_size", 16384),
                 "top_k":   LLM_CONFIG.get("top_k", 40),
@@ -252,6 +252,7 @@ def _build_stage2_prompt(
     master_summary: str,
     last_score: float,
     stage1_result: Optional[dict],
+    available_sectors: list[dict] = None,
 ) -> str:
     # Article text: use Stage 1 output if available, else raw text
     if stage1_result:
@@ -272,6 +273,7 @@ def _build_stage2_prompt(
             "master_summary":    master_summary or "",
             "last_article_score": last_score,
         },
+        "available_sectors": available_sectors or [],
     }
     return _json_dumps(payload)
 
@@ -290,7 +292,7 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
             {"role": "user",   "content": prompt},
         ],
     }
-    if LLM_TYPE == "ollama":
+    if LLM_TYPE in ("ollama", "local"):
         kwargs["extra_body"] = {
             "num_ctx": LLM_CONFIG.get("context_size", 16384),
             "top_k":   LLM_CONFIG.get("top_k", 40),
@@ -599,7 +601,8 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
                 s.relative_volume_10d_calc, s.average_volume_30d_calc,
                 s.earnings_release_date, s.dividend_yield_recent,
                 s.number_of_employees,
-                s.symbol_master_summary
+                s.symbol_master_summary,
+                s.ai_sector_pick
             FROM symbols s
             WHERE s.exchange = %s
               AND s.status = TRUE
@@ -661,6 +664,50 @@ def _get_macro_multiplier(conn, industry: str) -> float:
     return float(row[0]) if row else 1.000
 
 
+def _load_all_sectors(conn) -> list[dict]:
+    """Load all sectors_macro rows for AI sector picking. Returns list of dicts."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT sector_name, industry_name, macro_multiplier
+            FROM sectors_macro
+            ORDER BY sector_name, industry_name
+        """)
+        rows = cur.fetchall()
+    return [{"sector_name": r[0], "industry_name": r[1], "macro_multiplier": float(r[2])} for r in rows]
+
+
+def _resolve_ai_sector_multiplier(conn, ai_sector_pick: str) -> float:
+    """
+    Given 'sector_name | industry_name' string from LLM, find the matching
+    macro_multiplier. Falls back to 1.000 if not found.
+    """
+    if not ai_sector_pick:
+        return 1.000
+    parts = [p.strip() for p in ai_sector_pick.split("|")]
+    sector = parts[0] if len(parts) > 0 else ""
+    industry = parts[1] if len(parts) > 1 else ""
+    with conn.cursor() as cur:
+        # Try exact match on both
+        cur.execute("""
+            SELECT macro_multiplier FROM sectors_macro
+            WHERE sector_name ILIKE %s AND industry_name ILIKE %s
+            LIMIT 1
+        """, (sector, industry))
+        row = cur.fetchone()
+        if row:
+            return float(row[0])
+        # Fallback: match sector_name only, take MAX
+        if sector:
+            cur.execute("""
+                SELECT COALESCE(MAX(macro_multiplier), 1.000) FROM sectors_macro
+                WHERE sector_name ILIKE %s
+            """, (f"%{sector}%",))
+            row = cur.fetchone()
+            if row:
+                return float(row[0])
+    return 1.000
+
+
 def _save_article_result(cur, article_id: int, result: dict,
                          master_snapshot: str, pre_summary: Optional[dict],
                          published_at: datetime, stage2_prompt: str = ""):
@@ -710,21 +757,27 @@ def _save_article_result(cur, article_id: int, result: dict,
 
 def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
                         forecast: str, weighted_scores: list[float],
-                        macro_multiplier: float):
+                        macro_multiplier: float, ai_sector_pick: str = "",
+                        ai_sector_multiplier: float = 1.000):
     if not weighted_scores:
         return
     avg_weighted = sum(weighted_scores) / len(weighted_scores)
-    final_score  = round(avg_weighted * macro_multiplier, 6)
+    final_score  = round(avg_weighted * macro_multiplier * ai_sector_multiplier, 6)
     cur.execute("""
         UPDATE symbols SET
             symbol_master_summary      = %s,
             symbol_forecast_narrative  = %s,
             final_score                = %s,
+            ai_sector_pick             = %s,
+            ai_sector_multiplier       = %s,
             score_updated_at           = NOW()
         WHERE id = %s
     """, (master_summary[:4000] if master_summary else None,
           forecast[:2000] if forecast else None,
-          final_score, symbol_id))
+          final_score,
+          ai_sector_pick or None,
+          ai_sector_multiplier,
+          symbol_id))
 
 
 # ── Per-symbol processor ──────────────────────────────────────────────────────
@@ -769,12 +822,14 @@ def _process_symbol(
     if not articles:
         return {"symbol": symbol, "scored": 0, "skipped": 0}
 
-    macro_mult     = _get_macro_multiplier(conn, industry)
-    master_summary = sym.get("symbol_master_summary") or ""
-    last_score     = 0.0
-    weighted_scores = []
-    last_forecast  = ""
-    scored = 0
+    macro_mult          = _get_macro_multiplier(conn, industry)
+    all_sectors         = _load_all_sectors(conn)
+    master_summary      = sym.get("symbol_master_summary") or ""
+    last_score          = 0.0
+    weighted_scores     = []
+    last_forecast       = ""
+    last_ai_sector_pick = sym.get("ai_sector_pick") or ""
+    scored  = 0
     skipped = 0
 
     # Fallback TV snapshot from symbols row (used when no daily snapshot exists)
@@ -830,7 +885,8 @@ def _process_symbol(
         # Stage 2: stateful scoring
         prompt = _build_stage2_prompt(
             symbol, tv_snapshot, article,
-            master_summary, last_score, stage1_result
+            master_summary, last_score, stage1_result,
+            available_sectors=all_sectors,
         )
         _t0 = time.time()
         result = _call_stage2(main_client, prompt)
@@ -861,9 +917,10 @@ def _process_symbol(
                                  master_summary, stage1_result, published_at,
                                  stage2_prompt=prompt)
         conn.commit()
-        master_summary = result.get("updated_master_summary") or master_summary
-        last_forecast  = result.get("forecast_until_earnings") or last_forecast
-        last_score     = raw_score
+        master_summary      = result.get("updated_master_summary") or master_summary
+        last_forecast       = result.get("forecast_until_earnings") or last_forecast
+        last_score          = raw_score
+        last_ai_sector_pick = result.get("ai_sector_pick") or last_ai_sector_pick
         weighted_scores.append(weighted)
         scored += 1
 
@@ -877,14 +934,20 @@ def _process_symbol(
 
     # Save symbol-level scores
     if weighted_scores:
+        ai_sector_mult = _resolve_ai_sector_multiplier(conn, last_ai_sector_pick)
         with conn.cursor() as cur:
             _save_symbol_scores(cur, sym_id, master_summary,
-                                last_forecast, weighted_scores, macro_mult)
+                                last_forecast, weighted_scores, macro_mult,
+                                ai_sector_pick=last_ai_sector_pick,
+                                ai_sector_multiplier=ai_sector_mult)
         conn.commit()
-
-    logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
-                f"macro_mult={macro_mult:.3f} final_score="
-                f"{round(sum(weighted_scores)/len(weighted_scores)*macro_mult, 4) if weighted_scores else 'N/A'}")
+        avg_w = sum(weighted_scores) / len(weighted_scores)
+        logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
+                    f"macro_mult={macro_mult:.3f} ai_sector='{last_ai_sector_pick}' "
+                    f"ai_sector_mult={ai_sector_mult:.3f} final_score="
+                    f"{round(avg_w * macro_mult * ai_sector_mult, 4)}")
+    else:
+        logger.info(f"[{symbol}] scored={scored} skipped={skipped} — no weighted scores")
     return {"symbol": symbol, "scored": scored, "skipped": skipped,
             "macro_multiplier": macro_mult}
 

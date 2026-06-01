@@ -1280,7 +1280,7 @@ async def symbol_debug(sym_id: int, page: int = 1, art_id: int = 0):
 
                   <div style="margin-bottom:12px">
                     <div style="font-size:0.72rem;color:#475569;font-weight:700;margin-bottom:4px">RAW ARTICLE TEXT (full_text)</div>
-                    <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;max-height:300px;overflow-y:auto">{esc((art['full_text'] or 'No full text scraped — title-only article')[:5000])}</div>
+                    <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;max-height:300px;overflow-y:auto">{esc((art['full_text'] or 'No full text scraped — title-only article'))}</div>
                   </div>
                 </div>
                 """
@@ -1406,7 +1406,8 @@ async def symbol_intel(sym_id: int):
                        s.earnings_per_share_basic_ttm, s.earnings_release_date,
                        s.dividend_yield_recent, s.number_of_employees,
                        s.total_revenue, s.net_income,
-                       sm.macro_multiplier, sm.rationale AS sector_rationale, sm.sector_name
+                       sm.macro_multiplier, sm.rationale AS sector_rationale, sm.sector_name,
+                       s.ai_sector_pick, s.ai_sector_multiplier
                 FROM symbols s
                 LEFT JOIN sectors_macro sm ON sm.id = s.sector_id
                 WHERE s.id = %s
@@ -1506,15 +1507,19 @@ async def symbol_intel(sym_id: int):
     sector_rat = (sym.get("sector_rationale") or "").replace("<","&lt;")
     industry = sym.get("industry") or "—"
     sector   = sym.get("sector_name") or "—"
+    ai_sector_pick = sym.get("ai_sector_pick") or "—"
+    ai_sector_mult = float(sym.get("ai_sector_multiplier") or 1.0)
+    ai_sector_boost = fmt(round((ai_sector_mult - 1) * 100, 2))
 
     _score_col = "#4ade80" if (sym.get("final_score") or 0) > 0.05 else "#f87171" if (sym.get("final_score") or 0) < -0.05 else "#fbbf24"
-    _base_avg  = fmt(round(sym["final_score"] / sym["macro_multiplier"], 6) if sym.get("macro_multiplier") and sym["macro_multiplier"] != 0 else sym.get("final_score"))
+    _macro_mult = float(sym.get("macro_multiplier") or 1.0)
+    _base_avg  = fmt(round(sym["final_score"] / (_macro_mult * ai_sector_mult), 6) if sym.get("final_score") is not None and _macro_mult != 0 and ai_sector_mult != 0 else sym.get("final_score"))
     _mult_val  = fmt(sym.get("macro_multiplier"))
-    _mult_boost = fmt(round((sym["macro_multiplier"]-1)*100, 2)) if sym.get("macro_multiplier") else "0.00"
+    _mult_boost = fmt(round((_macro_mult-1)*100, 2)) if sym.get("macro_multiplier") else "0.00"
     _final_str = f'{sym["final_score"]:+.4f}' if sym.get("final_score") is not None else "—"
     _score_breakdown = f'''<div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;margin-bottom:16px">
         <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:8px">📐 Score Breakdown</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
           <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
             <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Base Avg (decayed)</div>
             <div style="font-size:1.4rem;font-weight:800;color:#fcd34d">{_base_avg}</div>
@@ -1523,6 +1528,12 @@ async def symbol_intel(sym_id: int):
             <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Sector Mult ×</div>
             <div style="font-size:1.4rem;font-weight:800;color:#34d399">{_mult_val}</div>
             <div style="font-size:10px;color:#475569">+{_mult_boost}% boost</div>
+          </div>
+          <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">AI Sector Mult ×</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#a78bfa">{fmt(ai_sector_mult)}</div>
+            <div style="font-size:10px;color:#475569">+{ai_sector_boost}% boost</div>
+            <div style="font-size:10px;color:#64748b;margin-top:4px">{ai_sector_pick}</div>
           </div>
           <div style="background:#161b27;border:1px solid #1e2535;border-radius:6px;padding:10px;text-align:center">
             <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Final Score</div>
@@ -1542,6 +1553,10 @@ async def symbol_intel(sym_id: int):
         <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px">
           <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">Sector</div>
           <div style="font-size:14px;color:#60a5fa;font-weight:700">{sector}</div>
+        </div>
+        <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px">
+          <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;margin-bottom:4px">🤖 AI Sector Pick</div>
+          <div style="font-size:13px;color:#a78bfa;font-weight:700">{ai_sector_pick}</div>
         </div>
       </div>
 
