@@ -53,8 +53,8 @@ STAGE_ORDER = ["rss", "html", "edgar", "sector_map", "market_research", "macro_m
 from config import LLM_CONFIG
 
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
-MAX_EVAL_ARTICLES        = 30      # rolling window per symbol (newest N articles)
-ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
+MAX_EVAL_ARTICLES        = 12      # rolling window per symbol (newest N articles)
+ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
 SENTIMENT_LAMBDA         = 0.001   # time-decay lambda (per hour) — applied only AFTER grace period
 DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this many months

@@ -254,7 +254,7 @@ def _build_stage2_prompt(
     if stage1_result:
         text_block = _json_dumps(stage1_result)
     else:
-        raw = (article.get("full_text") or article.get("summary") or "")[:3000]
+        raw = (article.get("full_text") or article.get("summary") or "")
         text_block = raw
 
     payload = {
@@ -662,7 +662,9 @@ def _save_article_result(cur, article_id: int, result: dict,
                          master_snapshot: str, pre_summary: Optional[dict],
                          published_at: datetime, stage2_prompt: str = ""):
     score = float(result.get("sentiment_score", 0.0))
-    score = max(-1.0, min(1.0, score))
+    outlook_bonus = float(result.get("outlook_bonus", 0.0))
+    outlook_bonus = max(0.0, min(0.05, outlook_bonus))  # clamp bonus 0..0.15
+    score = max(-1.0, min(1.0, score + outlook_bonus))  # add bonus then clamp
     weighted = _time_decay(score, published_at)
 
     def _to_str(v, limit):
@@ -844,7 +846,9 @@ def _process_symbol(
             }
 
         raw_score = float(result.get("sentiment_score", 0.0))
-        raw_score = max(-1.0, min(1.0, raw_score))
+        _ob = float(result.get("outlook_bonus", 0.0))
+        _ob = max(0.0, min(0.05, _ob))
+        raw_score = max(-1.0, min(1.0, raw_score + _ob))
 
         weighted  = _time_decay(raw_score, published_at)
 
@@ -862,7 +866,7 @@ def _process_symbol(
 
         title_short = (article.get("title") or "")[:60]
         logger.info(
-            f"[{symbol}] article={art_id} score={raw_score:+.2f} "
+            f"[{symbol}] article={art_id} score={raw_score:+.2f} bonus={_ob:+.2f} "
             f"s1={t_s1}s s2={t_s2}s | {title_short}"
         )
 
