@@ -96,7 +96,7 @@
     "5. Write forecast_until_earnings: forward outlook based on accumulated evidence. Include: expected price direction, key risks, key catalysts, and confidence level (low/medium/high). Reference earnings_release_date if known.",
     "6. Write score_rationale: 2-3 sentences. Name the specific signals that drove the score. Reference the rubric category used. State which adjustment factors were applied.",
     "7. Extract company_connections: identify competitors, partners/customers, and suppliers mentioned in the article or implied by context. Use ticker symbols where known, otherwise company names.",
-    "8. Assign ai_sector_pick: from the 'available_sectors' list injected in the input payload, select the SINGLE best matching entry (format 'sector_name | industry_name') based on the company's business and this article's content. If no entry matches well, pick the closest one available. Never invent a sector not in the list."
+    "8. Focus on the current article only for sentiment scoring. Do not attempt sector assignment — that is handled separately."
   ],
   "output_schema": {
     "sentiment_score": 0.0,
@@ -113,7 +113,6 @@
     "forecast_until_earnings": "An actionable, forward-looking operational outlook (Max 200 words). Must explicitly state a directional bias (Bullish | Bearish | Neutral), key operational catalysts to watch, near-term risks, and an analyst confidence level (Low | Medium | High).",
     "outlook_bonus": 0.0,
     "outlook_bonus_rationale": "1-2 sentences. State exactly which forward-looking statements qualified for the bonus and cite the specific evidence (numbers, contracts, dates) found in the article. If bonus is 0.00, state why (e.g., 'No substantiated forward claims found' or 'Article is negative').",
-    "ai_sector_pick": "sector_name | industry_name \u2014 pick the single best match from the 'available_sectors' list provided in the input.",
     "key_events": {
       "revenue": "Actual revenue figure reported. Null if not mentioned.",
       "eps": "Actual EPS figure. Null if not mentioned.",
@@ -148,7 +147,6 @@
     "forecast_until_earnings must be actionable \u2014 include a directional bias (bullish/bearish/neutral) and confidence level.",
     "company_connections arrays must contain only string values. Use empty arrays [] if no connections found. Never null.",
     "outlook_bonus must be a pure floating-point number between 0.00 and 0.05. It is ADDED to sentiment_score by the post-processing engine \u2014 do not add it yourself to sentiment_score. Award it ONLY for substantiated forward-looking claims with concrete evidence in the article. Vague optimism = 0.00.",
-    "ai_sector_pick must be a string in 'sector_name | industry_name' format, chosen ONLY from the 'available_sectors' array in the input. Never invent a new sector. Never return null \u2014 always pick the closest available entry.",
     "key_events must always be a JSON object with its defined keys. Use null for any field not explicitly in the article. Never omit the key_events block.",
     "company_connections must always have keys competitors, partners, suppliers as string arrays. Empty arrays [] if none found. Never omit or null the block."
   ]

@@ -37,10 +37,16 @@ LLM_TYPE = os.getenv("LLM_TYPE", "local").lower()   # local | ollama | api
 
 _LLM_PROFILES = {
     "local": {
-        "base_url":          os.getenv("LLM_BASE_URL",   "http://127.0.0.1:1234/v1"),
-        "api_key":           os.getenv("LLM_API_KEY",    "lm-studio"),
-        "model":             os.getenv("LLM_MODEL",      "google/gemma-4-e2b"),
-        "summary_model":     os.getenv("SUMMARY_LLM_MODEL", "google/gemma-4-e2b"),
+        # Stage 2 (main scoring LLM) — LM Studio
+        "base_url":          os.getenv("LLM_BASE_URL",        "http://127.0.0.1:1234/v1"),
+        "api_key":           os.getenv("LLM_API_KEY",         "lm-studio"),
+        "model":             os.getenv("LLM_MODEL",           "google/gemma-4-e4b"),
+        # Stage 1 (pre-summarizer) — can point to a different server/model
+        # If stage1_base_url == base_url, both stages share the same LM Studio instance.
+        # Set to Ollama remote to offload Stage 1 there:  http://10.11.12.8:11434/v1
+        "stage1_base_url":   os.getenv("STAGE1_BASE_URL",     "http://10.11.12.8:11434/v1"),
+        "stage1_api_key":    os.getenv("STAGE1_API_KEY",      "ollama"),
+        "summary_model":     os.getenv("SUMMARY_LLM_MODEL",   "gemma4:e2b-ctx16k"),
         "temperature":       0.1,
         "context_size":      16384,
         "max_tokens":        12228,
@@ -63,7 +69,7 @@ _LLM_PROFILES = {
         "frequency_penalty": 0.2,
         "presence_penalty":  0.1,
         "num_gpu_layers":    40,
-        "reasoning_mode":    True,
+        "reasoning_mode":    False,
     },
     "api": {
         "base_url":          os.getenv("LLM_BASE_URL",   "https://api.openai.com/v1"),

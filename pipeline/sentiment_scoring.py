@@ -112,8 +112,10 @@ def _get_main_client() -> OpenAI:
 
 
 def _get_summary_client() -> OpenAI:
-    """Stage 1 client — same endpoint, different model (gemma-4-e2b)."""
-    return OpenAI(base_url=LLM_CONFIG["base_url"], api_key=LLM_CONFIG["api_key"])
+    """Stage 1 client — uses stage1_base_url if configured, otherwise shares stage2 endpoint."""
+    base_url = LLM_CONFIG.get("stage1_base_url") or LLM_CONFIG["base_url"]
+    api_key  = LLM_CONFIG.get("stage1_api_key")  or LLM_CONFIG["api_key"]
+    return OpenAI(base_url=base_url, api_key=api_key)
 
 
 def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
@@ -252,7 +254,7 @@ def _build_stage2_prompt(
     master_summary: str,
     last_score: float,
     stage1_result: Optional[dict],
-    available_sectors: list[dict] = None,
+    previous_article_summary: Optional[str] = None,
 ) -> str:
     # Article text: use Stage 1 output if available, else raw text
     if stage1_result:
@@ -263,21 +265,17 @@ def _build_stage2_prompt(
 
     payload = {
         "symbol": symbol,
-        "tradingview_snapshot": tv_snapshot,
+        "master_summary": master_summary or "",
+        "tradingview_snapshot": tv_snapshot or {},
+        "previous_state": {
+            "last_article_score": last_score,
+            "last_article_summary": previous_article_summary or None,
+        },
         "current_article": {
             "title":        article["title"],
             "published_at": article["published_at"].isoformat() if hasattr(article["published_at"], "isoformat") else str(article["published_at"]),
             "text_snippet": text_block,
         },
-        "previous_state": {
-            "master_summary":    master_summary or "",
-            "last_article_score": last_score,
-        },
-        # Send only "sector_name | industry_name" strings — saves ~8KB per call
-        "available_sectors": [
-            f"{s['sector_name']} | {s['industry_name']}"
-            for s in (available_sectors or [])
-        ],
     }
     return _json_dumps(payload)
 
@@ -680,6 +678,52 @@ def _load_all_sectors(conn) -> list[dict]:
     return [{"sector_name": r[0], "industry_name": r[1], "macro_multiplier": float(r[2])} for r in rows]
 
 
+def _call_ai_sector_pick(main_client, symbol: str, master_summary: str, sectors: list) -> str:
+    """
+    Dedicated LLM call after all articles are scored.
+    Uses the final master_summary to pick the best sector from sectors_macro.
+    Returns 'sector_name | industry_name' string or empty string on failure.
+    """
+    if not sectors or not master_summary:
+        return ""
+
+    sector_list = "\n".join(
+        f"- {s['sector_name']} | {s['industry_name']}"
+        for s in sectors
+    )
+
+    prompt = (
+        f"You are a financial sector analyst.\n\n"
+        f"Symbol: {symbol}\n\n"
+        f"Company Summary (accumulated from all recent news):\n{master_summary}\n\n"
+        f"Available Sectors (sector_name | industry_name):\n{sector_list}\n\n"
+        f"Task: Select the SINGLE best matching sector from the list above that fits this company's "
+        f"core business and recent news activity. You must return ONLY a JSON object in this exact format:\n"
+        f"{{\"ai_sector_pick\": \"sector_name | industry_name\"}}\n\n"
+        f"Rules:\n"
+        f"- Pick ONLY from the list above. Never invent a sector.\n"
+        f"- Return the exact string as it appears in the list.\n"
+        f"- No explanation, no markdown, just the JSON object."
+    )
+
+    try:
+        resp = main_client.chat.completions.create(
+            model=LLM_CONFIG["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=64,
+        )
+        raw = resp.choices[0].message.content.strip()
+        parsed = _parse_json_response(raw)
+        pick = parsed.get("ai_sector_pick", "").strip()
+        if pick:
+            logger.info(f"[{symbol}] ai_sector_pick → '{pick}'")
+        return pick
+    except Exception as e:
+        logger.warning(f"[{symbol}] ai_sector_pick call failed: {e}")
+        return ""
+
+
 def _resolve_ai_sector_multiplier(conn, ai_sector_pick: str) -> float:
     """
     Given 'sector_name | industry_name' string from LLM, find the matching
@@ -827,12 +871,11 @@ def _process_symbol(
         return {"symbol": symbol, "scored": 0, "skipped": 0}
 
     macro_mult          = _get_macro_multiplier(conn, industry)
-    all_sectors         = _load_all_sectors(conn)
     master_summary      = sym.get("symbol_master_summary") or ""
-    last_score          = 0.0
+    last_score          = sym.get("final_score") or 0.0
+    last_article_summary = None
     weighted_scores     = []
     last_forecast       = ""
-    last_ai_sector_pick = sym.get("ai_sector_pick") or ""
     scored  = 0
     skipped = 0
 
@@ -850,7 +893,33 @@ def _process_symbol(
     if "earnings_release_date" in tv_snapshot_fallback and hasattr(tv_snapshot_fallback["earnings_release_date"], "isoformat"):
         tv_snapshot_fallback["earnings_release_date"] = tv_snapshot_fallback["earnings_release_date"].isoformat()
 
+    # Pass 1: run Stage 1 for ALL articles (use cache where available)
+    stage1_map: dict = {}   # art_id -> stage1_result (dict or None)
+    stage1_times: dict = {} # art_id -> elapsed seconds
     for article in articles:
+        art_id = article["id"]
+        if article.get("pre_summary_data"):
+            stage1_map[art_id] = article["pre_summary_data"]
+            stage1_times[art_id] = 0.0
+        elif ENABLE_PRE_SUMMARIZATION:
+            raw_text = (article.get("full_text") or article.get("summary") or "")
+            if raw_text.strip():
+                _t0 = time.time()
+                s1r = _call_stage1(
+                    summary_client, raw_text,
+                    model_override=LLM_CONFIG["model"] if single_model_mode else None
+                )
+                stage1_map[art_id] = s1r
+                stage1_times[art_id] = round(time.time() - _t0, 1)
+            else:
+                stage1_map[art_id] = None
+                stage1_times[art_id] = 0.0
+        else:
+            stage1_map[art_id] = None
+            stage1_times[art_id] = 0.0
+
+    # Pass 2: Stage 2 scoring with lookahead (next article's Stage 1 summary)
+    for idx, article in enumerate(articles):
         art_id      = article["id"]
         published_at = article["published_at"]
 
@@ -869,28 +938,17 @@ def _process_symbol(
             skipped += 1
             continue
 
-        # Stage 1: pre-summarization
-        stage1_result = None
-        t_s1 = 0.0
-        if ENABLE_PRE_SUMMARIZATION:
-            # Use cached pre_summary_data if available
-            if article.get("pre_summary_data"):
-                stage1_result = article["pre_summary_data"]
-            else:
-                raw_text = (article.get("full_text") or article.get("summary") or "")
-                if raw_text.strip():
-                    _t0 = time.time()
-                    stage1_result = _call_stage1(
-                        summary_client, raw_text,
-                        model_override=LLM_CONFIG["model"] if single_model_mode else None
-                    )
-                    t_s1 = round(time.time() - _t0, 1)
+        stage1_result = stage1_map.get(art_id)
+        t_s1 = stage1_times.get(art_id, 0.0)
+
+        # Previous article's DB summary (article_summary from last scored article)
+        prev_art_summary = last_article_summary if idx > 0 else None
 
         # Stage 2: stateful scoring
         prompt = _build_stage2_prompt(
             symbol, tv_snapshot, article,
             master_summary, last_score, stage1_result,
-            available_sectors=all_sectors,
+            previous_article_summary=prev_art_summary,
         )
         _t0 = time.time()
         result = _call_stage2(main_client, prompt)
@@ -924,7 +982,7 @@ def _process_symbol(
         master_summary      = result.get("updated_master_summary") or master_summary
         last_forecast       = result.get("forecast_until_earnings") or last_forecast
         last_score          = raw_score
-        last_ai_sector_pick = result.get("ai_sector_pick") or last_ai_sector_pick
+        last_article_summary = result.get("article_summary") or None
         weighted_scores.append(weighted)
         scored += 1
 
@@ -938,16 +996,19 @@ def _process_symbol(
 
     # Save symbol-level scores
     if weighted_scores:
-        ai_sector_mult = _resolve_ai_sector_multiplier(conn, last_ai_sector_pick)
+        # Dedicated AI sector pick — runs once after all articles scored
+        all_sectors = _load_all_sectors(conn)
+        ai_sector_pick = _call_ai_sector_pick(main_client, symbol, master_summary, all_sectors)
+        ai_sector_mult = _resolve_ai_sector_multiplier(conn, ai_sector_pick)
         with conn.cursor() as cur:
             _save_symbol_scores(cur, sym_id, master_summary,
                                 last_forecast, weighted_scores, macro_mult,
-                                ai_sector_pick=last_ai_sector_pick,
+                                ai_sector_pick=ai_sector_pick,
                                 ai_sector_multiplier=ai_sector_mult)
         conn.commit()
         avg_w = sum(weighted_scores) / len(weighted_scores)
         logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
-                    f"macro_mult={macro_mult:.3f} ai_sector='{last_ai_sector_pick}' "
+                    f"macro_mult={macro_mult:.3f} ai_sector='{ai_sector_pick}' "
                     f"ai_sector_mult={ai_sector_mult:.3f} final_score="
                     f"{round(avg_w * macro_mult * ai_sector_mult, 4)}")
     else:
