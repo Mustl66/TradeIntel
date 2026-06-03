@@ -52,6 +52,12 @@ STAGE_ORDER = ["rss", "html", "edgar", "sector_map", "market_research", "macro_m
 
 from config import LLM_CONFIG
 
+# ── LLM Skills ────────────────────────────────────────────────────────────────
+# Drop .md files into the skills/ folder to inject extra instructions into the
+# Stage 2 LLM system prompt.  Files prefixed with _ are skipped.
+# Set SKILLS_ENABLED = False to disable all skills globally.
+SKILLS_ENABLED = True
+
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
 MAX_EVAL_ARTICLES        = 12      # rolling window per symbol (newest N articles)
 ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM

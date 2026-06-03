@@ -56,6 +56,7 @@ from pipeline_config import (  # noqa — patched below
     STAGE1_PARALLEL_WORKERS,
     STAGE2_PARALLEL_WORKERS,
     SKIP_WORKER_COUNT_DETECTION,
+    SKILLS_ENABLED,
 )
 
 # ── JSON helper — handles Decimal / NaN from psycopg2 ─────────────────────────
@@ -81,6 +82,40 @@ class _SafeEncoder(json.JSONEncoder):
 
 def _json_dumps(obj, **kwargs):
     return json.dumps(obj, cls=_SafeEncoder, ensure_ascii=False, **kwargs)
+
+
+# ── Skills loader ─────────────────────────────────────────────────────────────
+
+def _load_skills() -> str:
+    """Load all .md files from the project skills/ folder.
+
+    Rules:
+    - Files prefixed with _ are skipped (easy per-file disable).
+    - Files are loaded in alphabetical order.
+    - Returns empty string if SKILLS_ENABLED=False or no files found.
+    """
+    if not SKILLS_ENABLED:
+        return ""
+    skills_dir = Path(__file__).parent.parent / "skills"
+    if not skills_dir.is_dir():
+        return ""
+    parts = []
+    for md_path in sorted(skills_dir.glob("*.md")):
+        if md_path.stem.startswith("_") or md_path.name == "README.md":
+            continue
+        try:
+            text = md_path.read_text(encoding="utf-8").strip()
+            if text:
+                parts.append(
+                    f"[SKILL: {md_path.stem}]\n"
+                    f"The following skill is GLOBALLY ACTIVE and must be followed STRICTLY "
+                    f"for every response in this session:\n\n{text}"
+                )
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[skills] Failed to load {md_path.name}: {e}")
+    if not parts:
+        return ""
+    return "\n\n" + "\n\n---\n\n".join(parts)
 
 
 # ── Load instruction JSONs ────────────────────────────────────────────────────
@@ -145,6 +180,7 @@ _STAGE1_SYSTEM = (
     "You are a financial news extraction engine operating under the following instruction schema.\n\n"
     + _STAGE1_INSTRUCTION_JSON
     + "\n\nReturn ONLY valid JSON matching the output_schema above. No markdown, no explanation."
+    + _load_skills()
 )
 
 
@@ -244,6 +280,7 @@ _STAGE2_SYSTEM = (
     "You are a professional financial analyst AI operating under the following instruction schema.\n\n"
     + _STAGE2_INSTRUCTION_JSON
     + "\n\nReturn ONLY valid JSON matching the output_schema above. No markdown, no explanation."
+    + _load_skills()
 )
 
 
