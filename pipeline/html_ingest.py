@@ -365,18 +365,99 @@ def _handle_mynewsdesk(url: str, symbol: str, feed_id: int, symbol_id: int) -> l
         return []
 
 
+def _handle_nasdaq_press_release_api(ticker: str, symbol: str, feed_id: int, symbol_id: int) -> list[dict]:
+    """
+    Nasdaq press-release API — works for any Nasdaq-listed ticker.
+    Used as fallback when Yahoo Finance returns sparse results.
+    GET https://api.nasdaq.com/api/news/topic/press_release
+        ?q=symbol:{ticker}|assetclass:stocks&limit=100&offset=0
+    """
+    import trafilatura, hashlib as _hashlib
+
+    api_url = (
+        f"https://api.nasdaq.com/api/news/topic/press_release"
+        f"?q=symbol:{ticker.lower()}|assetclass:stocks&limit=100&offset=0"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.nasdaq.com/",
+    }
+    try:
+        _delay()
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            logger.warning(f"[{symbol}] Nasdaq PR API HTTP {resp.status_code}")
+            return []
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"[{symbol}] Nasdaq PR API error: {e}")
+        return []
+
+    rows = (data.get("data") or {}).get("rows") or []
+    if not rows:
+        return []
+
+    articles = []
+    for row in rows:
+        title = (row.get("title") or "").strip()
+        slug  = (row.get("url") or "").strip()
+        if not title or not slug:
+            continue
+
+        link = slug if slug.startswith("http") else f"https://www.nasdaq.com{slug}"
+
+        # Parse date string like "May 14, 2026"
+        pub_dt = None
+        date_str = row.get("created") or row.get("ago") or ""
+        if date_str:
+            try:
+                from datetime import datetime, timezone as _tz
+                pub_dt = datetime.strptime(date_str, "%b %d, %Y").replace(tzinfo=_tz.utc)
+            except Exception:
+                pass
+
+        full_text = ""
+        try:
+            _delay()
+            r_art = requests.get(link, headers=_headers(), timeout=12, allow_redirects=True)
+            if r_art.status_code == 200:
+                extracted = trafilatura.extract(r_art.text, include_comments=False, include_tables=False)
+                full_text = (extracted or "")[:MAX_FULL_TEXT_LEN]
+        except Exception as e:
+            logger.debug(f"[{symbol}] Nasdaq PR trafilatura error on {link}: {e}")
+
+        art_hash = _hashlib.sha256(f"{title}|{link}".encode()).hexdigest()
+        articles.append({
+            "symbol_id":    symbol_id,
+            "feed_id":      feed_id,
+            "title":        title,
+            "url":          link,
+            "published_at": pub_dt,
+            "summary":      "",
+            "author":       "",
+            "full_text":    full_text,
+            "source_name":  "nasdaq_pr_api",
+            "article_hash": art_hash,
+        })
+
+    return articles
+
+
 def _handle_yahoo_finance(url: str, symbol: str, feed_id: int, symbol_id: int) -> list[dict]:
     """
     Yahoo Finance press-release pages:
     https://finance.yahoo.com/quote/{TICKER}/press-releases/
 
     Strategy:
-      1. Hit Yahoo Finance search API — free, no JS needed, returns 40 news items
+      1. Hit Yahoo Finance search API — free, no JS needed, returns up to 40 items
       2. Filter to only press release publishers (Business Wire, PRNewswire, GNW, etc.)
-      3. Fetch full article text via trafilatura (bypasses Yahoo consent wall)
-      4. Return clean article dicts
+      3. If Yahoo returns <= 5 items (capped / page 404), fall back to Nasdaq press-release API
+      4. Fetch full article text via trafilatura
+      5. Return clean article dicts
 
     API: https://query2.finance.yahoo.com/v1/finance/search?q={ticker}&newsCount=40
+    Fallback: https://api.nasdaq.com/api/news/topic/press_release?q=symbol:{ticker}|assetclass:stocks
     """
     import trafilatura
 
@@ -393,21 +474,30 @@ def _handle_yahoo_finance(url: str, symbol: str, feed_id: int, symbol_id: int) -
         "Referer": "https://finance.yahoo.com/",
     }
 
+    pr_items = []
+    source = "yahoo"
     try:
         _delay()
         resp = requests.get(api_url, headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
+        news_items = data.get("news", [])
+        pr_items = [n for n in news_items if n.get("publisher", "") in _YAHOO_PR_PUBLISHERS]
+        logger.debug(f"[{symbol}] Yahoo search API: {len(news_items)} total, {len(pr_items)} press releases")
     except Exception as e:
         logger.warning(f"[{symbol}] Yahoo API error: {e}")
-        return []
 
-    news_items = data.get("news", [])
-    # Filter to press release publishers only — skip analyst commentary
-    pr_items = [n for n in news_items if n.get("publisher", "") in _YAHOO_PR_PUBLISHERS]
+    # Fall back to Nasdaq press-release API if Yahoo returned too few results
+    if len(pr_items) <= 5:
+        logger.info(f"[{symbol}] Yahoo sparse ({len(pr_items)}), trying Nasdaq press-release API fallback")
+        nasdaq_articles = _handle_nasdaq_press_release_api(ticker, symbol, feed_id, symbol_id)
+        if nasdaq_articles:
+            logger.info(f"[{symbol}] Nasdaq fallback: {len(nasdaq_articles)} articles")
+            return nasdaq_articles
+        # If Nasdaq also empty, proceed with whatever Yahoo gave us
 
     if not pr_items:
-        logger.debug(f"[{symbol}] Yahoo: 0 press releases found (total news={len(news_items)})")
+        logger.debug(f"[{symbol}] Yahoo: 0 press releases, no fallback results either")
         return []
 
     logger.info(f"[{symbol}] Yahoo: {len(pr_items)} press releases from API, fetching full text...")

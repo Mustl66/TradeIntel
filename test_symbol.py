@@ -108,21 +108,16 @@ else:
 # ── HTML pipeline ─────────────────────────────────────────────────────────────
 if PIPELINES['html']['active'] and html_feeds:
     print(f"── HTML pipeline ({len(html_feeds)} feed(s)) ─────────────────────────────")
-    from pipeline.html_ingest import _process_html_feed, _save_articles as _html_insert
-    conn = get_conn()
+    from pipeline.html_ingest import _process_html_feed
     for feed in html_feeds:
         print(f"  Fetching: {feed['feed_url']}")
         try:
+            # _process_html_feed returns (symbol, n_inserted) — saves internally
             result = _process_html_feed(feed)
-            articles = result.get("articles", []) if isinstance(result, dict) else (result or [])
-            if articles:
-                inserted = _html_insert(conn, articles)
-                print(f"  → {len(articles)} fetched, {inserted} new inserted")
-            else:
-                print(f"  → 0 articles returned")
+            _, inserted = result if isinstance(result, tuple) else (feed['symbol'], 0)
+            print(f"  → {inserted} new inserted")
         except Exception as e:
             print(f"  [ERROR] {e}")
-    conn.close()
     print()
 else:
     if not PIPELINES['html']['active']:

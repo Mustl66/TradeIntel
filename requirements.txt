@@ -24,7 +24,7 @@ openai
 
 # TradingView data
 tradingview-screener
-
+rookiepy
 # Testing
 pytest
 json_repair

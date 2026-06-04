@@ -18,7 +18,7 @@ START_FROM = None   # e.g. "html"  or  "sector_map"
 
 # Limit symbols processed per run. False = all symbols. Integer = first N symbols only.
 # Useful for quick test runs without waiting for the full 2800-symbol pipeline.
-SYMBOL_LIMIT = False   # e.g. 100  or  False
+SYMBOL_LIMIT = 8   # e.g. 100  or  False
 
 PIPELINES = {
     "rss": {
@@ -56,11 +56,11 @@ from config import LLM_CONFIG
 # Drop .md files into the skills/ folder to inject extra instructions into the
 # Stage 2 LLM system prompt.  Files prefixed with _ are skipped.
 # Set SKILLS_ENABLED = False to disable all skills globally.
-SKILLS_ENABLED = True
+SKILLS_ENABLED = False
 
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
 MAX_EVAL_ARTICLES        = 12      # rolling window per symbol (newest N articles)
-ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM
+ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
 SENTIMENT_LAMBDA         = 0.001   # time-decay lambda (per hour) — applied only AFTER grace period
 DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this many months
@@ -69,6 +69,12 @@ DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this man
 # Stage 1 is stateless per article — safe to run in parallel.
 # Set >1 only if LM Studio can handle concurrent requests for the fast model.
 # Set to 1 to disable parallelism (safe default).
+# ── TradingView snapshot in LLM context ───────────────────────────────────────
+# When True: tv_snapshot (market cap, sector, earnings date, etc.) is included
+# in every Stage 2 prompt so the LLM can scale scores by company size.
+# When False: tv_snapshot is omitted — faster prompts, less context, blind scoring.
+INCLUDE_TV_SNAPSHOT      = False    # set False to disable TV data in LLM prompts
+
 STAGE1_PARALLEL_WORKERS  = 1       # e.g. 3 to test parallel Stage 1
 
 # ── Stage 2 parallel workers (main LLM scoring) ───────────────────────────────

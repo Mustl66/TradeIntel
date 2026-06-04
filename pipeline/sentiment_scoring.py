@@ -57,6 +57,7 @@ from pipeline_config import (  # noqa — patched below
     STAGE2_PARALLEL_WORKERS,
     SKIP_WORKER_COUNT_DETECTION,
     SKILLS_ENABLED,
+    INCLUDE_TV_SNAPSHOT,
 )
 
 # ── JSON helper — handles Decimal / NaN from psycopg2 ─────────────────────────
@@ -153,12 +154,108 @@ def _get_summary_client() -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
+def _lmstudio_unload_model(root: str, instance_id: str) -> None:
+    """Unload a specific model instance so we can reload with correct settings."""
+    try:
+        resp = requests.post(
+            f"{root}/api/v1/models/unload",
+            json={"instance_id": instance_id},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            logger.info(f"[lmstudio_unload] '{instance_id}' unloaded OK")
+        else:
+            logger.debug(f"[lmstudio_unload] '{instance_id}' HTTP {resp.status_code}")
+    except Exception as e:
+        logger.debug(f"[lmstudio_unload] '{instance_id}' error (non-fatal): {e}")
+
+
+def _lmstudio_load_model(base_url: str, model_id: str, context_length: int) -> bool:
+    """Force-load a model via LM Studio /api/v1/models/load (LM Studio >= 0.4.0).
+
+    Steps:
+      1. Check if model already loaded with correct context — skip if so.
+      2. Unload any existing instances that have wrong context.
+      3. Load fresh with context_length from config.
+
+    LM Studio 0.4.x auto-maximizes GPU layers — no gpu_offload param needed.
+    Returns True on success."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+
+    # Check current state via /api/v1/models
+    try:
+        r = requests.get(f"{root}/api/v1/models", timeout=10)
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                if m.get("key") == model_id:
+                    for inst in m.get("loaded_instances", []):
+                        inst_ctx = inst.get("config", {}).get("context_length", 0)
+                        inst_id  = inst.get("id", model_id)
+                        if inst_ctx == context_length:
+                            logger.info(
+                                f"[lmstudio_load] '{model_id}' already loaded "
+                                f"ctx={context_length} — skipping"
+                            )
+                            return True
+                        else:
+                            logger.info(
+                                f"[lmstudio_load] Unloading '{inst_id}' "
+                                f"(ctx={inst_ctx} → need {context_length})"
+                            )
+                            _lmstudio_unload_model(root, inst_id)
+    except Exception as e:
+        logger.debug(f"[lmstudio_load] state check failed (non-fatal): {e}")
+
+    # Load with desired context_length
+    try:
+        resp = requests.post(
+            f"{root}/api/v1/models/load",
+            json={"model": model_id, "context_length": context_length},
+            timeout=120,
+        )
+        if resp.status_code in (200, 201):
+            logger.info(
+                f"[lmstudio_load] '{model_id}' loaded — ctx={context_length}"
+            )
+            return True
+        else:
+            logger.warning(
+                f"[lmstudio_load] '{model_id}' failed: "
+                f"HTTP {resp.status_code} — {resp.text[:300]}"
+            )
+            return False
+    except Exception as e:
+        logger.warning(f"[lmstudio_load] '{model_id}' request error: {e}")
+        return False
+
+
 def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
-    """Send a tiny request to both models so LM Studio loads both into VRAM before processing starts.
-    Skipped for API mode — wastes tokens and the model is always available remotely."""
+    """Load both models with guaranteed GPU offload + context size before processing starts.
+    LM Studio (local): uses /api/v0/models/load to force settings from code, not UI.
+    Ollama: sends a tiny chat ping to preload into VRAM.
+    Skipped entirely for API/Anthropic."""
     if LLM_TYPE in ("api", "anthropic"):
         logger.info("[warmup] API mode — skipping warmup (no local model to load)")
         return
+
+    ctx_size       = LLM_CONFIG.get("context_size", 50000)
+    base_url       = LLM_CONFIG["base_url"]
+    stage1_base_url = LLM_CONFIG.get("stage1_base_url") or base_url
+
+    if LLM_TYPE == "local":
+        # LM Studio: force-load both models via REST API with correct settings.
+        # Stage 1 (e2b) first — smaller, loads faster.
+        ok1 = _lmstudio_load_model(stage1_base_url, SUMMARY_LLM_MODEL,  ctx_size)
+        ok2 = _lmstudio_load_model(base_url,        LLM_CONFIG["model"], ctx_size)
+        if ok1 and ok2:
+            logger.info("[warmup] Both models loaded via LM Studio API — GPU auto-max, ctx=%d", ctx_size)
+            return
+        # Fallback: /api/v0/models/load unavailable — fall through to chat ping
+        logger.warning("[warmup] LM Studio load API failed — falling back to chat ping (GPU/ctx from UI)")
+
+    # Ollama or LM Studio fallback: plain chat ping
     for client, model, label in [
         (summary_client, SUMMARY_LLM_MODEL,    "summary (e2b)"),
         (main_client,    LLM_CONFIG["model"],  "main (e4b)"),
@@ -169,7 +266,7 @@ def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],
             )
-            logger.info(f"[warmup] {label} loaded OK")
+            logger.info(f"[warmup] {label} loaded OK (chat ping)")
         except Exception as e:
             logger.warning(f"[warmup] {label} warmup failed (non-fatal): {e}")
 
@@ -202,15 +299,20 @@ def _extract_json(raw: str) -> Optional[dict]:
     # find outermost { ... } — skip if no closing } (truncated output)
     start = raw.find("{")
     end   = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    if start == -1:
+        # no JSON object at all — give up immediately
+        return None
+    if end != -1 and end > start:
         raw = raw[start:end + 1]
-    elif start != -1:
+    else:
         # truncated: no closing } — take from { onward and let json_repair fix it
         raw = raw[start:]
 
     # pass 1: standard json.loads (fast path)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
     except json.JSONDecodeError:
         pass
 
@@ -303,7 +405,7 @@ def _build_stage2_prompt(
     payload = {
         "symbol": symbol,
         "master_summary": master_summary or "",
-        "tradingview_snapshot": tv_snapshot or {},
+        "tradingview_snapshot": (tv_snapshot or {}) if INCLUDE_TV_SNAPSHOT else {},
         "previous_state": {
             "last_article_score": last_score,
             "last_article_summary": previous_article_summary or None,
@@ -333,9 +435,9 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
     }
     if LLM_TYPE in ("ollama", "local"):
         kwargs["extra_body"] = {
-            "num_ctx": LLM_CONFIG.get("context_size", 16384),
-            "top_k":   LLM_CONFIG.get("top_k", 40),
-            "format":  "json",   # force valid JSON output
+            "num_ctx":     LLM_CONFIG.get("context_size", 16384),
+            "num_predict": LLM_CONFIG.get("max_tokens", 4096),
+            "top_k":       LLM_CONFIG.get("top_k", 40),
         }
     elif LLM_TYPE in ("api", "anthropic"):
         kwargs["response_format"] = {"type": "json_object"}
@@ -751,7 +853,7 @@ def _call_ai_sector_pick(main_client, symbol: str, master_summary: str, sectors:
             max_tokens=64,
         )
         raw = resp.choices[0].message.content.strip()
-        parsed = _parse_json_response(raw)
+        parsed = _extract_json(raw) or {}
         pick = parsed.get("ai_sector_pick", "").strip()
         if pick:
             logger.info(f"[{symbol}] ai_sector_pick → '{pick}'")
@@ -930,32 +1032,34 @@ def _process_symbol(
     if "earnings_release_date" in tv_snapshot_fallback and hasattr(tv_snapshot_fallback["earnings_release_date"], "isoformat"):
         tv_snapshot_fallback["earnings_release_date"] = tv_snapshot_fallback["earnings_release_date"].isoformat()
 
-    # Pass 1: run Stage 1 for ALL articles (use cache where available)
-    stage1_map: dict = {}   # art_id -> stage1_result (dict or None)
-    stage1_times: dict = {} # art_id -> elapsed seconds
-    for article in articles:
-        art_id = article["id"]
+    # ── Stage 1 prefetch pool ─────────────────────────────────────────────────
+    # Pipeline pattern: S1[n+1] runs in background while S2[n] scores.
+    # All S1 futures are submitted upfront; S2 loop calls .result() in order
+    # (returns immediately if S1 already done, blocks briefly if still running).
+    # Stage 2 stays sequential — master_summary chain requires ordered processing.
+    _s1_pool = ThreadPoolExecutor(max_workers=max(1, STAGE1_PARALLEL_WORKERS))
+
+    def _submit_s1(article):
+        """Submit one article's Stage 1 task. Returns Future[(result, elapsed)]."""
         if article.get("pre_summary_data"):
-            stage1_map[art_id] = article["pre_summary_data"]
-            stage1_times[art_id] = 0.0
-        elif ENABLE_PRE_SUMMARIZATION:
+            return _s1_pool.submit(lambda c=article["pre_summary_data"]: (c, 0.0))
+        if ENABLE_PRE_SUMMARIZATION:
             raw_text = (article.get("full_text") or article.get("summary") or "")
             if raw_text.strip():
-                _t0 = time.time()
-                s1r = _call_stage1(
-                    summary_client, raw_text,
-                    model_override=LLM_CONFIG["model"] if single_model_mode else None
-                )
-                stage1_map[art_id] = s1r
-                stage1_times[art_id] = round(time.time() - _t0, 1)
-            else:
-                stage1_map[art_id] = None
-                stage1_times[art_id] = 0.0
-        else:
-            stage1_map[art_id] = None
-            stage1_times[art_id] = 0.0
+                def _run(text=raw_text):
+                    t0 = time.time()
+                    r = _call_stage1(
+                        summary_client, text,
+                        model_override=LLM_CONFIG["model"] if single_model_mode else None,
+                    )
+                    return r, round(time.time() - t0, 1)
+                return _s1_pool.submit(_run)
+        return _s1_pool.submit(lambda: (None, 0.0))
 
-    # Pass 2: Stage 2 scoring with lookahead (next article's Stage 1 summary)
+    stage1_futures = {a["id"]: _submit_s1(a) for a in articles}
+    _s1_pool.shutdown(wait=False)  # no new submissions; running tasks continue in background
+
+    # ── Stage 2 scoring (sequential — stateful master_summary chain) ──────────
     for idx, article in enumerate(articles):
         art_id      = article["id"]
         published_at = article["published_at"]
@@ -975,8 +1079,7 @@ def _process_symbol(
             skipped += 1
             continue
 
-        stage1_result = stage1_map.get(art_id)
-        t_s1 = stage1_times.get(art_id, 0.0)
+        stage1_result, t_s1 = stage1_futures[art_id].result()  # wait if S1 still running
 
         # Previous article's DB summary (article_summary from last scored article)
         prev_art_summary = last_article_summary if idx > 0 else None
@@ -1017,7 +1120,8 @@ def _process_symbol(
                                  stage2_prompt=prompt)
         conn.commit()
         master_summary      = result.get("updated_master_summary") or master_summary
-        last_forecast       = result.get("forecast_until_earnings") or last_forecast
+        _fc = result.get("forecast_until_earnings")
+        last_forecast       = str(_fc) if _fc and not isinstance(_fc, str) else (_fc or last_forecast)
         last_score          = raw_score
         last_article_summary = result.get("article_summary") or None
         weighted_scores.append(weighted)

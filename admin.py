@@ -512,8 +512,10 @@ async def symbols(q: str = "", filter: str = "all", sort: str = "alpha"):
               hx-target="#feed-panel"
               hx-swap="innerHTML"
               hx-indicator="#fetch-spinner-{r['id']}"
+              hx-timeout="600000"
               onclick="event.stopPropagation();document.querySelectorAll('.sym-row').forEach(e=>e.classList.remove('active'));this.closest('.sym-row').classList.add('active')"
             >▶</button>
+            <span id="fetch-spinner-{r['id']}" class="htmx-indicator spinner" style="margin-left:4px"></span>
           </div>
         </div>"""
     return HTMLResponse(html)
@@ -770,14 +772,14 @@ async def fetch_symbol(sym_id: int):
     try:
         result = subprocess.run(
             [sys.executable, script, symbol],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=600,
             cwd=os.path.dirname(__file__)
         )
         output = (result.stdout + result.stderr).strip()
         elapsed = round(time.time() - start, 1)
     except subprocess.TimeoutExpired:
-        output  = "ERROR: timed out after 120s"
-        elapsed = 120
+        output  = "ERROR: timed out after 600s"
+        elapsed = 600
 
     conn2 = get_conn()
     try:
