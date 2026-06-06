@@ -329,6 +329,50 @@ def _fetch_leaderboard(sort="final_score", dir="desc"):
     return rows, stats
 
 
+@app.get("/throughput.json")
+def throughput_json():
+    """Rolling throughput estimate: articles/hr + symbols/hr.
+
+    Sample = up to last 200 events per kind in 24h window.
+    rate = N / hours_span. More events → tighter estimate.
+    """
+    SAMPLE_N = 200
+    MIN_SPAN_S = 30
+    out = {"tier": None, "article": {"rate": None, "n": 0},
+           "symbol":  {"rate": None, "n": 0}}
+    try:
+        import config as _cfg
+        t = getattr(_cfg, "ACTIVE_TIER", None)
+        if t is not None:
+            out["tier"] = f"T{t}"
+    except Exception:
+        pass
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            for kind in ("article", "symbol"):
+                try:
+                    cur.execute("""
+                        SELECT scored_at FROM scoring_events
+                        WHERE kind = %s AND scored_at >= NOW() - INTERVAL '24 hours'
+                        ORDER BY scored_at DESC LIMIT %s
+                    """, (kind, SAMPLE_N))
+                    rows = cur.fetchall()
+                except Exception:
+                    conn.rollback()
+                    rows = []
+                n = len(rows)
+                if n >= 2:
+                    span_s = max(MIN_SPAN_S, (rows[0][0] - rows[-1][0]).total_seconds())
+                    out[kind] = {"rate": n / (span_s / 3600.0), "n": n}
+                else:
+                    out[kind] = {"rate": None, "n": n}
+    finally:
+        conn.close()
+    return out
+
+
 @app.get("/leaderboard-partial")
 def leaderboard_partial(sort: str = "final_score", dir: str = "desc"):
     """Returns updated rows + stats as JSON for seamless live refresh."""
@@ -476,8 +520,33 @@ def index(sort: str = "final_score", dir: str = "desc"):
   <span class="badge" style="color:{avg_col}">avg {fmt_score(stats['avg_fs'])}</span>
   <span class="badge" style="color:#86efac">↑ {fmt_score(stats['max_fs'])}</span>
   <span class="badge" style="color:#fca5a5">↓ {fmt_score(stats['min_fs'])}</span>
+  <span id="throughput-badge" class="badge" style="color:#94a3b8;font-size:11px">⚡ loading…</span>
   <span class="badge" style="color:#475569;margin-left:auto">🕐 {now}</span>
 </div>
+<script>
+(function() {{
+  async function refreshThroughput() {{
+    try {{
+      const r = await fetch('/throughput.json');
+      if (!r.ok) return;
+      const d = await r.json();
+      const el = document.getElementById('throughput-badge');
+      if (!el) return;
+      const fmt = (s) => {{
+        if (s.rate === null) return `— /h <span style="color:#475569">(n=${{s.n}})</span>`;
+        const rate = s.rate >= 10 ? Math.round(s.rate).toLocaleString() : s.rate.toFixed(1);
+        const conf = Math.min(1, s.n / 200);
+        const dot = conf < 0.3 ? '#ef4444' : (conf < 0.7 ? '#fbbf24' : '#4ade80');
+        return `<b style="color:#e2e8f0">${{rate}}</b><span style="color:#64748b">/h</span> <span style="color:${{dot}}">●</span> <span style="color:#475569">n=${{s.n}}</span>`;
+      }};
+      const tier = d.tier ? `<span style="color:#a5b4fc;font-weight:700;margin-right:6px">${{d.tier}}</span>` : '';
+      el.innerHTML = `${{tier}}📄 ${{fmt(d.article)}} <span style="color:#1e293b">│</span> 📊 ${{fmt(d.symbol)}}`;
+    }} catch(e) {{}}
+  }}
+  refreshThroughput();
+  setInterval(refreshThroughput, 10000);
+}})();
+</script>
 
 <div class="controls">
   <input class="search-box" type="text" placeholder="🔍 Filter symbol or company…" oninput="filterRows(this.value)" id="search">

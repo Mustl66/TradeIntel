@@ -727,23 +727,59 @@ def _compute_worker_count() -> int:
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
-    """Return symbols that have at least one unscored article."""
+    """Return symbols that have at least one unscored article.
+
+    Priority-queue symbols are ALWAYS included (regardless of exchange filter
+    and LIMIT) so they actually get scored. Non-priority symbols obey
+    exchange + LIMIT.
+    """
+    SELECT_COLS = """
+        s.id, s.symbol,
+        s.industry, s.market_cap_formatted,
+        s.close_price, s.price_change,
+        s.price_earnings_ttm, s.price_sales_ratio, s.price_book_ratio,
+        s.earnings_per_share_basic_ttm, s.price_earnings_growth_ttm,
+        s.total_revenue, s.net_income,
+        s.gross_margin, s.operating_margin, s.net_margin,
+        s.return_on_equity, s.debt_to_equity, s.current_ratio,
+        s.rsi, s.sma200, s.price_52_week_high,
+        s.relative_volume_10d_calc, s.average_volume_30d_calc,
+        s.earnings_release_date, s.dividend_yield_recent,
+        s.number_of_employees,
+        s.symbol_master_summary,
+        s.ai_sector_pick
+    """
+
+    # ── 1) Priority symbols (no exchange/limit filter — user explicitly queued)
+    priority_ids: list[int] = []
+    priority_rows: list[dict] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol_id FROM priority_queue ORDER BY rank ASC")
+            priority_ids = [r[0] for r in cur.fetchall()]
+        if priority_ids:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT {SELECT_COLS}
+                    FROM symbols s
+                    WHERE s.id = ANY(%s)
+                      AND EXISTS (
+                          SELECT 1 FROM news_articles na
+                          WHERE na.symbol_id = s.id AND na.sentiment_score IS NULL
+                      )
+                """, (priority_ids,))
+                cols = [d[0] for d in cur.description]
+                rows_by_id = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
+            # Preserve priority rank order
+            priority_rows = [rows_by_id[sid] for sid in priority_ids if sid in rows_by_id]
+    except Exception as e:
+        logger.warning(f"[priority_queue] read failed: {e}")
+        priority_ids = []
+
+    # ── 2) Normal symbols (exchange + limit)
     with conn.cursor() as cur:
-        q = """
-            SELECT DISTINCT s.id, s.symbol,
-                s.industry, s.market_cap_formatted,
-                s.close_price, s.price_change,
-                s.price_earnings_ttm, s.price_sales_ratio, s.price_book_ratio,
-                s.earnings_per_share_basic_ttm, s.price_earnings_growth_ttm,
-                s.total_revenue, s.net_income,
-                s.gross_margin, s.operating_margin, s.net_margin,
-                s.return_on_equity, s.debt_to_equity, s.current_ratio,
-                s.rsi, s.sma200, s.price_52_week_high,
-                s.relative_volume_10d_calc, s.average_volume_30d_calc,
-                s.earnings_release_date, s.dividend_yield_recent,
-                s.number_of_employees,
-                s.symbol_master_summary,
-                s.ai_sector_pick
+        q = f"""
+            SELECT DISTINCT {SELECT_COLS}
             FROM symbols s
             WHERE s.exchange = %s
               AND s.status = TRUE
@@ -752,25 +788,22 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
                   WHERE na.symbol_id = s.id AND na.sentiment_score IS NULL
               )
         """
+        params: list = [exchange]
+        if priority_ids:
+            q += " AND NOT (s.id = ANY(%s))"
+            params.append(priority_ids)
         if limit:
             q += f" LIMIT {limit}"
-        cur.execute(q, (exchange,))
+        cur.execute(q, tuple(params))
         cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        normal_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     import random
-    random.shuffle(rows)
-    # Pull priority queue and move those symbols to the front (preserving their rank order)
-    try:
-        with conn.cursor() as pq_cur:
-            pq_cur.execute("SELECT symbol_id FROM priority_queue ORDER BY rank ASC")
-            priority_ids = [r[0] for r in pq_cur.fetchall()]
-        if priority_ids:
-            prio_map = {sid: i for i, sid in enumerate(priority_ids)}
-            priority_rows = sorted([r for r in rows if r["id"] in prio_map], key=lambda r: prio_map[r["id"]])
-            normal_rows   = [r for r in rows if r["id"] not in prio_map]
-            rows = priority_rows + normal_rows
-    except Exception:
-        pass  # priority_queue table may not exist yet on older installs
+    random.shuffle(normal_rows)
+
+    rows = priority_rows + normal_rows
+    if priority_rows:
+        logger.debug(f"[priority_queue] {len(priority_rows)} priority symbol(s) at head of run: "
+                     f"{[r['symbol'] for r in priority_rows]}")
     return rows
 
 
@@ -941,6 +974,23 @@ def _save_article_result(cur, article_id: int, result: dict,
     """, {**updates, "id": article_id,
           "pre_summary_data": json.dumps(pre_summary) if pre_summary else None})
 
+    # Log scoring event (resource manager throughput tracking)
+    try:
+        cur.execute(
+            "INSERT INTO scoring_events (kind, symbol_id) "
+            "SELECT 'article', symbol_id FROM news_articles WHERE id = %s",
+            (article_id,)
+        )
+    except Exception:
+        pass
+
+    # Remove from active_article (this article is now finished)
+    try:
+        cur.execute("DELETE FROM active_article WHERE article_id = %s", (article_id,))
+        cur.execute("NOTIFY active_article_changed")
+    except Exception:
+        pass
+
 
 def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
                         forecast: str, weighted_scores: list[float],
@@ -965,6 +1015,15 @@ def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
           ai_sector_pick or None,
           ai_sector_multiplier,
           symbol_id))
+
+    # Log scoring event (resource manager throughput tracking)
+    try:
+        cur.execute(
+            "INSERT INTO scoring_events (kind, symbol_id) VALUES ('symbol', %s)",
+            (symbol_id,)
+        )
+    except Exception:
+        pass
 
 
 # ── Per-symbol processor ──────────────────────────────────────────────────────
@@ -1000,6 +1059,7 @@ def _process_symbol(
     summary_client: OpenAI,
     sym: dict,
     single_model_mode: bool = False,
+    s1_pool: "ThreadPoolExecutor | None" = None,
 ) -> dict:
     symbol   = sym["symbol"]
     sym_id   = sym["id"]
@@ -1037,10 +1097,28 @@ def _process_symbol(
     # All S1 futures are submitted upfront; S2 loop calls .result() in order
     # (returns immediately if S1 already done, blocks briefly if still running).
     # Stage 2 stays sequential — master_summary chain requires ordered processing.
-    _s1_pool = ThreadPoolExecutor(max_workers=max(1, STAGE1_PARALLEL_WORKERS))
+    # Use shared pool if provided (so total S1 concurrency = STAGE1_PARALLEL_WORKERS
+    # globally, not per-symbol). Fall back to per-symbol pool for back-compat.
+    _own_pool = s1_pool is None
+    _s1_pool = s1_pool or ThreadPoolExecutor(max_workers=max(1, STAGE1_PARALLEL_WORKERS))
 
     def _submit_s1(article):
         """Submit one article's Stage 1 task. Returns Future[(result, elapsed)]."""
+        # Mark as Stage 1 active (yellow in admin view)
+        try:
+            with conn.cursor() as _ac:
+                _ac.execute(
+                    "INSERT INTO active_article (article_id, symbol_id, stage) VALUES (%s, %s, 1) "
+                    "ON CONFLICT (article_id) DO UPDATE SET stage = 1, started_at = NOW()",
+                    (article["id"], sym_id)
+                )
+                _ac.execute("NOTIFY active_article_changed")
+            conn.commit()
+        except Exception as _e:
+            logger.warning(f"[active_article] S1 mark failed for art={article.get('id')}: {_e}")
+            try: conn.rollback()
+            except Exception: pass
+
         if article.get("pre_summary_data"):
             return _s1_pool.submit(lambda c=article["pre_summary_data"]: (c, 0.0))
         if ENABLE_PRE_SUMMARIZATION:
@@ -1057,7 +1135,8 @@ def _process_symbol(
         return _s1_pool.submit(lambda: (None, 0.0))
 
     stage1_futures = {a["id"]: _submit_s1(a) for a in articles}
-    _s1_pool.shutdown(wait=False)  # no new submissions; running tasks continue in background
+    if _own_pool:
+        _s1_pool.shutdown(wait=False)  # no new submissions; running tasks continue in background
 
     # ── Stage 2 scoring (sequential — stateful master_summary chain) ──────────
     for idx, article in enumerate(articles):
@@ -1090,6 +1169,20 @@ def _process_symbol(
             master_summary, last_score, stage1_result,
             previous_article_summary=prev_art_summary,
         )
+        # Upgrade to Stage 2 active (green in admin view)
+        try:
+            with conn.cursor() as _ac:
+                _ac.execute(
+                    "INSERT INTO active_article (article_id, symbol_id, stage) VALUES (%s, %s, 2) "
+                    "ON CONFLICT (article_id) DO UPDATE SET stage = 2, started_at = NOW()",
+                    (art_id, sym_id)
+                )
+                _ac.execute("NOTIFY active_article_changed")
+            conn.commit()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+
         _t0 = time.time()
         result = _call_stage2(main_client, prompt)
         t_s2 = round(time.time() - _t0, 1)
@@ -1172,6 +1265,26 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     # ── Auto-dedup cross-language articles before scoring ──────────────────────
     _dedup_languages(conn)
 
+    # Ensure active_processing table exists + clear stale rows from prior crashes
+    try:
+        with conn.cursor() as _ac:
+            _ac.execute("""
+                CREATE TABLE IF NOT EXISTS active_processing (
+                    symbol_id  INT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+                    worker_id  TEXT,
+                    started_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            _ac.execute("TRUNCATE active_processing")
+            try:
+                _ac.execute("TRUNCATE active_article")
+            except Exception:
+                pass
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[active_processing] init failed: {e}")
+        conn.rollback()
+
     symbols = _get_symbols_with_unscored(conn, exchange, limit)
     if not symbols:
         logger.info("[sentiment_scoring] No symbols with unscored articles.")
@@ -1183,11 +1296,15 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
 
     # ── VRAM-based worker sizing ───────────────────────────────────────────────
     if SKIP_WORKER_COUNT_DETECTION:
-        n_workers       = max(STAGE1_PARALLEL_WORKERS, STAGE2_PARALLEL_WORKERS)
+        # n_workers = symbol-level (Stage 2) concurrency.
+        # Stage 1 concurrency is enforced by the SHARED _shared_s1_pool below.
+        n_workers       = max(1, STAGE2_PARALLEL_WORKERS)
         single_model_mode = False
         print(f"\n[worker sizing] SKIP_WORKER_COUNT_DETECTION=True — "
-              f"using config workers={n_workers}, single_model_mode=False\n")
-        logger.info(f"[vram] detection skipped — workers={n_workers} (from pipeline_config)")
+              f"stage1={STAGE1_PARALLEL_WORKERS} stage2/symbol={n_workers} "
+              f"single_model_mode=False\n")
+        logger.info(f"[vram] detection skipped — stage1={STAGE1_PARALLEL_WORKERS} "
+                    f"stage2={n_workers} (from active tier in config.py)")
     else:
         n_workers, single_model_mode = _compute_worker_count()
 
@@ -1200,11 +1317,19 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
         summary_client = _get_summary_client()
     _warmup_models(main_client, summary_client)
 
-    # ── Semaphore caps concurrent Ollama requests ──────────────────────────────
+    # ── Semaphore caps concurrent symbol-level (Stage 2) work ─────────────────
     semaphore = threading.Semaphore(n_workers)
 
+    # ── Shared Stage 1 pool ───────────────────────────────────────────────────
+    # ONE pool across all symbols → enforces global STAGE1_PARALLEL_WORKERS cap.
+    # Previously each symbol created its own pool → effective S1 = N_symbols × S1.
+    shared_s1_pool = ThreadPoolExecutor(
+        max_workers=max(1, STAGE1_PARALLEL_WORKERS),
+        thread_name_prefix="s1",
+    )
+
     # Progress tracking
-    total_symbols  = len(symbols)
+    total_symbols  = [len(symbols)]  # list so workers see updates
     done_count     = [0]  # mutable counter shared across threads
     done_lock      = threading.Lock()
 
@@ -1212,8 +1337,24 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
         with semaphore:
             # Each worker gets its own DB connection (thread-safe)
             w_conn = get_conn()
+            # Mark symbol as actively processing (best-effort; ignore if table missing)
             try:
-                result = _process_symbol(w_conn, main_client, summary_client, sym, single_model_mode)
+                with w_conn.cursor() as _ac:
+                    _ac.execute(
+                        "INSERT INTO active_processing (symbol_id, worker_id, started_at) "
+                        "VALUES (%s, %s, NOW()) "
+                        "ON CONFLICT (symbol_id) DO UPDATE SET started_at = NOW()",
+                        (sym["id"], threading.current_thread().name),
+                    )
+                w_conn.commit()
+            except Exception as e:
+                logger.debug(f"[active_processing] insert failed: {e}")
+                w_conn.rollback()
+            try:
+                result = _process_symbol(
+                    w_conn, main_client, summary_client, sym,
+                    single_model_mode, s1_pool=shared_s1_pool,
+                )
             except Exception as e:
                 logger.error(f"[{sym['symbol']}] Unhandled error: {e}", exc_info=True)
                 try:
@@ -1222,13 +1363,23 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
                     pass
                 result = {"symbol": sym["symbol"], "scored": 0, "skipped": 0}
             finally:
+                # Clear active marker + remove from priority_queue if it was queued
+                try:
+                    with w_conn.cursor() as _ac:
+                        _ac.execute("DELETE FROM active_processing WHERE symbol_id = %s", (sym["id"],))
+                        _ac.execute("DELETE FROM priority_queue   WHERE symbol_id = %s", (sym["id"],))
+                    w_conn.commit()
+                except Exception as e:
+                    logger.debug(f"[active_processing] cleanup failed: {e}")
+                    try: w_conn.rollback()
+                    except Exception: pass
                 w_conn.close()
 
             with done_lock:
                 done_count[0] += 1
-                pct = done_count[0] / total_symbols * 100
+                pct = done_count[0] / total_symbols[0] * 100
                 print(
-                    f"  [{done_count[0]:>{len(str(total_symbols))}}/{total_symbols}] "
+                    f"  [{done_count[0]:>{len(str(total_symbols[0]))}}/{total_symbols[0]}] "
                     f"({pct:5.1f}%)  {sym['symbol']:10s}  "
                     f"scored={result.get('scored',0)}  "
                     f"skipped={result.get('skipped',0)}",
@@ -1238,29 +1389,136 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
 
     conn.close()  # main conn no longer needed — workers use their own
 
-    print(f"\n  Scoring {total_symbols} symbols with {n_workers} parallel worker(s)...\n")
+    print(f"\n  Scoring {total_symbols[0]} symbols with {n_workers} parallel worker(s)...\n")
 
     results      = []
-    total_scored = 0
+    total_scored = [0]
+    results_lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_worker, sym): sym for sym in symbols}
-        for future in as_completed(futures):
+    # Build initial worklist from the priority-aware fetcher
+    worklist: list[dict] = list(symbols)
+    worklist_lock = threading.Lock()
+    seen_ids: set[int] = {s["id"] for s in worklist}
+    work_done = threading.Event()
+
+    def _next_symbol() -> dict | None:
+        """Pop the highest-priority symbol off the worklist.
+
+        Priority order: any symbol present in `priority_queue` table (by rank),
+        then everything else. Re-reads priority_queue each call so freshly
+        rescored symbols jump the line.
+        """
+        with worklist_lock:
+            if not worklist:
+                return None
+            # Read priority order from DB
             try:
-                r = future.result()
+                _c = get_conn()
+                with _c.cursor() as _cur:
+                    _cur.execute("SELECT symbol_id FROM priority_queue ORDER BY rank ASC")
+                    prio_order = [r[0] for r in _cur.fetchall()]
+                _c.close()
+            except Exception:
+                prio_order = []
+            prio_set = set(prio_order)
+            # Find best symbol
+            best_idx = None
+            best_rank = float("inf")
+            for i, s in enumerate(worklist):
+                if s["id"] in prio_set:
+                    r = prio_order.index(s["id"])
+                    if r < best_rank:
+                        best_rank = r
+                        best_idx = i
+            if best_idx is None:
+                # No priority hits → return first non-priority
+                return worklist.pop(0)
+            return worklist.pop(best_idx)
+
+    def _refill():
+        """Re-read DB for newly-queued symbols (rescore additions)."""
+        try:
+            poll_conn = get_conn()
+            with poll_conn.cursor() as _pc:
+                _pc.execute("SELECT symbol_id FROM priority_queue ORDER BY rank ASC")
+                pq_ids = {r[0] for r in _pc.fetchall()}
+            new_syms = _get_symbols_with_unscored(poll_conn, exchange, 0)
+            poll_conn.close()
+        except Exception as e:
+            logger.debug(f"[priority_queue] refill failed: {e}")
+            return 0
+
+        added = 0
+        with worklist_lock:
+            worklist_ids = {s["id"] for s in worklist}
+            for s in new_syms:
+                sid = s["id"]
+                # Skip if currently queued in this run's worklist
+                if sid in worklist_ids:
+                    continue
+                # Skip if already submitted AND not a fresh priority entry
+                if sid in seen_ids and sid not in pq_ids:
+                    continue
+                # Rescore case: previously processed but now re-queued via priority.
+                # Only re-add if it actually has unscored articles AND isn't running.
+                if sid in seen_ids and sid in pq_ids:
+                    seen_ids.discard(sid)
+                worklist.append(s)
+                worklist_ids.add(sid)
+                seen_ids.add(sid)
+                added += 1
+        if added:
+            total_symbols[0] = len(seen_ids)
+            logger.debug(f"[priority_queue] +{added} symbol(s) added mid-run "
+                         f"(worklist now {len(worklist)})")
+        return added
+
+    # Background refill poller — fires every 3s
+    def _poller():
+        while not work_done.is_set():
+            time.sleep(3.0)
+            if work_done.is_set():
+                break
+            _refill()
+
+    poller_thread = threading.Thread(target=_poller, name="pq-poller", daemon=True)
+    poller_thread.start()
+
+    # Worker loop — N workers pull symbols off worklist until empty + drained
+    def _drain_worker():
+        while True:
+            sym = _next_symbol()
+            if sym is None:
+                # Worklist empty; wait briefly in case poller adds more
+                time.sleep(2.0)
+                sym = _next_symbol()
+                if sym is None:
+                    return
+            r = _worker(sym)
+            with results_lock:
                 results.append(r)
-                total_scored += r.get("scored", 0)
-            except Exception as e:
-                logger.error(f"[run] Future raised: {e}", exc_info=True)
+                total_scored[0] += r.get("scored", 0)
+
+    drain_threads = []
+    for i in range(n_workers):
+        t = threading.Thread(target=_drain_worker, name=f"drain-{i}", daemon=False)
+        t.start()
+        drain_threads.append(t)
+
+    for t in drain_threads:
+        t.join()
+
+    work_done.set()
+    shared_s1_pool.shutdown(wait=True)
 
     duration = (datetime.now(timezone.utc) - started_at).total_seconds()
-    print(f"\n  Done — symbols={len(results)}, articles_scored={total_scored}, "
+    print(f"\n  Done — symbols={len(results)}, articles_scored={total_scored[0]}, "
           f"duration={duration:.1f}s\n")
     logger.info(f"[sentiment_scoring] Done — symbols={len(results)}, "
-                f"articles_scored={total_scored}, duration={duration:.1f}s")
+                f"articles_scored={total_scored[0]}, duration={duration:.1f}s")
     return {
         "symbols_processed": len(results),
-        "articles_scored":   total_scored,
+        "articles_scored":   total_scored[0],
         "duration_s":        round(duration, 1),
     }
 

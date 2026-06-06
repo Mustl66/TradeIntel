@@ -32,7 +32,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import DB_CONFIG
 
 from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
+import asyncio
+import select as _stdlib_select
 import uvicorn
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,38 @@ def _ensure_priority_queue_table():
                     added_at  TIMESTAMP DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS active_processing (
+                    symbol_id  INT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+                    worker_id  TEXT,
+                    started_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS active_article (
+                    article_id INT PRIMARY KEY REFERENCES news_articles(id) ON DELETE CASCADE,
+                    symbol_id  INT,
+                    stage      SMALLINT NOT NULL DEFAULT 1,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("ALTER TABLE active_article ADD COLUMN IF NOT EXISTS stage SMALLINT NOT NULL DEFAULT 1")
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS active_article_symbol_idx
+                ON active_article (symbol_id)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scoring_events (
+                    id         BIGSERIAL PRIMARY KEY,
+                    kind       TEXT NOT NULL,
+                    symbol_id  INT,
+                    scored_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS scoring_events_kind_time_idx
+                ON scoring_events (kind, scored_at DESC)
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -72,6 +106,8 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+<script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/sse.js"></script>
+<script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
@@ -267,11 +303,18 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
   }}
 </style>
 </head>
-<body>
+<body hx-ext="morph">
 <div class="header">
   <h1>TradeIntel</h1>
   <span class="badge">RSS MANAGER</span>
   <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+    <div id="throughput-badge"
+         hx-get="/throughput"
+         hx-trigger="load, every 10s"
+         hx-swap="innerHTML"
+         style="display:inline-flex">
+      <span style="color:#475569;font-size:11px">loading capacity…</span>
+    </div>
     <button
       hx-get="/market-research"
       hx-target="#feed-panel"
@@ -393,7 +436,7 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       }}
     </script>
     <div class="panel-body" id="sym-list"
-      hx-get="/symbols" hx-trigger="load, every 30s" hx-target="#sym-list" hx-swap="innerHTML"
+      hx-get="/symbols" hx-trigger="load, every 120s" hx-target="#sym-list" hx-swap="morph:innerHTML"
       hx-include="#sym-search, #sym-filter, #sym-sort">
       <div class="empty-state"><span class="spinner"></span></div>
     </div>
@@ -2313,6 +2356,13 @@ async def symbol_rescore(sym_id: int):
       <div style="color:#94a3b8;font-size:0.9rem">{articles_cleared} articles cleared · queued as priority #1</div>
       <div style="margin-top:16px;color:#64748b;font-size:0.8rem">Will run next on the active/next sentiment scoring pass.</div>
       <button
+        hx-get="/priority-panel"
+        hx-target="#feed-panel"
+        hx-swap="innerHTML"
+        style="margin-top:14px;background:#7c3aed;border:1px solid #a855f7;color:#fff;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:8px">
+        👁 View Queue
+      </button>
+      <button
         hx-get="/symbol/{sym_id}/intel"
         hx-target="#feed-panel"
         hx-swap="innerHTML"
@@ -2476,70 +2526,623 @@ async def priority_toggle(sym_id: int, q: str = "", filter: str = "all", sort: s
     return await symbols(q=q, filter=filter, sort=sort)
 
 
-@app.get("/priority-panel", response_class=HTMLResponse)
-async def priority_panel():
+@app.get("/priority-strip", response_class=HTMLResponse)
+async def priority_strip():
+    """Compact always-visible status strip: active (green) + next-in-line."""
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            try:
+                cur.execute("""
+                    SELECT ap.symbol_id, ap.started_at, s.symbol
+                    FROM active_processing ap
+                    JOIN symbols s ON s.id = ap.symbol_id
+                    ORDER BY ap.started_at ASC
+                """)
+                active = cur.fetchall()
+            except Exception:
+                active = []
             cur.execute("""
-                SELECT pq.rank, pq.symbol_id, s.symbol, s.company_name,
-                       COUNT(na.id) FILTER (WHERE na.sentiment_score IS NULL) AS unscored,
-                       COUNT(na.id) AS total_articles
+                SELECT pq.symbol_id, pq.rank, s.symbol
                 FROM priority_queue pq
                 JOIN symbols s ON s.id = pq.symbol_id
-                LEFT JOIN news_articles na ON na.symbol_id = pq.symbol_id
-                GROUP BY pq.rank, pq.symbol_id, s.symbol, s.company_name
                 ORDER BY pq.rank ASC
+                LIMIT 10
             """)
-            rows = cur.fetchall()
+            pending = cur.fetchall()
     finally:
         conn.close()
 
-    if not rows:
-        queue_html = '<div style="color:#475569;font-size:13px;padding:20px;text-align:center">No symbols in priority queue.<br>Click ⭐ next to any symbol in the list to add it.</div>'
+    active_html = ""
+    if active:
+        chips = "".join(
+            f'<span style="background:#052e16;color:#4ade80;border:1px solid #14532d;'
+            f'padding:2px 8px;border-radius:99px;margin-right:6px;font-weight:700">'
+            f'▶ {r["symbol"]}</span>'
+            for r in active
+        )
+        active_html = f'<span style="color:#4ade80;margin-right:8px">PROCESSING ({len(active)}):</span>{chips}'
     else:
-        queue_html = ""
-        for r in rows:
-            queue_html += f"""
-            <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid #1e2535">
-              <span class="prio-rank">#{r['rank']}</span>
-              <div style="flex:1">
-                <span style="font-weight:700;color:#60a5fa;font-size:14px">{r['symbol']}</span>
-                <span style="color:#64748b;font-size:12px;margin-left:8px">{r['company_name'] or ''}</span>
-              </div>
-              <span style="font-size:11px;color:#475569">{r['unscored']} unscored / {r['total_articles']} total</span>
-              <button
-                class="btn btn-danger"
-                style="font-size:11px;padding:3px 9px"
-                hx-post="/priority/toggle/{r['symbol_id']}"
-                hx-target="#feed-panel"
-                hx-swap="innerHTML"
-                hx-vals='{{"filter":"priority"}}'
-              >Remove</button>
-            </div>"""
+        active_html = '<span style="color:#475569;margin-right:12px">idle</span>'
 
+    pending_html = ""
+    if pending:
+        chips = "".join(
+            f'<span style="background:#1e293b;color:#cbd5e1;border:1px solid #334155;'
+            f'padding:2px 8px;border-radius:99px;margin-right:4px">'
+            f'#{r["rank"]} {r["symbol"]}</span>'
+            for r in pending
+        )
+        pending_html = f'<span style="color:#fbbf24;margin:0 8px">NEXT:</span>{chips}'
+    else:
+        pending_html = '<span style="color:#475569">queue empty</span>'
+
+    return HTMLResponse(
+        f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">'
+        f'{active_html}{pending_html}'
+        f'<button hx-get="/priority-panel" hx-target="#feed-panel" hx-swap="innerHTML" '
+        f'style="margin-left:auto;background:#1e293b;border:1px solid #fbbf24;color:#fcd34d;'
+        f'padding:3px 10px;border-radius:6px;cursor:pointer;font-size:11px">'
+        f'👁 Open Full Queue</button>'
+        f'</div>'
+    )
+
+
+def _build_active_news_inner() -> str:
+    """Render the active-news header+body (inner HTML, no outer wrapper)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            try:
+                cur.execute("""
+                    SELECT aa.article_id, aa.stage,
+                           EXTRACT(EPOCH FROM (NOW() - aa.started_at))::int AS elapsed_s,
+                           s.symbol, s.id AS symbol_id,
+                           na.title, na.published_at
+                    FROM active_article aa
+                    JOIN symbols s ON s.id = aa.symbol_id
+                    LEFT JOIN news_articles na ON na.id = aa.article_id
+                    ORDER BY aa.stage DESC, aa.started_at ASC
+                LIMIT 40
+                """)
+                rows = cur.fetchall()
+            except Exception:
+                conn.rollback()
+                rows = []
+    finally:
+        conn.close()
+
+    def _fmt(s):
+        if s < 60: return f"{s}s"
+        if s < 3600: return f"{s // 60}m {s % 60}s"
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+
+    n_s1 = sum(1 for r in rows if (r["stage"] or 1) == 1)
+    n_s2 = sum(1 for r in rows if (r["stage"] or 1) == 2)
+
+    if not rows:
+        body = ('<div style="color:#475569;font-size:12px;padding:14px 16px;'
+                'text-align:center;font-style:italic">No articles currently on the LLM.</div>')
+    else:
+        items = []
+        for r in rows:
+            stage = r["stage"] or 1
+            secs = max(0, r["elapsed_s"] or 0)
+            title = (r["title"] or "(no title)")[:120]
+            pub = r["published_at"].strftime("%Y-%m-%d") if r["published_at"] else "—"
+            if stage == 1:
+                badge = ('<span style="background:#b45309;color:#fef3c7;font-weight:800;'
+                         'font-size:10px;padding:2px 7px;border-radius:10px;min-width:78px;text-align:center">'
+                         f'☀ S1 · {_fmt(secs)}</span>')
+                bg = "background:#451a03;border-left:3px solid #fbbf24"
+                title_col = "#fcd34d"
+            else:
+                badge = ('<span style="background:#16a34a;color:#052e16;font-weight:800;'
+                         'font-size:10px;padding:2px 7px;border-radius:10px;min-width:78px;text-align:center">'
+                         f'▶ S2 · {_fmt(secs)}</span>')
+                bg = "background:#052e16;border-left:3px solid #4ade80"
+                title_col = "#4ade80"
+            items.append(
+                f'<div style="display:flex;align-items:center;gap:10px;padding:7px 14px;'
+                f'border-bottom:1px solid #1a2133;{bg}">'
+                f'{badge}'
+                f'<span style="color:#60a5fa;font-weight:700;font-size:12px;min-width:64px">{r["symbol"]}</span>'
+                f'<span style="color:#475569;font-size:10px;min-width:80px">{pub}</span>'
+                f'<span style="color:{title_col};font-size:12px;flex:1;overflow:hidden;'
+                f'text-overflow:ellipsis;white-space:nowrap" title="{title}">{title}</span>'
+                f'</div>'
+            )
+        body = ('<div style="max-height:65vh;min-height:300px;overflow-y:auto">'
+                + "".join(items) + '</div>')
+
+    header = (f'<div style="padding:10px 16px;background:#0b1220;border-bottom:1px solid #1e2535;'
+              f'font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;'
+              f'display:flex;align-items:center;gap:10px">'
+              f'<span>🧠 News on the LLM right now</span>'
+              f'<span style="color:#fbbf24">☀ {n_s1} S1</span>'
+              f'<span style="color:#4ade80">▶ {n_s2} S2</span>'
+              f'<span style="margin-left:auto;color:#22c55e;font-weight:400">● live</span>'
+              f'</div>')
+    return header + body
+
+
+@app.get("/active-news", response_class=HTMLResponse)
+async def active_news_panel():
+    """Live view of every article currently on the LLM (fallback polling endpoint)."""
+    inner = _build_active_news_inner()
+    return HTMLResponse(
+        f'<div id="active-news-panel" hx-ext="sse" sse-connect="/active-news/stream" '
+        f'sse-swap="active-news" hx-swap="morph:innerHTML" '
+        f'style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow:hidden;margin-bottom:14px">'
+        f'{inner}</div>'
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE bus — PostgreSQL LISTEN/NOTIFY → in-process asyncio fanout
+# ─────────────────────────────────────────────────────────────────────────────
+_sse_subscribers: "set[asyncio.Queue]" = set()
+
+
+def _pg_listen_thread(loop: asyncio.AbstractEventLoop) -> None:
+    """Background thread: LISTEN on active_article_changed, push to each queue."""
+    import psycopg2.extensions
+    while True:
+        try:
+            conn = get_conn()
+            conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+            with conn.cursor() as cur:
+                cur.execute("LISTEN active_article_changed")
+            logger.info("[sse] LISTEN active_article_changed ready")
+            while True:
+                if _stdlib_select.select([conn], [], [], 30) == ([], [], []):
+                    continue  # heartbeat tick
+                conn.poll()
+                fired = False
+                while conn.notifies:
+                    conn.notifies.pop(0)
+                    fired = True
+                if fired:
+                    for q in list(_sse_subscribers):
+                        try:
+                            loop.call_soon_threadsafe(q.put_nowait, "tick")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"[sse] LISTEN thread crashed, retry in 5s: {e}")
+            try: conn.close()
+            except Exception: pass
+            import time as _t; _t.sleep(5)
+
+
+@app.on_event("startup")
+async def _start_sse_bus():
+    import threading
+    loop = asyncio.get_event_loop()
+    t = threading.Thread(target=_pg_listen_thread, args=(loop,), daemon=True)
+    t.start()
+
+
+@app.get("/active-news/stream")
+async def active_news_stream(request: Request):
+    """SSE endpoint: pushes rendered active-news HTML on every active_article change."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+    _sse_subscribers.add(queue)
+
+    async def event_gen():
+        try:
+            # Send initial snapshot immediately
+            html = _build_active_news_inner().replace("\n", "")
+            yield f"event: active-news\ndata: {html}\n\n"
+            last_push = asyncio.get_event_loop().time()
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=15)
+                    # Coalesce: drain any extra pending events for ~150ms
+                    await asyncio.sleep(0.15)
+                    while not queue.empty():
+                        try: queue.get_nowait()
+                        except Exception: break
+                    html = _build_active_news_inner().replace("\n", "")
+                    yield f"event: active-news\ndata: {html}\n\n"
+                    last_push = asyncio.get_event_loop().time()
+                except asyncio.TimeoutError:
+                    # Heartbeat: keeps proxies + browser from closing the connection
+                    yield ": ping\n\n"
+        finally:
+            _sse_subscribers.discard(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/symbol-articles/{sym_id}", response_class=HTMLResponse)
+async def symbol_articles_for_queue(sym_id: int):
+    """Per-symbol article list with live status: ▶ running / ✓ scored / ⏳ pending."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Currently-running articles for this symbol (with stage)
+            try:
+                cur.execute("""
+                    SELECT article_id, stage,
+                           EXTRACT(EPOCH FROM (NOW() - started_at))::int AS elapsed_s
+                    FROM active_article WHERE symbol_id = %s
+                """, (sym_id,))
+                active_arts = {r["article_id"]: (r["stage"] or 1, max(0, r["elapsed_s"] or 0))
+                               for r in cur.fetchall()}
+            except Exception:
+                conn.rollback()
+                active_arts = {}
+
+            cur.execute("""
+                SELECT id, title, published_at, sentiment_score
+                FROM news_articles
+                WHERE symbol_id = %s
+                ORDER BY
+                    CASE WHEN sentiment_score IS NULL THEN 0 ELSE 1 END,
+                    published_at DESC NULLS LAST
+                LIMIT 200
+            """, (sym_id,))
+            articles = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not articles:
+        return HTMLResponse('<div style="padding:10px 16px;color:#475569;font-size:12px;font-style:italic">No articles for this symbol.</div>')
+
+    def _fmt_elapsed(s):
+        if s < 60: return f"{s}s"
+        if s < 3600: return f"{s // 60}m {s % 60}s"
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+
+    rows = []
+    for a in articles:
+        aid = a["id"]
+        title = (a["title"] or "(no title)")[:140]
+        pub = a["published_at"].strftime("%Y-%m-%d") if a["published_at"] else "—"
+        if aid in active_arts:
+            stage, secs = active_arts[aid]
+            if stage == 1:
+                status = (f'<span style="background:#b45309;color:#fef3c7;font-weight:800;'
+                          f'font-size:10px;padding:2px 7px;border-radius:10px">'
+                          f'☀ S1 summarize · {_fmt_elapsed(secs)}</span>')
+                bg = "background:#451a03;border-left:3px solid #fbbf24"
+                title_col = "#fcd34d"
+            else:
+                status = (f'<span style="background:#16a34a;color:#052e16;font-weight:800;'
+                          f'font-size:10px;padding:2px 7px;border-radius:10px">'
+                          f'▶ S2 score · {_fmt_elapsed(secs)}</span>')
+                bg = "background:#052e16;border-left:3px solid #4ade80"
+                title_col = "#4ade80"
+        elif a["sentiment_score"] is not None:
+            sc = float(a["sentiment_score"])
+            sc_col = "#4ade80" if sc > 0.05 else ("#f87171" if sc < -0.05 else "#94a3b8")
+            status = (f'<span style="background:#1e293b;color:#94a3b8;font-size:10px;'
+                      f'padding:2px 7px;border-radius:10px">✓ scored '
+                      f'<span style="color:{sc_col};font-weight:700">{sc:+.2f}</span></span>')
+            bg = "background:#0f1825"
+            title_col = "#94a3b8"
+        else:
+            status = ('<span style="background:#1a2133;color:#64748b;font-size:10px;'
+                      'padding:2px 7px;border-radius:10px">⏳ pending</span>')
+            bg = "background:#0b1220"
+            title_col = "#cbd5e1"
+
+        rows.append(
+            f'<div style="display:flex;align-items:center;gap:10px;padding:6px 14px;'
+            f'border-bottom:1px solid #1a2133;{bg}">'
+            f'<span style="min-width:80px">{status}</span>'
+            f'<span style="color:#475569;font-size:10px;min-width:75px">{pub}</span>'
+            f'<span style="color:{title_col};font-size:12px;flex:1;overflow:hidden;'
+            f'text-overflow:ellipsis;white-space:nowrap" title="{title}">{title}</span>'
+            f'</div>'
+        )
+
+    n_s1 = sum(1 for st, _ in active_arts.values() if st == 1)
+    n_s2 = sum(1 for st, _ in active_arts.values() if st == 2)
+    n_scored = sum(1 for a in articles if a["sentiment_score"] is not None and a["id"] not in active_arts)
+    n_pending = len(articles) - n_s1 - n_s2 - n_scored
+    header = (f'<div style="display:flex;align-items:center;gap:10px;padding:6px 14px;'
+              f'background:#0b1220;border-bottom:1px solid #1e2535;font-size:10px;color:#64748b">'
+              f'<span style="color:#fbbf24">☀ {n_s1} S1</span>'
+              f'<span style="color:#4ade80">▶ {n_s2} S2</span>'
+              f'<span style="color:#94a3b8">✓ {n_scored} done</span>'
+              f'<span style="color:#64748b">⏳ {n_pending} pending</span>'
+              f'<span style="margin-left:auto">auto-refresh 4s</span>'
+              f'</div>')
+
+    return HTMLResponse(
+        f'{header}'
+        f'<div style="max-height:280px;overflow-y:auto">{"".join(rows)}</div>'
+    )
+
+
+@app.get("/throughput", response_class=HTMLResponse)
+async def throughput_badge():
+    """Header badge: rolling articles/hr + symbols/hr from scoring_events.
+
+    EMA-style: rate = N_events / hours_span over the most recent N events.
+    Sample size grows with traffic → estimate stabilizes over time.
+    Confidence = clamp(N / 200, 0, 1).
+    """
+    SAMPLE_N = 200
+    MIN_SPAN_S = 30  # avoid divide-by-zero on bursty very-fresh data
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            stats = {}
+            for kind in ("article", "symbol"):
+                cur.execute("""
+                    SELECT scored_at
+                    FROM scoring_events
+                    WHERE kind = %s AND scored_at >= NOW() - INTERVAL '24 hours'
+                    ORDER BY scored_at DESC
+                    LIMIT %s
+                """, (kind, SAMPLE_N))
+                rows = cur.fetchall()
+                n = len(rows)
+                if n < 2:
+                    stats[kind] = {"rate": None, "n": n}
+                    continue
+                newest = rows[0][0]
+                oldest = rows[-1][0]
+                span_s = max(MIN_SPAN_S, (newest - oldest).total_seconds())
+                # rate per hour = (n events) / (span in hours)
+                rate = n / (span_s / 3600.0)
+                stats[kind] = {"rate": rate, "n": n}
+
+            # Tier label (best-effort import)
+            tier_label = ""
+            try:
+                import config as _cfg
+                tier_label = f"T{getattr(_cfg, 'ACTIVE_TIER', '?')}"
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    def _fmt(s):
+        if s["rate"] is None:
+            return f'<span style="color:#475569">— /h (n={s["n"]})</span>'
+        rate = s["rate"]
+        n = s["n"]
+        conf = min(1.0, n / SAMPLE_N)
+        # confidence dot color: red <30%, yellow <70%, green ≥70%
+        if conf < 0.3:
+            dot = "#ef4444"
+        elif conf < 0.7:
+            dot = "#fbbf24"
+        else:
+            dot = "#4ade80"
+        rate_str = f"{int(rate):,}" if rate >= 10 else f"{rate:.1f}"
+        return (f'<span style="color:#e2e8f0;font-weight:700">{rate_str}</span>'
+                f'<span style="color:#64748b">/h</span> '
+                f'<span style="color:{dot};font-size:9px">●</span>'
+                f'<span style="color:#475569;font-size:10px"> n={n}</span>')
+
+    art_html = _fmt(stats["article"])
+    sym_html = _fmt(stats["symbol"])
+    tier_html = (f'<span style="background:#1e293b;color:#a5b4fc;padding:2px 8px;'
+                 f'border-radius:99px;font-size:10px;font-weight:700;margin-right:8px">'
+                 f'{tier_label}</span>') if tier_label else ""
+
+    return HTMLResponse(
+        f'<div style="display:inline-flex;align-items:center;gap:14px;'
+        f'background:#0b1220;border:1px solid #1e293b;border-radius:8px;'
+        f'padding:5px 12px;font-size:11px;color:#94a3b8">'
+        f'{tier_html}'
+        f'<span title="Articles scored per hour (rolling sample)">📄 {art_html}</span>'
+        f'<span style="color:#1e293b">│</span>'
+        f'<span title="Symbols completed per hour (rolling sample)">📊 {sym_html}</span>'
+        f'</div>'
+    )
+
+
+@app.get("/priority-panel", response_class=HTMLResponse)
+async def priority_panel():
+    queue_inner = _build_queue_wrap_html()
     return HTMLResponse(f"""
-    <div style="padding:20px">
+    <div id="active-news-wrap" hx-get="/active-news" hx-trigger="load" hx-target="this" hx-swap="outerHTML"
+         style="margin:20px 20px 0 20px">
+      <div style="color:#475569;font-size:12px;padding:14px 16px;text-align:center">Loading live LLM activity…</div>
+    </div>
+    <div id="queue-poll-wrap" style="padding:20px"
+         hx-get="/priority-panel-rows"
+         hx-trigger="every 15s"
+         hx-target="this"
+         hx-swap="morph:innerHTML">
+      {queue_inner}
+    </div>
+    """)
+
+
+@app.get("/priority-panel-rows", response_class=HTMLResponse)
+async def priority_panel_rows():
+    return HTMLResponse(_build_queue_wrap_html())
+
+
+def _build_queue_wrap_html() -> str:
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Currently-running set + elapsed (compute on DB to avoid TZ skew)
+            try:
+                cur.execute("""
+                    SELECT ap.symbol_id,
+                           EXTRACT(EPOCH FROM (NOW() - ap.started_at))::int AS elapsed_s
+                    FROM active_processing ap
+                """)
+                active_map = {r["symbol_id"]: max(0, r["elapsed_s"] or 0) for r in cur.fetchall()}
+            except Exception:
+                conn.rollback()
+                active_map = {}
+
+            # Manual priority queue (rescore-injected entries get rank 1, 2, …)
+            cur.execute("""
+                SELECT symbol_id, rank
+                FROM priority_queue
+                ORDER BY rank ASC
+            """)
+            prio_rows = cur.fetchall()
+            prio_rank = {r["symbol_id"]: r["rank"] for r in prio_rows}
+
+            # Full worklist — every symbol with at least one unscored article
+            cur.execute("""
+                SELECT s.id AS symbol_id, s.symbol, s.company_name,
+                       COUNT(na.id) FILTER (WHERE na.sentiment_score IS NULL) AS unscored,
+                       COUNT(na.id) AS total_articles
+                FROM symbols s
+                JOIN news_articles na ON na.symbol_id = s.id
+                WHERE s.status = TRUE
+                GROUP BY s.id, s.symbol, s.company_name
+                HAVING COUNT(na.id) FILTER (WHERE na.sentiment_score IS NULL) > 0
+            """)
+            worklist = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Order: ACTIVE first (longest-running on top), then PRIORITY queue, then rest (alpha)
+    def _sort_key(r):
+        sid = r["symbol_id"]
+        if sid in active_map:
+            return (0, -active_map[sid], r["symbol"])
+        if sid in prio_rank:
+            return (1, prio_rank[sid], r["symbol"])
+        return (2, 0, r["symbol"])
+
+    worklist.sort(key=_sort_key)
+
+    # Cap visible rows hard — 3000+ <details> nodes kill the browser.
+    PENDING_LIMIT = 50
+    n_active_total = sum(1 for r in worklist if r["symbol_id"] in active_map)
+    n_prio_total = sum(1 for r in worklist if r["symbol_id"] in prio_rank
+                       and r["symbol_id"] not in active_map)
+    n_truncated = max(0, len(worklist) - n_active_total - n_prio_total - PENDING_LIMIT)
+    visible = []
+    pending_seen = 0
+    for r in worklist:
+        sid = r["symbol_id"]
+        if sid in active_map or sid in prio_rank:
+            visible.append(r)
+        elif pending_seen < PENDING_LIMIT:
+            visible.append(r)
+            pending_seen += 1
+    worklist = visible
+
+    rows_html = []
+    for i, r in enumerate(worklist, start=1):
+        sid = r["symbol_id"]
+        is_active = sid in active_map
+        prio = prio_rank.get(sid)
+        if is_active:
+            secs = active_map[sid]
+            if secs < 60:
+                elapsed = f"⏱ {secs}s"
+            elif secs < 3600:
+                elapsed = f"⏱ {secs // 60}m {secs % 60}s"
+            else:
+                elapsed = f"⏱ {secs // 3600}h {(secs % 3600) // 60}m"
+            rows_html.append(f"""
+            <details id="qrow-{sid}" style="border-bottom:1px solid #14532d;background:#052e16">
+              <summary style="display:flex;align-items:center;gap:12px;padding:8px 14px;cursor:pointer;list-style:none">
+                <span style="background:#16a34a;color:#052e16;font-weight:800;font-size:10px;padding:2px 7px;border-radius:10px;min-width:60px;text-align:center">▶ RUNNING</span>
+                <div style="flex:1">
+                  <span style="font-weight:700;color:#4ade80;font-size:13px">{r['symbol']}</span>
+                  <span style="color:#64748b;font-size:11px;margin-left:8px">{r['company_name'] or ''}</span>
+                </div>
+                <span style="font-size:11px;color:#86efac">{elapsed}</span>
+                <span style="font-size:11px;color:#64748b;min-width:90px;text-align:right">{r['unscored']} / {r['total_articles']}</span>
+                <span style="color:#475569;font-size:10px">▾</span>
+              </summary>
+              <div hx-get="/symbol-articles/{sid}" hx-trigger="click once from:previous summary, every 5s from:previous summary[aria-expanded='true']" hx-target="this" hx-swap="morph:innerHTML"
+                   style="background:#0b1220;border-top:1px solid #14532d">
+                <div style="padding:10px 16px;color:#475569;font-size:11px">Loading…</div>
+              </div>
+            </details>""")
+        elif prio is not None:
+            rows_html.append(f"""
+            <details id="qrow-{sid}" style="border-bottom:1px solid #1e2535;background:#1a1530">
+              <summary style="display:flex;align-items:center;gap:12px;padding:8px 14px;cursor:pointer;list-style:none">
+                <span style="background:#451a03;color:#fbbf24;font-weight:800;font-size:10px;padding:2px 7px;border-radius:10px;min-width:60px;text-align:center">⭐ #{prio}</span>
+                <div style="flex:1">
+                  <span style="font-weight:700;color:#fcd34d;font-size:13px">{r['symbol']}</span>
+                  <span style="color:#64748b;font-size:11px;margin-left:8px">{r['company_name'] or ''}</span>
+                </div>
+                <span style="font-size:11px;color:#64748b;min-width:90px;text-align:right">{r['unscored']} / {r['total_articles']}</span>
+                <span style="color:#475569;font-size:10px">▾</span>
+              </summary>
+              <div hx-get="/symbol-articles/{sid}" hx-trigger="click once from:previous summary, every 5s from:previous summary[aria-expanded='true']" hx-target="this" hx-swap="morph:innerHTML"
+                   style="background:#0b1220;border-top:1px solid #1e2535">
+                <div style="padding:10px 16px;color:#475569;font-size:11px">Loading…</div>
+              </div>
+            </details>""")
+        else:
+            rows_html.append(f"""
+            <details id="qrow-{sid}" style="border-bottom:1px solid #1e2535">
+              <summary style="display:flex;align-items:center;gap:12px;padding:8px 14px;cursor:pointer;list-style:none">
+                <span style="color:#475569;font-size:11px;font-weight:700;min-width:60px;text-align:center">#{i}</span>
+                <div style="flex:1">
+                  <span style="font-weight:600;color:#cbd5e1;font-size:13px">{r['symbol']}</span>
+                  <span style="color:#475569;font-size:11px;margin-left:8px">{r['company_name'] or ''}</span>
+                </div>
+                <span style="font-size:11px;color:#475569;min-width:90px;text-align:right">{r['unscored']} / {r['total_articles']}</span>
+                <span style="color:#475569;font-size:10px">▾</span>
+              </summary>
+              <div hx-get="/symbol-articles/{sid}" hx-trigger="click once from:previous summary, every 5s from:previous summary[aria-expanded='true']" hx-target="this" hx-swap="morph:innerHTML"
+                   style="background:#0b1220;border-top:1px solid #1e2535">
+                <div style="padding:10px 16px;color:#475569;font-size:11px">Loading…</div>
+              </div>
+            </details>""")
+
+    if not rows_html:
+        rows_html = ['<div style="color:#475569;font-size:13px;padding:20px;text-align:center">No symbols with unscored articles.</div>']
+
+    n_active = len(active_map)
+    n_total = n_active_total + n_prio_total + PENDING_LIMIT + n_truncated
+    n_shown = len(worklist)
+    trunc_html = (f' <span style="color:#fbbf24;font-size:11px">(showing {n_shown} of {n_total} — {n_truncated} hidden)</span>'
+                  if n_truncated else '')
+
+    return f"""
+    <div id="queue-poll-wrap-inner">
       <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
-        <h2 style="margin:0;color:#fcd34d;font-size:18px">⭐ Priority Queue</h2>
-        <span style="background:#451a0344;color:#fbbf24;border:1px solid #b4530966;padding:3px 10px;border-radius:12px;font-size:12px">{len(rows)} symbols</span>
+        <h2 style="margin:0;color:#fcd34d;font-size:18px">⚡ Processing Queue</h2>
+        <span style="background:#052e1644;color:#4ade80;border:1px solid #16a34a66;padding:3px 10px;border-radius:12px;font-size:12px">{n_active} running</span>
+        <span style="background:#1a253344;color:#cbd5e1;border:1px solid #33415566;padding:3px 10px;border-radius:12px;font-size:12px">{n_total} total in line</span>{trunc_html}
+        <span style="margin-left:auto;color:#475569;font-size:11px">auto-refresh 15s</span>
         <button
           hx-post="/priority/clear"
           hx-target="#feed-panel"
           hx-swap="innerHTML"
-          hx-confirm="Reset entire priority queue?"
+          hx-confirm="Reset manual priority queue? (Does not affect normal scoring queue.)"
           class="btn btn-danger"
-          style="margin-left:auto;font-size:12px"
-        >🗑 Reset All Priority</button>
+          style="font-size:12px"
+        >🗑 Reset Priority</button>
       </div>
-      <div style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow:hidden">
-        <div style="padding:10px 16px;background:#1a2133;border-bottom:1px solid #1e2535;font-size:11px;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">
-          These symbols will be scored first on the next (and current) sentiment scoring run, in rank order.
+
+      <div id="queue-rows-list" style="background:#161b27;border:1px solid #1e2535;border-radius:10px;overflow:hidden">
+        <div style="padding:10px 16px;background:#1a2133;border-bottom:1px solid #1e2535;font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;gap:8px">
+          <span>Full queue (top → bottom = scoring order)</span>
+          <span style="color:#4ade80;font-weight:600">■ green = running now</span>
+          <span style="color:#fcd34d;font-weight:600">■ yellow = manual priority</span>
         </div>
-        {queue_html}
+        <div style="max-height:40vh;overflow-y:auto" id="queue-rows-scroll">
+        {''.join(rows_html)}
+        </div>
       </div>
     </div>
-    """)
+    """
 
 
 @app.post("/priority/clear", response_class=HTMLResponse)

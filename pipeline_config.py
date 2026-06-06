@@ -75,7 +75,13 @@ DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this man
 # When False: tv_snapshot is omitted — faster prompts, less context, blind scoring.
 INCLUDE_TV_SNAPSHOT      = False    # set False to disable TV data in LLM prompts
 
-STAGE1_PARALLEL_WORKERS  = 1       # e.g. 3 to test parallel Stage 1
+STAGE1_PARALLEL_WORKERS  = 4      # e.g. 3 to test parallel Stage 1
+# Tier override: config.py sets per-tier counts. Pull active tier value.
+try:
+    from config import STAGE1_PARALLEL_WORKERS as _S1_TIER
+    STAGE1_PARALLEL_WORKERS = _S1_TIER
+except ImportError:
+    pass
 
 # ── Stage 2 parallel workers (main LLM scoring) ───────────────────────────────
 # Stage 2 is stateful WITHIN a symbol (needs rolling master_summary) — only
@@ -83,6 +89,12 @@ STAGE1_PARALLEL_WORKERS  = 1       # e.g. 3 to test parallel Stage 1
 # Set >1 only if LM Studio handles concurrent main-model requests.
 # Set to 1 to disable (recommended until tested).
 STAGE2_PARALLEL_WORKERS  = 1       # e.g. 2 to test parallel Stage 2 across symbols
+# Tier override
+try:
+    from config import STAGE2_PARALLEL_WORKERS as _S2_TIER
+    STAGE2_PARALLEL_WORKERS = _S2_TIER
+except ImportError:
+    pass
 
 # ── Worker count detection bypass ─────────────────────────────────────────────
 # When True: skip _compute_worker_count() VRAM probe entirely.

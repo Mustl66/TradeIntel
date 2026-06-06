@@ -23,6 +23,72 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [3.1.0] – 2026-06-06 — Real-time SSE + Idiomorph live admin (no-flicker)
+
+#### Goal
+Eliminate the polling-flicker on the admin Processing Queue. Updates must feel
+instant — open dropdowns must stay open, scroll position preserved, no
+"flash → repaint" on every refresh.
+
+#### admin.py
+- **Idiomorph swap engine** — added `htmx.org/dist/ext/sse.js` + `idiomorph-ext`
+  CDN scripts; `<body hx-ext="morph">` enables it globally. All auto-refresh
+  panels switched from `outerHTML`/`innerHTML` → `morph:outerHTML`/`morph:innerHTML`:
+  - `/active-news` (now SSE-driven, see below)
+  - `/priority-panel-rows` (15s)
+  - `/symbol-articles/{sid}` dropdowns (5s when open)
+  - `/symbols` list (120s)
+- **Server-Sent Events (SSE) for live LLM activity:**
+  - New `_build_active_news_inner()` shared renderer
+  - New `/active-news/stream` SSE endpoint — pushes rendered HTML on every
+    `active_article` change, with 150ms coalescing for bursts + 15s heartbeat
+  - Background thread on FastAPI `startup` runs `LISTEN active_article_changed`
+    on a dedicated autocommit psycopg2 connection, fans out to every open
+    SSE subscriber via `asyncio.Queue` (`call_soon_threadsafe`)
+  - Auto-reconnects on PG connection loss (5s backoff)
+  - Header now shows `● live` instead of "auto-refresh 3s"
+- **Layout split for stable morphing:**
+  - `/priority-panel` now returns active-news div + queue wrap as **siblings**
+    (previously nested — caused id-collision thrash on the 15s poll)
+  - New `/priority-panel-rows` endpoint returns just the queue subtree, used
+    for the 15s morph poll → SSE-connected `#active-news-panel` no longer
+    gets ripped out of the DOM on poll
+- **Stable element ids for idiomorph diffing:**
+  - Every queue `<details>` row now has `id="qrow-{sid}"` (previously no id →
+    idiomorph fell back to positional matching, dropped rows)
+  - Added `#active-news-wrap`, `#queue-poll-wrap`, `#queue-poll-wrap-inner`,
+    `#queue-rows-list`, `#queue-rows-scroll` anchors
+- **Panel sizing:**
+  - Active-news (`🧠 News on the LLM right now`): `max-height: 65vh; min-height: 300px`
+    (was 260px) — now shows ~14+ entries before scrolling
+  - Processing Queue: `max-height: 40vh` (was 75vh) — leaves room for active-news
+
+#### pipeline/sentiment_scoring.py
+- Added `NOTIFY active_article_changed` after every INSERT/UPDATE/DELETE on
+  `active_article`:
+  - Stage 1 mark (S1 yellow)
+  - Stage 2 upgrade (S2 green)
+  - Article finished (DELETE in `_save_article_result`)
+- Pairs with admin's PG LISTEN thread → end-to-end push update typically
+  arrives in the browser within ~200ms of the pipeline event
+
+#### Effect
+- `/active-news` no longer polled (was every 5s) — zero request spam in
+  admin logs when the LLM is idle
+- One persistent SSE connection per open tab; ~1 small message per article
+  stage transition instead of ~720 polls/hr
+- Dropdowns stay open across refreshes, scroll position preserved, no
+  visible flash on update
+- Symbols list no longer disappears on 15s poll (root cause: idiomorph
+  positional-matching after id collision with the SSE-connected element)
+
+#### Files touched
+- `admin.py` (+~150 lines: SSE bus, stream endpoint, layout refactor, ids)
+- `pipeline/sentiment_scoring.py` (+3 NOTIFY statements)
+- `CHANGELOG.md` (this entry)
+
+---
+
 ### [3.0.3] – 2026-05-28 — LLM Instruction JSONs + Full Scoring Schema
 
 #### config/stage1_instruction.json
