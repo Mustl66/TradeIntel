@@ -1593,7 +1593,7 @@ async def symbol_intel(sym_id: int):
 
     _score_col = "#4ade80" if (sym.get("final_score") or 0) > 0.05 else "#f87171" if (sym.get("final_score") or 0) < -0.05 else "#fbbf24"
     _macro_mult = float(sym.get("macro_multiplier") or 1.0)
-    _base_avg  = fmt(round(sym["final_score"] / (_macro_mult * ai_sector_mult), 6) if sym.get("final_score") is not None and _macro_mult != 0 and ai_sector_mult != 0 else sym.get("final_score"))
+    _base_avg  = fmt(round(float(sym["final_score"]) / (_macro_mult * ai_sector_mult), 6) if sym.get("final_score") is not None and _macro_mult != 0 and ai_sector_mult != 0 else sym.get("final_score"))
     _mult_val  = fmt(sym.get("macro_multiplier"))
     _mult_boost = fmt(round((_macro_mult-1)*100, 2)) if sym.get("macro_multiplier") else "0.00"
     _final_str = f'{sym["final_score"]:+.4f}' if sym.get("final_score") is not None else "—"
