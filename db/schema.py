@@ -295,6 +295,8 @@ def create_tables() -> None:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='symbol_master_summary') THEN ALTER TABLE symbols ADD COLUMN symbol_master_summary TEXT; END IF;
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='final_score') THEN ALTER TABLE symbols ADD COLUMN final_score NUMERIC(6,4); END IF;
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='score_updated_at') THEN ALTER TABLE symbols ADD COLUMN score_updated_at TIMESTAMPTZ; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='ai_sector_pick') THEN ALTER TABLE symbols ADD COLUMN ai_sector_pick TEXT; END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='symbols' AND column_name='ai_sector_multiplier') THEN ALTER TABLE symbols ADD COLUMN ai_sector_multiplier NUMERIC DEFAULT 1.000; END IF;
                 END$$;
             """)
 

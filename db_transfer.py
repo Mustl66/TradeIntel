@@ -16,14 +16,31 @@ import os
 import sys
 import subprocess
 import logging
+from datetime import datetime
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Change this to "save" or "load", or set TYPE env var
 TYPE = os.getenv("TYPE", "save").lower()   # "save" | "load"
 
-# Backup file location — same dir as this script
-BACKUP_FILE = Path(__file__).resolve().parent / "tradeintel_backup.sql"
+# Backup dir — created next to this script if missing
+BACKUP_DIR = Path(__file__).resolve().parent / "db_transfer"
+BACKUP_DIR.mkdir(exist_ok=True)
+
+BACKUP_NAME = "tradeintel_backup"
+
+def _new_backup_path() -> Path:
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return BACKUP_DIR / f"{BACKUP_NAME}_{date_str}.sql"
+
+def _latest_backup() -> Path | None:
+    # Allow explicit override via env
+    override = os.getenv("BACKUP_FILE")
+    if override:
+        p = Path(override)
+        return p if p.exists() else None
+    files = sorted(BACKUP_DIR.glob(f"{BACKUP_NAME}_*.sql"))
+    return files[-1] if files else None
 
 # ── Load DB creds from config ─────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -69,7 +86,8 @@ PSQL    = _find_pg_bin("psql")
 
 
 def save():
-    log.info(f"Dumping '{DBNAME}' -> {BACKUP_FILE}")
+    backup_file = _new_backup_path()
+    log.info(f"Dumping '{DBNAME}' -> {backup_file}")
     cmd = [
         PG_DUMP,
         "-h", HOST,
@@ -80,23 +98,24 @@ def save():
         "--clean",          # DROP before CREATE — safe re-import
         "--if-exists",      # no error if objects don't exist yet
         "--encoding", "UTF8",
-        "-f", str(BACKUP_FILE),
+        "-f", str(backup_file),
     ]
     result = subprocess.run(cmd, env=pg_env, capture_output=True, text=True)
     if result.returncode != 0:
         log.error(f"pg_dump failed:\n{result.stderr}")
         sys.exit(1)
-    size_mb = BACKUP_FILE.stat().st_size / (1024 * 1024)
-    log.info(f"Done. File: {BACKUP_FILE}  ({size_mb:.2f} MB)")
+    size_mb = backup_file.stat().st_size / (1024 * 1024)
+    log.info(f"Done. File: {backup_file}  ({size_mb:.2f} MB)")
     log.info("Transfer this file to the target machine, then run: TYPE=load python db_transfer.py")
 
 
 def load():
-    if not BACKUP_FILE.exists():
-        log.error(f"Backup file not found: {BACKUP_FILE}")
+    backup_file = _latest_backup()
+    if not backup_file or not backup_file.exists():
+        log.error(f"No backup file found in {BACKUP_DIR} (or BACKUP_FILE env override missing)")
         sys.exit(1)
-    size_mb = BACKUP_FILE.stat().st_size / (1024 * 1024)
-    log.info(f"Restoring '{DBNAME}' from {BACKUP_FILE}  ({size_mb:.2f} MB)")
+    size_mb = backup_file.stat().st_size / (1024 * 1024)
+    log.info(f"Restoring '{DBNAME}' from {backup_file}  ({size_mb:.2f} MB)")
     # psql runs the .sql dump (handles --clean/--if-exists DROP statements)
     cmd = [
         PSQL,
@@ -105,7 +124,7 @@ def load():
         "-U", USER,
         "-d", DBNAME,
         "--no-password",
-        "-f", str(BACKUP_FILE),
+        "-f", str(backup_file),
     ]
     result = subprocess.run(cmd, env=pg_env, capture_output=True, text=True)
     # psql exits 0 even on non-fatal errors — check stderr for real failures

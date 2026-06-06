@@ -1565,6 +1565,17 @@ async def symbol_intel(sym_id: int):
       <!-- Score breakdown -->
       {_score_breakdown}
 
+      <div style="margin-bottom:16px;text-align:right">
+        <button
+          onclick="if(!confirm('Wipe all sentiment for {sym["symbol"]} and queue as next? Cannot be undone.')) return false;"
+          hx-post="/symbol/{sym_id}/rescore"
+          hx-target="#feed-panel"
+          hx-swap="innerHTML"
+          style="background:#1e1b3b;border:1px solid #a855f7;color:#d8b4fe;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+          🔄 Redo Sentiment Scoring
+        </button>
+      </div>
+
 
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #1e2535">📊 TradingView Screener Data</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-bottom:16px">
@@ -2103,6 +2114,85 @@ def reset_scores():
       <div style="margin-top:16px;color:#64748b;font-size:0.8rem">Ready for a fresh sentiment scoring run.</div>
     </div>
     """
+
+
+@app.post("/symbol/{sym_id}/rescore", response_class=HTMLResponse)
+async def symbol_rescore(sym_id: int):
+    """Wipe sentiment for one symbol + queue it as rank #1 (runs next)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # Verify symbol exists
+            cur.execute("SELECT symbol FROM symbols WHERE id = %s", (sym_id,))
+            row = cur.fetchone()
+            if not row:
+                return HTMLResponse('<div class="empty-state">Symbol not found.</div>')
+            sym_label = row[0]
+
+            # Wipe per-article sentiment so pipeline picks them up again
+            cur.execute("""
+                UPDATE news_articles SET
+                    sentiment_score          = NULL,
+                    weighted_sentiment       = NULL,
+                    article_summary          = NULL,
+                    score_rationale          = NULL,
+                    key_events               = NULL,
+                    pre_summary_data         = NULL,
+                    master_summary_snapshot  = NULL,
+                    forecast_until_earnings  = NULL,
+                    stage2_prompt            = NULL,
+                    company_connections      = NULL
+                WHERE symbol_id = %s
+            """, (sym_id,))
+            articles_cleared = cur.rowcount
+
+            # Wipe symbol-level score
+            cur.execute("""
+                UPDATE symbols SET
+                    final_score              = NULL,
+                    score_updated_at         = NULL,
+                    symbol_master_summary    = NULL,
+                    symbol_forecast_narrative= NULL,
+                    ai_sector_pick           = NULL,
+                    ai_sector_multiplier     = 1.000
+                WHERE id = %s
+            """, (sym_id,))
+
+            # Push everyone down +1, insert this at rank 1
+            cur.execute("UPDATE priority_queue SET rank = rank + 1")
+            cur.execute("""
+                INSERT INTO priority_queue (symbol_id, rank, added_at)
+                VALUES (%s, 1, NOW())
+                ON CONFLICT (symbol_id) DO UPDATE SET rank = 1, added_at = NOW()
+            """, (sym_id,))
+            # Compact ranks (in case of duplicates from ON CONFLICT path)
+            cur.execute("""
+                WITH ranked AS (
+                    SELECT symbol_id, ROW_NUMBER() OVER (ORDER BY rank ASC, added_at ASC) AS new_rank
+                    FROM priority_queue
+                )
+                UPDATE priority_queue pq SET rank = ranked.new_rank
+                FROM ranked WHERE pq.symbol_id = ranked.symbol_id
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return HTMLResponse(f"""
+    <div style="background:#0f172a;border:1px solid #a855f7;border-radius:10px;padding:24px;color:#f1f5f9;text-align:center">
+      <div style="font-size:2rem;margin-bottom:8px">🔄</div>
+      <div style="font-size:1.1rem;font-weight:700;color:#d8b4fe;margin-bottom:8px">Rescore Queued: {sym_label}</div>
+      <div style="color:#94a3b8;font-size:0.9rem">{articles_cleared} articles cleared · queued as priority #1</div>
+      <div style="margin-top:16px;color:#64748b;font-size:0.8rem">Will run next on the active/next sentiment scoring pass.</div>
+      <button
+        hx-get="/symbol/{sym_id}/intel"
+        hx-target="#feed-panel"
+        hx-swap="innerHTML"
+        style="margin-top:14px;background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">
+        ← Back to intel
+      </button>
+    </div>
+    """)
 
 
 # ── Sentiment leaderboard ──────────────────────────────────────────────────────
