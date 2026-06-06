@@ -326,6 +326,14 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
       🌐 Dedup Languages
     </button>
     <button
+      hx-post="/admin/dedup-titles"
+      hx-target="#dedup-result"
+      hx-swap="innerHTML"
+      style="background:#1e293b;border:1px solid #a855f7;color:#d8b4fe;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px"
+      onclick="this.textContent='Running…'">
+      🧹 Dedup Titles (global)
+    </button>
+    <button
       hx-delete="/admin/sec/all"
       hx-target="#dedup-result"
       hx-swap="innerHTML"
@@ -941,66 +949,75 @@ async def symbol_news(sym_id: int, page: int = 1, q: str = ""):
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Dedup by normalized title in-query: keep the article with the highest
+            # sentiment_score (scored > unscored), tie-break by newest published_at, then id.
+            base_cte = """
+                WITH ranked AS (
+                    SELECT
+                        na.id, na.title, na.url, na.published_at, na.inserted_at,
+                        na.full_text, na.sentiment_score, na.weighted_sentiment,
+                        na.article_summary, na.source_name,
+                        rf.feed_url,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY LOWER(TRIM(COALESCE(na.title, '')))
+                            ORDER BY
+                                (na.sentiment_score IS NOT NULL) DESC,
+                                na.published_at DESC NULLS LAST,
+                                na.id ASC
+                        ) AS rn
+                    FROM news_articles na
+                    LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
+                    WHERE na.symbol_id = %s
+                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
+                      {kw_filter}
+                ),
+                deduped AS (SELECT * FROM ranked WHERE rn = 1)
+            """
             if keyword:
-                cur.execute("""
-                    SELECT COUNT(*) AS total FROM news_articles
-                    WHERE symbol_id = %s
-                      AND (source_name IS NULL OR source_name != 'edgar_8k')
-                      AND (title ILIKE %s OR full_text ILIKE %s)
-                """, (sym_id, f"%{keyword}%", f"%{keyword}%"))
+                kw_filter = "AND (na.title ILIKE %s OR na.full_text ILIKE %s)"
+                params_base = (sym_id, f"%{keyword}%", f"%{keyword}%")
             else:
-                cur.execute("""
-                    SELECT COUNT(*) AS total FROM news_articles
-                    WHERE symbol_id = %s
-                      AND (source_name IS NULL OR source_name != 'edgar_8k')
-                """, (sym_id,))
+                kw_filter = ""
+                params_base = (sym_id,)
+
+            cte = base_cte.format(kw_filter=kw_filter)
+
+            cur.execute(cte + " SELECT COUNT(*) AS total FROM deduped", params_base)
             total = cur.fetchone()["total"]
 
-            if keyword:
-                cur.execute("""
-                    SELECT
-                        na.id, na.title, na.url, na.published_at, na.inserted_at,
-                        na.full_text,
-                        rf.feed_url
-                    FROM news_articles na
-                    LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
-                    WHERE na.symbol_id = %s
-                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
-                      AND (na.title ILIKE %s OR na.full_text ILIKE %s)
-                    ORDER BY na.published_at DESC NULLS LAST
-                    LIMIT %s OFFSET %s
-                """, (sym_id, f"%{keyword}%", f"%{keyword}%", per_page, offset))
-            else:
-                cur.execute("""
-                    SELECT
-                        na.id, na.title, na.url, na.published_at, na.inserted_at,
-                        na.full_text,
-                        rf.feed_url
-                    FROM news_articles na
-                    LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
-                    WHERE na.symbol_id = %s
-                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
-                    ORDER BY na.published_at DESC NULLS LAST
-                    LIMIT %s OFFSET %s
-                """, (sym_id, per_page, offset))
+            cur.execute(
+                cte + " SELECT * FROM deduped ORDER BY published_at DESC NULLS LAST LIMIT %s OFFSET %s",
+                params_base + (per_page, offset)
+            )
             articles = cur.fetchall()
     finally:
         conn.close()
 
-    # ── Search box (always shown at top of news tab) ──────────────────────────
+    # ── Search box ─────────────────────────────────────────────────────────────
     q_safe = keyword.replace('"', '&quot;')
     html = f"""
-    <div style="padding:12px 16px 0">
-      <input type="text" id="news-search-{sym_id}" placeholder="Search keywords (FDA, patent, groundbreaking…)"
-        value="{q_safe}"
-        hx-get="/symbol/{sym_id}/news"
-        hx-trigger="keyup changed delay:300ms"
-        hx-target="#tab-content-{sym_id}"
-        hx-include="#news-search-{sym_id}"
-        name="q"
-        autocomplete="off"
-        style="width:100%"
-      />
+    <div style="padding:12px 16px 4px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="text" id="news-search-{sym_id}" placeholder="🔍 Search title or body (FDA, patent, earnings…)"
+          value="{q_safe}"
+          hx-get="/symbol/{sym_id}/news"
+          hx-trigger="keyup changed delay:300ms"
+          hx-target="#tab-content-{sym_id}"
+          hx-include="#news-search-{sym_id}"
+          name="q"
+          autocomplete="off"
+          style="flex:1"
+        />
+        <button
+          onclick="if(!confirm('Delete duplicate-title articles for this symbol? Keeps the scored / newest one per title.')) return false;"
+          hx-post="/symbol/{sym_id}/dedup-titles"
+          hx-target="#tab-content-{sym_id}"
+          hx-swap="innerHTML"
+          style="background:#1e1b3b;border:1px solid #a855f7;color:#d8b4fe;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap"
+          title="Remove duplicate-title articles">
+          🧹 Dedup Titles
+        </button>
+      </div>
     </div>
     """
 
@@ -1011,39 +1028,100 @@ async def symbol_news(sym_id: int, page: int = 1, q: str = ""):
             html += '<div class="empty-state">No news articles yet — run main.py to ingest</div>'
         return HTMLResponse(html)
 
+    html += '<div style="padding:8px 12px">'
     for a in articles:
-        pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "Unknown date"
-        preview = ""
-        if a["full_text"]:
-            preview = a["full_text"][:300].replace("<", "&lt;").replace(">", "&gt;")
-            if len(a["full_text"]) > 300:
-                preview += "…"
-        feed_chip = f'<span class="chip chip-gray" title="{a["feed_url"] or ""}">{(a["feed_url"] or "?")[:40]}…</span>' \
-                    if a["feed_url"] and len(a["feed_url"]) > 40 \
-                    else f'<span class="chip chip-gray">{a["feed_url"] or "unknown feed"}</span>'
-        html += f"""
-        <div class="news-card">
-          <a class="news-title" href="{a['url']}" target="_blank">{a['title'] or 'Untitled'}</a>
-          <div class="news-meta">
-            <span class="news-date">📅 {pub}</span>
-            {feed_chip}
-          </div>
-          {'<div class="news-preview">' + preview + '</div>' if preview else ''}
-        </div>"""
+        pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "—"
+        title = (a["title"] or "Untitled").replace("<", "&lt;").replace(">", "&gt;")
+        summary = (a.get("article_summary") or "").replace("<", "&lt;").replace(">", "&gt;")
+        preview_src = summary or (a["full_text"] or "")
+        preview = preview_src[:280].replace("<", "&lt;").replace(">", "&gt;")
+        if len(preview_src) > 280:
+            preview += "…"
 
-    # ── Pagination (preserves keyword) ────────────────────────────────────────
+        score = a.get("sentiment_score")
+        if score is None:
+            score_chip = '<span style="background:#1e293b;color:#64748b;border:1px solid #334155;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">⏳ unscored</span>'
+            border_col = "#1e2535"
+        else:
+            sc = float(score)
+            if sc > 0.05:
+                col, bg, icon = "#4ade80", "#052e16", "▲"
+                border_col = "#166534"
+            elif sc < -0.05:
+                col, bg, icon = "#f87171", "#450a0a", "▼"
+                border_col = "#7f1d1d"
+            else:
+                col, bg, icon = "#fbbf24", "#451a03", "■"
+                border_col = "#78350f"
+            score_chip = f'<span style="background:{bg};color:{col};border:1px solid {col}55;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700">{icon} {sc:+.3f}</span>'
+
+        feed_url = a.get("feed_url") or ""
+        source = a.get("source_name") or (feed_url.split("/")[2] if "://" in feed_url else feed_url) or "unknown"
+        source_short = source[:32] + ("…" if len(source) > 32 else "")
+
+        html += f"""
+        <div style="background:#0f172a;border:1px solid {border_col};border-left:3px solid {border_col};border-radius:8px;padding:12px 14px;margin-bottom:10px">
+          <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:6px">
+            <div style="flex:1;min-width:0">
+              <a href="{a['url']}" target="_blank" style="color:#e2e8f0;font-weight:600;font-size:14px;line-height:1.35;text-decoration:none;display:block">
+                {title}
+              </a>
+            </div>
+            {score_chip}
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;font-size:11px;color:#64748b;margin-bottom:{8 if preview else 0}px">
+            <span>🕒 {pub}</span>
+            <span style="color:#334155">·</span>
+            <span title="{feed_url}">📡 {source_short}</span>
+          </div>
+          {'<div style="color:#94a3b8;font-size:12.5px;line-height:1.5">' + preview + '</div>' if preview else ''}
+        </div>"""
+    html += '</div>'
+
+    # ── Pagination ────────────────────────────────────────────────────────────
     total_pages = max(1, (total + per_page - 1) // per_page)
     q_param = f"&q={q_safe}" if keyword else ""
     if total_pages > 1:
         html += '<div class="pagination">'
         if page > 1:
             html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page-1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">← Prev</button>'
-        html += f'<span style="color:#475569;font-size:.8rem;padding:5px 10px">Page {page} / {total_pages} &nbsp;·&nbsp; {total} articles</span>'
+        html += f'<span style="color:#475569;font-size:.8rem;padding:5px 10px">Page {page} / {total_pages} &nbsp;·&nbsp; {total} unique titles</span>'
         if page < total_pages:
             html += f'<button class="btn btn-ghost" hx-get="/symbol/{sym_id}/news?page={page+1}{q_param}" hx-target="#tab-content-{sym_id}" hx-swap="innerHTML">Next →</button>'
         html += '</div>'
 
     return HTMLResponse(html)
+
+
+@app.post("/symbol/{sym_id}/dedup-titles", response_class=HTMLResponse)
+async def symbol_dedup_titles(sym_id: int):
+    """Delete duplicate-title articles for a symbol. Keeps scored > unscored, then newest."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH ranked AS (
+                    SELECT id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY LOWER(TRIM(COALESCE(title, '')))
+                            ORDER BY
+                                (sentiment_score IS NOT NULL) DESC,
+                                published_at DESC NULLS LAST,
+                                id ASC
+                        ) AS rn
+                    FROM news_articles
+                    WHERE symbol_id = %s
+                )
+                DELETE FROM news_articles
+                WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
+            """, (sym_id,))
+            deleted = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    # Reload news view
+    resp = await symbol_news(sym_id=sym_id, page=1, q="")
+    return resp
 
 
 # ── SEC Filings route ─────────────────────────────────────────────────────────
@@ -1655,10 +1733,60 @@ async def run_dedup():
     </div>"""
 
 
-# ── Cross-language dedup route ─────────────────────────────────────────────────
-# Groups articles by (symbol_id, published_at rounded to 5 min, source_name).
-# Within each group keeps: English URL (/0/en/) preferring highest sentiment_score,
-# then any scored article, else keep_id = MIN(id). Deletes the rest.
+# ── Global dedup-titles route ─────────────────────────────────────────────────
+@app.post("/admin/dedup-titles", response_class=HTMLResponse)
+async def run_dedup_titles():
+    """Delete duplicate-title articles globally. Per (symbol_id, normalized title)
+    keep scored > unscored, then newest, then lowest id."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS cnt FROM (
+                    SELECT symbol_id, LOWER(TRIM(COALESCE(title, ''))) AS t
+                    FROM news_articles
+                    WHERE title IS NOT NULL AND TRIM(title) != ''
+                    GROUP BY symbol_id, t HAVING COUNT(*) > 1
+                ) sub
+            """)
+            dupe_groups = cur.fetchone()["cnt"]
+
+        with conn.cursor() as cur2:
+            cur2.execute("""
+                WITH ranked AS (
+                    SELECT id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol_id, LOWER(TRIM(COALESCE(title, '')))
+                            ORDER BY
+                                (sentiment_score IS NOT NULL) DESC,
+                                published_at DESC NULLS LAST,
+                                id ASC
+                        ) AS rn
+                    FROM news_articles
+                    WHERE title IS NOT NULL AND TRIM(title) != ''
+                )
+                DELETE FROM news_articles
+                WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
+            """)
+            deleted = cur2.rowcount
+            conn.commit()
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM news_articles")
+            total = cur.fetchone()["total"]
+    finally:
+        conn.close()
+
+    color = "#22c55e" if deleted == 0 else "#a855f7"
+    return f"""
+    <div style="padding:16px;background:#1e1e2e;border-radius:8px;border:1px solid #333;font-family:monospace;font-size:13px">
+      <div style="color:#888;margin-bottom:8px">Title dedup complete</div>
+      <div>Duplicate title groups: <b style="color:{color}">{dupe_groups}</b></div>
+      <div>Rows deleted: <b style="color:{color}">{deleted}</b></div>
+      <div>Total articles remaining: <b style="color:#60a5fa">{total:,}</b></div>
+      <div style="color:#888;margin-top:8px;font-size:11px">Kept scored > unscored, then newest. Per symbol.</div>
+    </div>"""
+
 
 @app.post("/admin/dedup-lang", response_class=HTMLResponse)
 async def run_dedup_lang():
