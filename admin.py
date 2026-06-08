@@ -1371,6 +1371,40 @@ async def symbol_debug(sym_id: int, page: int = 1, art_id: int = 0):
                     <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.82rem;color:#e2e8f0;line-height:1.6">{esc(art['article_summary'] or '—')}</div>
                   </div>
 
+                  <!-- ═══ LLM Pipeline I/O (4 stages, top → bottom) ═══ -->
+                  <div style="background:#0b1220;border:1px solid #1e2535;border-radius:10px;padding:14px;margin-bottom:16px">
+                    <div style="font-size:0.7rem;color:#94a3b8;font-weight:800;text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">🔬 LLM Pipeline I/O</div>
+
+                    <div style="margin-bottom:10px">
+                      <div style="font-size:0.7rem;color:#fbbf24;font-weight:700;margin-bottom:4px">☀ STAGE 1 — INPUT (raw article fed to pre-summarizer)</div>
+                      <div style="font-size:0.72rem;color:#475569;margin-bottom:4px"><b>Title:</b> {esc(art['title'])}</div>
+                      <div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:10px;font-size:0.72rem;color:#cbd5e1;white-space:pre-wrap;max-height:220px;overflow-y:auto">{esc(art['full_text'] or '(no body — title-only article)')}</div>
+                    </div>
+
+                    <div style="margin-bottom:10px">
+                      <div style="font-size:0.7rem;color:#fbbf24;font-weight:700;margin-bottom:4px">☀ STAGE 1 — OUTPUT (extracted facts JSON)</div>
+                      <pre style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:10px;font-size:0.72rem;color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow-y:auto;font-family:monospace">{esc(json.dumps(art['pre_summary_data'], indent=2, ensure_ascii=False) if art['pre_summary_data'] else '(stage 1 not run / no data)')}</pre>
+                    </div>
+
+                    <div style="margin-bottom:10px">
+                      <div style="font-size:0.7rem;color:#4ade80;font-weight:700;margin-bottom:4px">▶ STAGE 2 — INPUT (full prompt sent to scorer)</div>
+                      <pre style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:10px;font-size:0.72rem;color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:280px;overflow-y:auto;font-family:monospace">{esc(art['stage2_prompt'] or '(not saved — scored before v3.0.4)')}</pre>
+                    </div>
+
+                    <div>
+                      <div style="font-size:0.7rem;color:#4ade80;font-weight:700;margin-bottom:4px">▶ STAGE 2 — OUTPUT (score + summary + rationale + forecast + events)</div>
+                      <pre style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:10px;font-size:0.72rem;color:#cbd5e1;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;font-family:monospace">{esc(json.dumps({
+                          'sentiment_score':         float(art['sentiment_score']) if art['sentiment_score'] is not None else None,
+                          'weighted_sentiment':      float(art['weighted_sentiment']) if art['weighted_sentiment'] is not None else None,
+                          'article_summary':         art['article_summary'],
+                          'score_rationale':         art['score_rationale'],
+                          'forecast_until_earnings': art['forecast_until_earnings'],
+                          'key_events':              art['key_events'],
+                          'updated_master_summary':  art['master_summary_snapshot'],
+                      }, indent=2, ensure_ascii=False, default=str))}</pre>
+                    </div>
+                  </div>
+
                   <div style="margin-bottom:12px">
                     <div style="font-size:0.72rem;color:#f59e0b;font-weight:700;margin-bottom:4px">SCORE RATIONALE</div>
                     <div style="background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.82rem;color:#e2e8f0;line-height:1.6">{esc(art['score_rationale'] or '—')}</div>
@@ -1387,23 +1421,8 @@ async def symbol_debug(sym_id: int, page: int = 1, art_id: int = 0):
                   </div>
 
                   <div style="margin-bottom:12px">
-                    <div style="font-size:0.72rem;color:#38bdf8;font-weight:700;margin-bottom:4px">STAGE 1 OUTPUT (pre_summary_data)</div>
-                    <pre style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.75rem;color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto">{esc(json.dumps(art['pre_summary_data'], indent=2, ensure_ascii=False) if art['pre_summary_data'] else 'Stage 1 not run / no data')}</pre>
-                  </div>
-
-                  <div style="margin-bottom:12px">
-                    <div style="font-size:0.72rem;color:#fb923c;font-weight:700;margin-bottom:4px">MASTER SUMMARY SNAPSHOT (at time of scoring)</div>
+                    <div style="font-size:0.72rem;color:#fb923c;font-weight:700;margin-bottom:4px">MASTER SUMMARY SNAPSHOT (rolling context at scoring time)</div>
                     <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.78rem;color:#94a3b8;white-space:pre-wrap;max-height:150px;overflow-y:auto">{esc(art['master_summary_snapshot'] or '—')}</div>
-                  </div>
-
-                  <div style="margin-bottom:12px">
-                    <div style="font-size:0.72rem;color:#f87171;font-weight:700;margin-bottom:4px">FULL STAGE 2 PROMPT (sent to LLM)</div>
-                    <pre style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto">{esc(art['stage2_prompt'] or 'Not saved — scored before v3.0.4')}</pre>
-                  </div>
-
-                  <div style="margin-bottom:12px">
-                    <div style="font-size:0.72rem;color:#475569;font-weight:700;margin-bottom:4px">RAW ARTICLE TEXT (full_text)</div>
-                    <div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:12px;font-size:0.72rem;color:#64748b;white-space:pre-wrap;max-height:300px;overflow-y:auto">{esc((art['full_text'] or 'No full text scraped — title-only article'))}</div>
                   </div>
                 </div>
                 """
@@ -3012,14 +3031,22 @@ def _build_queue_wrap_html() -> str:
     finally:
         conn.close()
 
-    # Order: ACTIVE first (longest-running on top), then PRIORITY queue, then rest (alpha)
+    # Order: ACTIVE first (longest-running on top), then PRIORITY queue, then rest (random).
+    # Pending tier is shuffled with a per-day seed so the order is stable within a session
+    # (no flicker across the 30s SSE refresh) but rotates daily — matches the scoring pass
+    # which random.shuffle()s the worklist before each run.
+    import random as _rnd, time as _time
+    _today_seed = int(_time.time() // 86400)   # changes once per day
+    _pending_rng = _rnd.Random(_today_seed)
+    _pending_jitter = {r["symbol_id"]: _pending_rng.random() for r in worklist}
+
     def _sort_key(r):
         sid = r["symbol_id"]
         if sid in active_map:
             return (0, -active_map[sid], r["symbol"])
         if sid in prio_rank:
             return (1, prio_rank[sid], r["symbol"])
-        return (2, 0, r["symbol"])
+        return (2, _pending_jitter[sid], "")
 
     worklist.sort(key=_sort_key)
 

@@ -23,6 +23,574 @@ Full pipeline (6 steps):
 
 ## Changelog
 
+### [3.1.11] – 2026-06-08 — AI sector pick: hint-augmented + validated against catalog
+
+#### Bug
+With `ENABLE_PRE_SUMMARIZATION=False`, the sector-pick LLM call was unreliable:
+- The `master_summary` was now built from raw_full_text dumps (less curated
+  than Stage 1 facts), so the picker often returned vague labels.
+- The picker used `temperature=0.1`, `max_tokens=64`, no top_p/seed → drift
+  and JSON truncation on long names.
+- The LLM sometimes returned wrong separators ('/', '-', ':'), wrong taxonomy
+  ("Information Technology" — GICS — when our catalog is "Electronic
+  Technology" — FactSet), leading indices like `[7] ...`, or outright
+  hallucinations. The old code accepted any string verbatim, which then
+  failed the SQL ILIKE lookup → multiplier silently fell back to 1.000.
+
+#### pipeline/sentiment_scoring.py
+- **`_call_ai_sector_pick`** now accepts an optional `hint_candidates` list
+  of per-article `extracted_facts.ai_sector_pick_hint` values from Stage 2.
+  The 3 most common hints are presented to the picker as a soft guide
+  (NOT a constraint — the final answer must still come from the catalog).
+- Sector list rendered as `[N] sector_name | industry_name` so the model
+  sees indices but is told to omit them in the JSON answer.
+- Determinism knobs aligned with Stage 1 / Stage 2:
+  `temperature=0.0`, `top_p=1.0`, `seed=42`, `max_tokens=256`
+  (was 64 — caused truncation on long names),
+  Ollama: `top_k=1`, `format=json`, `num_predict=256`.
+- API path: `response_format = json_object`.
+- **New `_snap_sector_pick()`** validator: takes the raw LLM output and
+  snaps it to a real catalog entry, trying in order:
+  1. exact verbatim (case-insensitive)
+  2. separator-normalized (`/`, `-`, `:`, `,`, `>` → `|`)
+  3. (sector, industry) exact pair match
+  4. industry_name exact (LLM dropped sector)
+  5. industry_name substring (most-specific wins by longest name)
+  6. sector_name substring fallback
+  If nothing matches → returns "" so the multiplier stays 1.000 instead of
+  saving a hallucinated label.
+- Stripped leading `[N]` index and surrounding quotes.
+- Logs `LLM='...' → snapped='...'` when normalization fired, and
+  `... not in catalog — discarding` when hallucinated.
+- Hint accumulator wired in the per-symbol loop: `ai_sector_hints[]` is
+  populated from `result["extracted_facts"]["ai_sector_pick_hint"]` for
+  every article scored, then passed into the picker call.
+
+#### Result
+- S1 ON: hints from Stage 1 → S2 stage1_facts → S2 emits hint → picker uses it.
+- S1 OFF: S2 extracts hint directly from raw_full_text → picker uses it
+  (this is the path that was broken).
+- Taxonomy drift between models (GICS / FactSet / ICB) is auto-corrected
+  by `_snap_sector_pick` via industry_name matching.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (`_call_ai_sector_pick` rewrite,
+  new `_snap_sector_pick`, hint accumulator in scoring loop)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.13] – 2026-06-08 — AI sector pick: two-stage funnel + budget fix for reasoning models
+
+#### Bug
+After scoring, every symbol showed `AI sector multiplier (—): ×1.00`. The
+picker LLM returned empty content, so `_resolve_ai_sector_multiplier` fell
+back to 1.000 and `ai_sector_pick` was saved as empty.
+
+Two root causes:
+1. **Catalog too big for the prompt.** sectors_macro has 672 rows. Rendered as
+   `[N] sector | industry` that's ~38k chars. At `num_ctx=16384` the list alone
+   overflowed context, so the model saw a truncated prompt.
+2. **`num_predict` too small for reasoning models.** Gemma at top_k=1 / temp=0
+   consumes 500-1000 hidden "thinking" tokens before emitting the JSON. The
+   old `num_predict=256` cap killed the response mid-reasoning → empty output.
+   Confirmed via `usage.completion_tokens=758` while visible content was 0.
+
+#### pipeline/sentiment_scoring.py — `_call_ai_sector_pick` two-stage rewrite
+- **Stage A — sector:** only the ~164 distinct `sector_name` values
+  (~3.4k chars). Easily fits ctx.
+- **Stage B — industry:** only industries within the chosen sector.
+  Single-industry sectors skip Stage B.
+- Both snap to catalog entries (case-insensitive + substring fallback).
+- `num_predict=1536` for both — accommodates reasoning chain-of-thought.
+- `master_summary` capped at 4000 chars.
+- Hints from `extracted_facts.ai_sector_pick_hint` shown in both stages.
+
+#### Verified
+- Before: MTVA → `pick=''  mult=1.0`
+- After:  MTVA → `pick='Biopharmaceuticals | Cell-based Therapies (CAR-T)'  mult=1.027`
+- Sector list size: 38k → 3.4k chars (10× reduction)
+- num_predict: 256 → 1536
+
+#### Cost
+- Two LLM calls per symbol (was one).
+- ~25-30s per call on Gemma-4-e4b — total ~60s/symbol for the picker.
+- Runs ONCE per symbol per scoring run (after all articles), so amortized.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (`_call_ai_sector_pick` rewrite)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.12] – 2026-06-08 — Stage 2 JSON-mode + system prompt compression
+
+#### Bugs
+1. **`[Stage2] Attempt 1/3: could not parse JSON (len=3) raw: 'The'`** — Stage 2's
+   Ollama path was missing `"format": "json"` in extra_body. Stage 1 and the
+   sector-picker had it, Stage 2 didn't. With temp=0 + top_k=1 (greedy), Gemma
+   deterministically picked "The" as the first token on certain inputs and
+   leaked prose before the JSON. Cost: 7-10s per retry.
+2. **`config/stage2_instruction.json` was 24KB** — bloated prose burned ~6k
+   tokens of system prompt on every Stage 2 call, slowing first-token latency.
+
+#### Fixes
+- `pipeline/sentiment_scoring.py` `_call_stage2()`: added `"format": "json"`
+  to Ollama extra_body — Ollama now enforces a JSON grammar at the sampler
+  level. Model can no longer emit a non-`{` first character.
+- `config/stage2_instruction.json` compressed from 23.8KB → 12.8KB (46% smaller):
+  - outlook_bonus_rubric: 5 prose lines → 4 one-liners
+  - scoring_rubric: nested example arrays → 5 pipe-separated one-liners
+  - adjustment_factors: 6 nested prose objects → 6 one-liners
+  - tasks: 10 verbose imperatives → 9 numbered one-liners
+  - output_schema field hints: full sentences → terse forms
+  - rules: 19 verbose sentences → 15 imperative one-liners
+  - Nothing semantic removed — all 20 extracted_facts sections,
+    all enum values, all S1-ON/S1-OFF dual-mode logic preserved.
+
+#### Result
+- No more `Stage2 Attempt 1/3: could not parse JSON` retries.
+- ~46% fewer system-prompt tokens per Stage 2 call.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (Stage 2 format=json)
+- `config/stage2_instruction.json` (compressed)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.11] – 2026-06-08 — AI sector pick (initial pass): hint-augmented + catalog snap
+
+#### Bug
+With `ENABLE_PRE_SUMMARIZATION=False`, the sector-pick LLM call was unreliable:
+- master_summary built from raw_full_text dumps → vague labels
+- picker used temp=0.1, max_tokens=64, no top_p/seed → drift + truncation
+- LLM returned GICS-style names ("Information Technology") that didn't match
+  the FactSet-style catalog ("Electronic Technology"), wrong separators ('/'),
+  leading `[N]` indices, or pure hallucinations. Old code accepted any string
+  verbatim → SQL ILIKE failed → multiplier silently fell back to 1.000.
+
+#### pipeline/sentiment_scoring.py — single-call version with snap validator
+- `_call_ai_sector_pick` accepts `hint_candidates` (top-3 from Stage 2
+  `extracted_facts.ai_sector_pick_hint`).
+- Determinism aligned: temp=0.0, top_p=1.0, seed=42, max_tokens=256
+  (was 64 → truncation on long names).
+- **NEW `_snap_sector_pick()`** — forces output to a real catalog entry via
+  6-step fallback: verbatim → separator-normalized → (sector, industry) exact
+  → industry exact → industry substring (longest wins) → sector substring.
+  Hallucinations discarded.
+- Hint accumulator wired in scoring loop.
+
+#### Why a v2 in [3.1.13]
+This v1 still failed because the catalog (672 rows) didn't fit in the prompt
+at 16k ctx, and Gemma's reasoning budget exceeded `max_tokens=256`. See
+[3.1.13] for the two-stage funnel fix that actually works.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (initial picker + snap validator + hint wiring)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.10] – 2026-06-08 — Honor SYMBOL_LIMIT in sentiment scoring
+
+#### Bug
+`SYMBOL_LIMIT = 8` in `pipeline_config.py` was completely ignored by the
+scoring run. The orchestrator hardcoded `sentiment_run(limit=0)` and the
+config value never reached `_get_symbols_with_unscored()`. Result: setting
+SYMBOL_LIMIT to 8 still scored thousands of symbols.
+
+Two additional leaks:
+- After `priority_rows + normal_rows`, the worklist length was not capped
+  again, so priority entries pushed the run above the limit.
+- The mid-run `_refill()` poller re-read all unscored symbols every 3s and
+  appended new ones to the worklist with no cap check.
+
+#### pipeline/sentiment_scoring.py
+- `run()` now resolves an `effective_limit`:
+  1. explicit `limit` argument if > 0
+  2. otherwise `SYMBOL_LIMIT` from pipeline_config (0/False/None → all)
+- `_get_symbols_with_unscored()` hard-caps the merged
+  `priority_rows + normal_rows` list to `limit` (priority entries kept first).
+- `_refill()` skips non-priority symbols once `len(seen_ids) >= effective_limit`.
+- Priority-queue entries (user-injected rescores) always bypass the cap so
+  manual "score this symbol now" still works regardless of SYMBOL_LIMIT.
+
+#### Behavior
+- `SYMBOL_LIMIT = 8`   → exactly 8 symbols scored per run (priority first)
+- `SYMBOL_LIMIT = 100` → exactly 100 symbols scored per run
+- `SYMBOL_LIMIT = False / 0 / None` → unlimited (all unscored)
+- Manual rescore via priority_queue still works mid-run even when the cap is hit.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (`run()` resolution, hard cap in
+  `_get_symbols_with_unscored`, refill-cap in `_refill`)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.9] – 2026-06-08 — Pending queue UI shuffle
+
+#### Bug
+The admin priority panel rendered the pending tier alphabetically — `r["symbol"]`
+was the secondary sort key. The user wanted the same random shuffle the backend
+scoring loop already does (`random.shuffle(normal_rows)` per run).
+
+#### admin.py — `_build_queue_wrap_html` sort key
+- Pending tier (tier=2) now uses a per-day-seeded random jitter instead of
+  alphabetical `r["symbol"]`.
+- Seed is `int(time.time() // 86400)` so the shuffle is:
+  - stable within a UTC day (no flicker across the 30s SSE refresh)
+  - reshuffled the next day
+  - matches the spirit of the backend `random.shuffle(normal_rows)` call.
+- ACTIVE tier (running symbols, longest-first) and PRIORITY tier (manual rank)
+  are unchanged.
+
+#### Files touched
+- `admin.py` (sort key + jitter map)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.8] – 2026-06-08 — Stage 2 schema rebuild: extracted_facts + cross-model determinism + S1-off coverage
+
+#### Why
+When `ENABLE_PRE_SUMMARIZATION = False`, Stage 2 was the ONLY engine to see
+the article. The old Stage 2 schema only emitted a flat 9-key `key_events`
+block — losing multi-item structure (multiple contracts/people/M&A), missing
+patents/IP/clinical/capital-structure entirely, missing key quotes, missing
+ai_sector_pick_hint, missing earnings calendar. So with S1 off, the
+pipeline lost ~70% of article content.
+
+#### config/stage2_instruction.json — full rewrite
+- New `input_contract` section explains exactly where to read facts from
+  (stage1_facts when `_pre_summarization==ON`, raw_full_text when OFF) so
+  the LLM does the right thing in both modes.
+- New `fact_extraction_priority` section: "if S1 on copy verbatim from
+  stage1_facts; if S1 off scan raw_full_text yourself."
+- **NEW `extracted_facts` block** mirroring the Stage 1 schema (20 sections):
+  - `headline_event`, `financial_figures[]` (with yoy/vs_consensus deltas),
+    `guidance_and_outlook[]`, `contracts_and_orders[]`, `mergers_and_acquisitions[]`,
+    `partnerships_and_collaborations[]`, `management_and_board_changes[]`,
+    `legal_and_regulatory_events[]`, `patents_and_ip[]`,
+    `clinical_and_regulatory_pipeline[]`, `products_and_technology[]`,
+    `capital_structure_events[]`, `key_quotes[]` (verbatim), `people_mentioned[]`,
+    `connected_companies_detail[]` (name+ticker+relationship enum),
+    `earnings_calendar`, `industry_and_market`, `ai_sector_pick_hint`,
+    `article_metadata` (is_press_release / is_earnings_release / is_sec_filing /
+    is_routine_disclosure).
+- **`key_events` (legacy 9-key flat dict) is preserved** for viewer/admin
+  backward compatibility — populated alongside `extracted_facts`.
+- **`company_connections` (legacy 3-array flat dict) is preserved** —
+  sourced from `extracted_facts.connected_companies_detail` so they stay
+  consistent.
+- Outlook bonus rubric widened to 0.00–0.15 (matches existing post-processing).
+- `adjustment_factors.market_cap_calibration` added (was buried in `rules`).
+- `adjustment_factors.duplicate_neutralization` codified (was prose rule).
+- `output_format_rules`: first char `{`, last char `}`, no markdown, all
+  schema keys present even when null/[].
+
+#### pipeline/sentiment_scoring.py — call-site determinism (matches Stage 1)
+- `_call_stage2`: `temperature=0.0`, `top_p=1.0`, `seed=42`.
+- Ollama path: `top_k=1` (greedy), `seed=42` in extra_body, top-level seed stripped.
+- Same knobs as Stage 1 so output is reproducible across runs and models.
+
+#### Persistence
+- DB: `news_articles` gained two columns
+  - `extracted_facts JSONB` — full structured fact set per article.
+  - `ai_sector_pick_hint TEXT` — LLM's per-article sector suggestion.
+- `_save_scoring_result()` writes both alongside legacy `key_events`.
+- The dedicated post-batch `_call_ai_sector_pick` (uses final master_summary)
+  remains authoritative for the multiplier lookup; the per-article hint is
+  observable/auditable data.
+
+#### Result
+With `ENABLE_PRE_SUMMARIZATION = False`:
+- Stage 2 receives `raw_full_text` (fix from 3.1.6).
+- Stage 2 NOW extracts the full structured fact set into `extracted_facts`
+  (matching what Stage 1 would have produced).
+- Downstream consumers (viewer 4-stage panel, admin LLM I/O panel,
+  recompute scripts) see complete coverage in both modes.
+
+#### Files touched
+- `config/stage2_instruction.json` (full rewrite, 14.3KB → ~23.8KB)
+- `pipeline/sentiment_scoring.py` (`_call_stage2` determinism, save block
+  +`extracted_facts`/`ai_sector_pick_hint`, UPDATE SQL +two columns)
+- `news_articles` table (+2 columns via ALTER)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.7] – 2026-06-06 — Stage 1 schema rebuild: 100% coverage + cross-model determinism
+
+#### Goal
+Old stage 1 schema only captured ~60% of article content because:
+- `extended_summary` was capped at 200 words ("summary, not full coverage").
+- Each section was singular (`contracts`, `management_changes`) — articles with multiple items lost data.
+- `financial_figures.revenue` was a freeform string — different models formatted differently ("$1.2B Q3" vs "Q3 2026: 1,200M").
+- No prior-period comparison (YoY/QoQ/consensus) — earnings reports lose their delta context.
+- No verbatim `key_quotes` — CEO/guidance language was paraphrased away.
+- Open-ended enums and no anti-hallucination rules — models drifted.
+
+#### config/stage1_instruction.json — full rewrite
+- New `determinism_contract` section: enforces field order, key presence, enum verbatim, null-vs-empty, unit preservation.
+- `full_coverage_summary` replaces `extended_summary` — length scales with article, must contain every figure/name/date.
+- 14 array-of-objects sections (was 8 singular objects):
+  - `financial_figures` (with structured `comparison` for vs_prior_period/yoy/qoq/vs_consensus)
+  - `guidance_and_outlook` (range_low/high/point + direction enum)
+  - `contracts_and_orders`, `patents_and_ip`, `clinical_and_regulatory_pipeline`
+  - `mergers_and_acquisitions`, `partnerships_and_collaborations`
+  - `management_and_board_changes`, `legal_and_regulatory_events`
+  - `products_and_technology`, `capital_structure_events`
+  - `connected_companies` (now objects with ticker + relationship enum)
+  - `people_mentioned`, `key_quotes` (verbatim only)
+- New `earnings_calendar`, `article_metadata` (is_press_release/is_earnings_release/is_sec_filing/is_routine_disclosure).
+- `sentiment_signals.confidence_in_facts` added; `tone` widened to 5-point scale; `flags` ~quadrupled (clinical_success, regulatory_approval, dilutive_offering, short_report, activist_investor, ...).
+- Calibrated materiality (>2%/0.5–2%/<0.5%) and urgency (today/week/background).
+- Controlled-vocabulary enums for ~30 fields so every model produces comparable values.
+- `anti_hallucination_rules`: independent per-invocation, no carry-over, verbatim quotes, null over guess.
+- `output_format_rules`: first char must be {, last must be }, no markdown, all schema keys present.
+
+#### pipeline/sentiment_scoring.py — call-site determinism knobs
+- `temperature` 0.05 → 0.0
+- `top_p` pinned to 1.0
+- `seed=42` (API providers that honor it)
+- Ollama `extra_body`: `top_k=1` (greedy), `seed=42`, `num_predict=4096`
+- top-level `seed` stripped for Ollama path (would be ignored or error)
+
+#### Cross-model determinism summary
+| Knob              | Stage 1 now |
+|-------------------|-------------|
+| temperature       | 0.0         |
+| top_p             | 1.0         |
+| top_k (ollama)    | 1 (greedy)  |
+| seed              | 42          |
+| response_format   | json_object |
+| schema enforcement| explicit enums + null-or-empty rule |
+
+Same article → same JSON across gemma/llama/qwen/mistral/gpt class models
+(assuming they honor temperature+top_p; gemma-4-e2b does).
+
+#### Files touched
+- `config/stage1_instruction.json` (full rewrite, 6573 → ~17k bytes)
+- `pipeline/sentiment_scoring.py` (`_call_stage1` rewritten with determinism knobs)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.6] – 2026-06-06 — Honor ENABLE_PRE_SUMMARIZATION=False end-to-end
+
+#### Bug
+Disabling `ENABLE_PRE_SUMMARIZATION` in `pipeline_config.py` did NOT actually
+bypass stage 1 in two ways:
+
+1. `_submit_s1()` reused any cached `pre_summary_data` from a prior run even
+   when the toggle was OFF. So you flipped the flag and the LLM still got
+   stage-1 facts from disk.
+2. `_build_stage2_prompt()` produced a single ambiguous `text_snippet` field
+   either way, and when `full_text` was empty the scorer essentially saw
+   only the title + master_summary (matching your observation).
+
+#### pipeline/sentiment_scoring.py
+- `_submit_s1()` now gates the cached-pre_summary reuse on
+  `ENABLE_PRE_SUMMARIZATION` — when OFF, cached stage-1 data is ignored.
+- `_build_stage2_prompt()` rewrote the `current_article` payload:
+  - **S1 ON**:  `stage1_facts` (compact JSON) + `_pre_summarization: ON`
+  - **S1 OFF**: `raw_full_text` (full body, falling back to RSS summary if
+    full_text is empty) + optional separate `rss_summary` when both exist
+    and differ + `_pre_summarization: OFF` + an explicit `_note` telling
+    the scorer to read raw text directly.
+
+#### Result
+Toggle is now truly authoritative. When OFF:
+- Cached stage-1 facts are ignored.
+- Stage 2 receives the raw article body (or RSS summary fallback).
+- The `_pre_summarization: OFF` marker shows up in the saved
+  `stage2_prompt`, visible in the new admin/viewer "🔬 LLM Pipeline I/O"
+  panel under STAGE 2 INPUT.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (+~30 lines, restructured prompt builder)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.5] – 2026-06-06 — Clear 4-stage LLM Pipeline I/O panel (admin + viewer)
+
+#### Goal
+Make every article's full LLM pipeline visible top-to-bottom in one
+labeled block, both in viewer and admin:
+
+  ☀ STAGE 1 — INPUT  (raw article: title + full_text)
+  ☀ STAGE 1 — OUTPUT (pre_summary_data JSON — extracted facts)
+  ▶ STAGE 2 — INPUT  (full stage2_prompt sent to scorer)
+  ▶ STAGE 2 — OUTPUT (score + summary + rationale + forecast + key_events + updated master_summary)
+
+#### viewer.py
+- Article query now selects `full_text` + `summary` for Stage 1 INPUT.
+- `🔬 What LLM received` accordion replaced with `🔬 LLM Pipeline I/O`
+  showing all 4 stages plus rolling MASTER SUMMARY context.
+- Each stage clearly labeled, color-coded (☀ yellow = stage 1, ▶ green = stage 2).
+
+#### admin.py
+- Article detail panel restructured. The old scattered blocks (Stage 1
+  OUTPUT after key events, Stage 2 PROMPT near the bottom, raw text at
+  the very end) merged into one cohesive `🔬 LLM Pipeline I/O` card
+  immediately after SUMMARY.
+- Stage 2 OUTPUT now serialized as JSON so it matches the input format.
+- Master summary kept as separate block below for rolling-context audit.
+
+#### Files touched
+- `viewer.py` (+~45 lines, restructured collapsible block)
+- `admin.py` (+~35 lines, restructured detail panel)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.4] – 2026-06-06 — Clamp final_score to [-1, 1] + new label bands
+
+#### Goal
+- final_score could exceed [-1, 1] when macro × ai_sector compounded > 1
+  (e.g. AMBA showed +1.042). Clamp to nominal range.
+- New 5-band rating system (one-sided): STRONG BUY / BUY / NEUTRAL /
+  WEAK SELL / SELL based on final_score thresholds.
+
+#### pipeline/sentiment_scoring.py
+- After `final_score = avg_weighted * macro * ai_sec`, clamp to [-1, 1].
+
+#### scripts/recompute_final_scores.py
+- Same clamp in backfill.
+- Re-ran: AMBA 1.0420 → 1.0000 (clamped); all others unchanged.
+
+#### viewer.py
+- `score_label()` rewritten with new thresholds:
+  - ≥ 0.75  STRONG BUY  (#4ade80)
+  - ≥ 0.60  BUY         (#86efac)
+  - ≥ 0.40  NEUTRAL     (#94a3b8)
+  - ≥ 0.25  WEAK SELL   (#fb923c)
+  - else    SELL        (#f87171)
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (+1 line)
+- `scripts/recompute_final_scores.py` (+1 line)
+- `viewer.py` (label band rewrite)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.3] – 2026-06-06 — Viewer: show BOTH multipliers (macro + ai_sector)
+
+#### Goal
+Old viewer card showed only one "Sector multiplier" line, mislabeling the
+macro multiplier and hiding the separate ai_sector_multiplier. Users saw
+`Base × ×1.00 = 1.04` and couldn't tell where the boost came from.
+
+#### viewer.py
+- Symbol-detail query now selects `s.ai_sector_pick` + `s.ai_sector_multiplier`.
+- Score breakdown block rewritten to show three lines:
+  1. Base avg (time-decayed, weighted)
+  2. Macro multiplier (sectors_macro by industry) + boost/drag %
+  3. AI sector multiplier (LLM pick) + boost/drag %
+  4. Final = base × macro × ai_sec
+- Base is now correctly back-derived as `final / (macro * ai_sec)`.
+
+#### Files touched
+- `viewer.py` (+~20 lines)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.2] – 2026-06-06 — Neutral-score noise filter (configurable threshold)
+
+#### Goal
+Stop articles where the LLM said "nothing important" (`|sentiment_score| < 0.05`)
+from diluting the weighted mean. Even with proper weighted aggregation, a
+fresh neutral article (raw=0, w=1) pulls the average toward zero in the
+denominator. Below threshold = no opinion = should not vote at all.
+
+#### pipeline_config.py
+- New config: `NEUTRAL_SCORE_THRESHOLD = 0.05` — tweak in one place.
+
+#### pipeline/sentiment_scoring.py
+- Imports `NEUTRAL_SCORE_THRESHOLD`.
+- Both aggregation paths (already-scored + freshly-scored) now skip articles
+  where `abs(raw_score) < NEUTRAL_SCORE_THRESHOLD` from `raw_weight_pairs`.
+- Legacy `weighted_scores` list still receives all articles (audit trail
+  + backward compatibility).
+
+#### scripts/recompute_final_scores.py
+- Honors `NEUTRAL_SCORE_THRESHOLD` for the backfill.
+- Verbose mode now shows `used=N skipNeutral=M` per symbol.
+- Header prints active threshold.
+
+#### Backfill executed (2026-06-06, threshold=0.05)
+- 79 symbols recomputed (down from 96 — 17 had only neutral articles)
+- 59 symbols changed by more than 0.01
+- Most dramatic: CZR +0.28→+0.83, TBRG +0.45→+0.90, FSTR +0.11→+0.50
+- Signal compression eliminated: bullish symbols no longer dragged toward
+  0 by noise articles
+
+#### Files touched
+- `pipeline_config.py` (+1 line)
+- `pipeline/sentiment_scoring.py` (+5 lines)
+- `scripts/recompute_final_scores.py` (+9 lines)
+- `CHANGELOG.md` (this entry)
+
+---
+
+### [3.1.1] – 2026-06-06 — Scoring math: true weighted mean (no decay double-count)
+
+#### Goal
+Fix the scoring bug where time-decay was applied twice: once shrinking each
+article's contribution toward 0, and again as equal voting weight in the
+arithmetic mean. Result: symbols with mostly old news always looked neutral
+even when a fresh major event should dominate.
+
+#### pipeline/sentiment_scoring.py
+- Added `_decay_weight(published_at)` helper — returns weight in [0,1].
+  1.0 inside grace window, then exp(-λ · t_hours) after.
+- `_save_symbol_scores()` now accepts optional `raw_weight_pairs:
+  list[tuple[raw_score, decay_weight]]`. When provided, aggregation uses
+  a true weighted mean:
+    final = Σ(raw · w) / Σw
+  Falls back to legacy `mean(weighted_scores)` if not supplied.
+- Aggregation collector now records both lists side-by-side:
+  - `weighted_scores` (legacy: raw · decay)
+  - `raw_weight_pairs` (new: (raw, decay))
+  Both the "already scored, skip LLM" path and the "freshly scored" path
+  populate both.
+
+#### Effect (worked example)
+1 fresh article (+0.8) + 50 stale articles (+0.3, 200d past grace):
+- OLD aggregation:  0.018  (fresh news drowned by stale-count)
+- NEW weighted mean: 0.654 (fresh news dominates, stale faded out)
+
+Same exponential decay constant, no new tunables.
+
+#### Files touched
+- `pipeline/sentiment_scoring.py` (+~25 lines)
+- `scripts/recompute_final_scores.py` (new — one-shot SQL backfill)
+- `CHANGELOG.md` (this entry)
+
+#### Backfill executed (2026-06-06)
+Ran `scripts/recompute_final_scores.py` to apply the new aggregation to
+existing `symbols.final_score` values without re-running the LLM. Reads
+existing `news_articles.sentiment_score` + `published_at`, uses each
+symbol's stored `ai_sector_multiplier`, re-resolves `macro_multiplier`
+from `sectors_macro` by industry.
+
+Result:
+- 96 symbols recomputed
+- 3134 skipped (no scored articles)
+- 63 symbols changed by more than 0.01
+- Most dramatic: AMBA 0.0000 → +1.0420, OMCL 0.0000 → +0.8000,
+  UBSI 0.0000 → +0.7700, CBFV 0.0000 → -0.4561 (i.e. signal that was
+  drowned by stale-article voting now correctly surfaces)
+
+Script is idempotent + supports `--dry-run` + `-v` for per-symbol output.
+
+---
+
 ### [3.1.0] – 2026-06-06 — Real-time SSE + Idiomorph live admin (no-flicker)
 
 #### Goal

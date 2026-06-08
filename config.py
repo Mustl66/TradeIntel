@@ -44,7 +44,7 @@ RSS_WORKERS      = int(os.getenv("RSS_WORKERS",  8))
 
 # ── LLM Tier system ──────────────────────────────────────────────────────────
 # TIER = 0 → auto-probe in order. TIER = 1..5 → force that tier.
-TIER = int(os.getenv("TIER", "2"))
+TIER = int(os.getenv("TIER", "4"))
 
 # Shared sampling defaults — same across all tiers unless overridden in the tier dict
 _SHARED_PARAMS = {

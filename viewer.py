@@ -40,13 +40,11 @@ def score_color(s):
 
 def score_label(s):
     s = float(s or 0)
-    if s >  0.30: return ("STRONG BUY",  "#4ade80")
-    if s >  0.10: return ("BUY",          "#86efac")
-    if s >  0.05: return ("WEAK BUY",    "#fbbf24")
-    if s < -0.30: return ("STRONG SELL", "#f87171")
-    if s < -0.10: return ("SELL",         "#fca5a5")
-    if s < -0.05: return ("WEAK SELL",   "#fb923c")
-    return ("NEUTRAL", "#94a3b8")
+    if s >= 0.75: return ("STRONG BUY",  "#4ade80")
+    if s >= 0.60: return ("BUY",         "#86efac")
+    if s >= 0.40: return ("NEUTRAL",     "#94a3b8")
+    if s >= 0.25: return ("WEAK SELL",   "#fb923c")
+    return ("SELL", "#f87171")
 
 
 def fmt_score(s):
@@ -744,10 +742,19 @@ def symbol_detail(sym_id: int):
                        s.earnings_per_share_basic_ttm, s.earnings_release_date,
                        s.dividend_yield_recent, s.number_of_employees,
                        s.total_revenue, s.net_income,
-                       sm.macro_multiplier, sm.rationale AS sector_rationale,
-                       sm.sector_name
+                       (SELECT COALESCE(MAX(macro_multiplier), 1.000)
+                          FROM sectors_macro
+                         WHERE industry_name ILIKE '%%' || s.industry || '%%')::float AS macro_multiplier,
+                       (SELECT rationale
+                          FROM sectors_macro
+                         WHERE industry_name ILIKE '%%' || s.industry || '%%'
+                         ORDER BY macro_multiplier DESC LIMIT 1) AS sector_rationale,
+                       (SELECT sector_name
+                          FROM sectors_macro
+                         WHERE industry_name ILIKE '%%' || s.industry || '%%'
+                         ORDER BY macro_multiplier DESC LIMIT 1) AS sector_name,
+                       s.ai_sector_pick, s.ai_sector_multiplier
                 FROM symbols s
-                LEFT JOIN sectors_macro sm ON sm.id = s.sector_id
                 WHERE s.id = %s
             """, (sym_id,))
             sym = cur.fetchone()
@@ -809,7 +816,8 @@ def symbol_detail(sym_id: int):
                        sentiment_score, weighted_sentiment,
                        article_summary, score_rationale, forecast_until_earnings,
                        key_events, pre_summary_data, master_summary_snapshot,
-                       stage2_prompt, company_connections
+                       stage2_prompt, company_connections,
+                       full_text, summary
                 FROM news_articles
                 WHERE symbol_id = %s AND sentiment_score IS NOT NULL
                 ORDER BY published_at DESC NULLS LAST
@@ -974,13 +982,48 @@ def symbol_detail(sym_id: int):
         stage2_p = (a.get("stage2_prompt") or "").replace("<","&lt;")
         pre_data_str = json.dumps(pre_data, indent=2).replace("<","&lt;") if pre_data else ""
 
+        # Stage 1 INPUT — raw article text fed to the pre-summarizer
+        s1_in_text = (a.get("full_text") or a.get("summary") or "").replace("<","&lt;")
+        s1_in_title = (a.get("title") or "").replace("<","&lt;")
+        s1_in_block = (f'<div style="font-size:11px;color:#475569;margin-bottom:4px"><b>Title:</b> {s1_in_title}</div>'
+                       f'<div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;'
+                       f'font-size:11px;color:#cbd5e1;white-space:pre-wrap;max-height:200px;overflow-y:auto">'
+                       f'{s1_in_text or "(no body — title-only article)"}</div>')
+
+        # Stage 2 OUTPUT — what LLM returned (score + summary + rationale + forecast + events)
+        s2_out = {
+            "sentiment_score":      float(a["sentiment_score"]) if a.get("sentiment_score") is not None else None,
+            "weighted_sentiment":   float(a["weighted_sentiment"]) if a.get("weighted_sentiment") is not None else None,
+            "article_summary":      a.get("article_summary"),
+            "score_rationale":      a.get("score_rationale"),
+            "forecast_until_earnings": a.get("forecast_until_earnings"),
+            "updated_master_summary":  a.get("master_summary_snapshot"),
+            "key_events":           a.get("key_events"),
+            "company_connections":  a.get("company_connections"),
+        }
+        try:
+            s2_out_str = json.dumps(s2_out, indent=2, default=str).replace("<","&lt;")
+        except Exception:
+            s2_out_str = "(could not serialize)"
+
+        def _stage_block(title_html, body_html):
+            return (f'<div style="margin-top:10px"><div style="font-size:10px;font-weight:700;'
+                    f'color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">{title_html}</div>'
+                    f'{body_html}</div>')
+
         llm_input_html = f"""
         <details style="margin-top:10px">
-          <summary style="cursor:pointer;font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.5px;user-select:none">🔬 What LLM received (click to expand)</summary>
+          <summary style="cursor:pointer;font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.5px;user-select:none">🔬 LLM Pipeline I/O (click to expand)</summary>
           <div style="margin-top:8px">
-            {'<div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;margin-bottom:4px">STAGE 1 PRE-SUMMARY (extracted facts)</div><div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:200px;overflow-y:auto;font-family:monospace">' + pre_data_str + '</div>' if pre_data_str else ''}
-            {'<div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;margin-top:8px;margin-bottom:4px">MASTER SUMMARY (context given to LLM)</div><div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:150px;overflow-y:auto">' + master_snap + '</div>' if master_snap else ''}
-            {'<div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;margin-top:8px;margin-bottom:4px">FULL STAGE 2 PROMPT (JSON sent to LLM)</div><div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:200px;overflow-y:auto;font-family:monospace">' + stage2_p + '</div>' if stage2_p else ''}
+            {_stage_block("☀ STAGE 1 — INPUT (raw article)", s1_in_block)}
+            {_stage_block("☀ STAGE 1 — OUTPUT (extracted facts JSON)",
+                '<div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:240px;overflow-y:auto;font-family:monospace">' + (pre_data_str or "(stage 1 not run / no data)") + '</div>')}
+            {_stage_block("▶ STAGE 2 — INPUT (full prompt sent to scorer)",
+                '<div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:280px;overflow-y:auto;font-family:monospace">' + (stage2_p or "(not saved — scored before v3.0.4)") + '</div>')}
+            {_stage_block("▶ STAGE 2 — OUTPUT (score + summary + rationale + forecast)",
+                '<div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#cbd5e1;white-space:pre-wrap;max-height:280px;overflow-y:auto;font-family:monospace">' + s2_out_str + '</div>')}
+            {_stage_block("📚 MASTER SUMMARY (rolling chain context after this article)",
+                '<div style="background:#060c18;border:1px solid #1e2535;border-radius:6px;padding:8px;font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:180px;overflow-y:auto">' + (master_snap or "—") + '</div>')}
           </div>
         </details>"""
 
@@ -1048,14 +1091,37 @@ def symbol_detail(sym_id: int):
     <div style="flex:1">
       <div style="font-size:12px;color:#475569">Updated: {upd}</div>
       <div style="font-size:12px;color:#475569">Articles scored: {len(articles)}</div>
-      {''.join([
-        f'<div style="font-size:12px;color:#94a3b8;margin-top:8px;line-height:1.8">',
-        f'<span style="color:#64748b">Base avg (time-decayed): </span><span style="color:#fcd34d;font-weight:700">{fmt(round(sc / sym["macro_multiplier"], 6) if sym.get("macro_multiplier") and sym["macro_multiplier"] != 0 else sc)}</span><br>',
-        f'<span style="color:#64748b">Sector multiplier (</span><span style="color:#60a5fa">{sym.get("sector_name") or "—"}</span><span style="color:#64748b">): </span><span style="color:#34d399;font-weight:700">×{fmt(sym.get("macro_multiplier"))}</span>',
-        f'<span style="color:#64748b;margin-left:8px;font-size:11px">(+{fmt(round((sym["macro_multiplier"]-1)*100 if sym.get("macro_multiplier") else 0, 2))}% boost)</span><br>' if sym.get("macro_multiplier") and sym["macro_multiplier"] > 1 else '<br>',
-        f'<span style="color:#64748b">Final score: </span><span style="color:{col};font-weight:700">{fmt_score(sc)}</span>',
-        f'</div>'
-      ]) if sym.get("macro_multiplier") else f'<div style="font-size:12px;color:#475569;margin-top:4px">No sector multiplier</div>'}
+      {(lambda: (
+        (lambda macro, ai_mult, ai_pick, sector: (
+          (lambda base: (
+            f'<div style="font-size:12px;color:#94a3b8;margin-top:8px;line-height:1.8">'
+            f'<span style="color:#64748b">Base avg (time-decayed, weighted): </span>'
+            f'<span style="color:#fcd34d;font-weight:700">{fmt(base)}</span><br>'
+            f'<span style="color:#64748b">Macro multiplier (</span>'
+            f'<span style="color:#60a5fa">{sector or "—"}</span>'
+            f'<span style="color:#64748b">): </span>'
+            f'<span style="color:#34d399;font-weight:700">×{fmt(macro)}</span>'
+            + (f'<span style="color:#64748b;margin-left:8px;font-size:11px">(+{fmt(round((macro-1)*100, 2))}% boost)</span>' if macro and macro > 1 else '')
+            + (f'<span style="color:#f87171;margin-left:8px;font-size:11px">({fmt(round((macro-1)*100, 2))}% drag)</span>' if macro and macro < 1 else '')
+            + '<br>'
+            f'<span style="color:#64748b">AI sector multiplier (</span>'
+            f'<span style="color:#60a5fa">{ai_pick or "—"}</span>'
+            f'<span style="color:#64748b">): </span>'
+            f'<span style="color:#34d399;font-weight:700">×{fmt(ai_mult)}</span>'
+            + (f'<span style="color:#64748b;margin-left:8px;font-size:11px">(+{fmt(round((ai_mult-1)*100, 2))}% boost)</span>' if ai_mult and ai_mult > 1 else '')
+            + (f'<span style="color:#f87171;margin-left:8px;font-size:11px">({fmt(round((ai_mult-1)*100, 2))}% drag)</span>' if ai_mult and ai_mult < 1 else '')
+            + '<br>'
+            f'<span style="color:#64748b">Final = base × macro × ai_sec: </span>'
+            f'<span style="color:{col};font-weight:700">{fmt_score(sc)}</span>'
+            f'</div>'
+          ))(round(float(sc) / (macro * ai_mult), 6) if (macro and ai_mult and (macro * ai_mult) != 0) else float(sc))
+        ))(
+          float(sym.get("macro_multiplier") or 1.0),
+          float(sym.get("ai_sector_multiplier") or 1.0),
+          sym.get("ai_sector_pick"),
+          sym.get("sector_name"),
+        )
+      ))() if (sym.get("macro_multiplier") or sym.get("ai_sector_multiplier")) else '<div style="font-size:12px;color:#475569;margin-top:4px">No multipliers</div>'}
     </div>
   </div>
 

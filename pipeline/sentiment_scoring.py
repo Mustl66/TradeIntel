@@ -53,6 +53,8 @@ from pipeline_config import (  # noqa — patched below
     SUMMARY_LLM_MODEL,
     SENTIMENT_LAMBDA,
     DECAY_GRACE_MONTHS,
+    NEUTRAL_SCORE_THRESHOLD,
+    SYMBOL_LIMIT,
     STAGE1_PARALLEL_WORKERS,
     STAGE2_PARALLEL_WORKERS,
     SKIP_WORKER_COUNT_DETECTION,
@@ -348,13 +350,20 @@ def _extract_json(raw: str) -> Optional[dict]:
 
 
 def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optional[dict]:
-    """Fast pre-summarization. Returns dict or None on failure."""
+    """Fast pre-summarization. Returns dict or None on failure.
+
+    Determinism: temperature near zero + top_p=1 + fixed seed (when supported)
+    so the same article yields the same JSON across runs and across models
+    that honor these knobs.
+    """
     model = model_override or SUMMARY_LLM_MODEL
     try:
         kwargs1 = dict(
             model=model,
-            temperature=0.05,
-            max_tokens=4096,          # was 2048 — too small, caused truncated JSON
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=4096,
+            seed=42,
             messages=[
                 {"role": "system", "content": _STAGE1_SYSTEM},
                 {"role": "user",   "content": f"Extract facts from this article:\n\n{text}"},
@@ -362,10 +371,15 @@ def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optio
         )
         if LLM_TYPE in ("ollama", "local"):
             kwargs1["extra_body"] = {
-                "num_ctx": LLM_CONFIG.get("context_size", 16384),
-                "top_k":   LLM_CONFIG.get("top_k", 40),
-                "format":  "json",
+                "num_ctx":     LLM_CONFIG.get("context_size", 16384),
+                "top_k":       1,        # greedy decoding for determinism
+                "num_predict": 4096,
+                "seed":        42,
+                "format":      "json",
             }
+            # ollama/local typically doesn't honor top-level seed; the
+            # extra_body version is what reaches the runtime.
+            kwargs1.pop("seed", None)
         elif LLM_TYPE in ("api", "anthropic"):
             kwargs1["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs1)
@@ -395,12 +409,34 @@ def _build_stage2_prompt(
     stage1_result: Optional[dict],
     previous_article_summary: Optional[str] = None,
 ) -> str:
-    # Article text: use Stage 1 output if available, else raw text
+    # Article body fed to stage 2:
+    #   • Stage 1 ON  → use the extracted-facts JSON (compact, structured)
+    #   • Stage 1 OFF → use raw article text. Prefer full_text; fall back to
+    #     RSS summary. If both are empty (title-only article) we leave it
+    #     empty and stage 2 has to score from the title alone.
+    raw_full   = (article.get("full_text") or "").strip()
+    raw_summary = (article.get("summary") or "").strip()
     if stage1_result:
         text_block = _json_dumps(stage1_result)
+        current_article = {
+            "title":           article["title"],
+            "published_at":    article["published_at"].isoformat() if hasattr(article["published_at"], "isoformat") else str(article["published_at"]),
+            "stage1_facts":    text_block,
+            "_pre_summarization": "ON",
+        }
     else:
-        raw = (article.get("full_text") or article.get("summary") or "")
-        text_block = raw
+        # Stage 1 disabled — give the scorer everything we have.
+        body = raw_full or raw_summary or ""
+        current_article = {
+            "title":             article["title"],
+            "published_at":      article["published_at"].isoformat() if hasattr(article["published_at"], "isoformat") else str(article["published_at"]),
+            "raw_full_text":     body,
+            "rss_summary":       raw_summary if (raw_full and raw_summary and raw_full != raw_summary) else None,
+            "_pre_summarization": "OFF",
+            "_note":             "Stage 1 pre-summarization disabled — score directly from raw text above.",
+        }
+        # Strip Nones for clean prompt
+        current_article = {k: v for k, v in current_article.items() if v is not None}
 
     payload = {
         "symbol": symbol,
@@ -410,24 +446,29 @@ def _build_stage2_prompt(
             "last_article_score": last_score,
             "last_article_summary": previous_article_summary or None,
         },
-        "current_article": {
-            "title":        article["title"],
-            "published_at": article["published_at"].isoformat() if hasattr(article["published_at"], "isoformat") else str(article["published_at"]),
-            "text_snippet": text_block,
-        },
+        "current_article": current_article,
     }
     return _json_dumps(payload)
 
 
 def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict]:
-    """Main sentiment LLM call. Returns parsed dict or None. Retries on bad JSON."""
+    """Main sentiment LLM call. Returns parsed dict or None. Retries on bad JSON.
+
+    Determinism knobs (so same article + same prompt → same output across runs
+    and across models that honor these settings):
+      - temperature pinned to 0.0
+      - top_p pinned to 1.0
+      - seed=42 (API providers that honor it)
+      - For Ollama: top_k=1 (greedy) + extra_body seed + format=json
+    """
     kwargs = {
         "model":             LLM_CONFIG["model"],
-        "temperature":       LLM_CONFIG["temperature"],
+        "temperature":       0.0,
+        "top_p":             1.0,
         "max_tokens":        LLM_CONFIG["max_tokens"],
-        "top_p":             LLM_CONFIG["top_p"],
         "frequency_penalty": LLM_CONFIG["frequency_penalty"],
         "presence_penalty":  LLM_CONFIG["presence_penalty"],
+        "seed":              42,
         "messages": [
             {"role": "system", "content": _STAGE2_SYSTEM},
             {"role": "user",   "content": prompt},
@@ -437,8 +478,12 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
         kwargs["extra_body"] = {
             "num_ctx":     LLM_CONFIG.get("context_size", 16384),
             "num_predict": LLM_CONFIG.get("max_tokens", 4096),
-            "top_k":       LLM_CONFIG.get("top_k", 40),
+            "top_k":       1,        # greedy decoding for determinism
+            "seed":        42,
+            "format":      "json",   # force JSON-mode grammar — no prose prefix
         }
+        # Ollama doesn't honor top-level seed — extra_body version is what reaches the runtime.
+        kwargs.pop("seed", None)
     elif LLM_TYPE in ("api", "anthropic"):
         kwargs["response_format"] = {"type": "json_object"}
     last_raw = None
@@ -472,6 +517,22 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
 
 
 # ── Time-decay ────────────────────────────────────────────────────────────────
+
+def _decay_weight(published_at: datetime, lam: float = SENTIMENT_LAMBDA) -> float:
+    """
+    Decay weight in [0, 1]. 1.0 inside the grace window, then exp(-lam * t_hours).
+    Use this as the weight in a weighted mean — DO NOT also multiply the raw
+    score by it for aggregation, or decay gets double-applied.
+    """
+    now = datetime.now(timezone.utc)
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    age_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
+    grace_hours = DECAY_GRACE_MONTHS * 30.44 * 24
+    if age_hours <= grace_hours:
+        return 1.0
+    return math.exp(-lam * (age_hours - grace_hours))
+
 
 def _time_decay(score: float, published_at: datetime, lam: float = SENTIMENT_LAMBDA) -> float:
     """
@@ -801,6 +862,9 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
     random.shuffle(normal_rows)
 
     rows = priority_rows + normal_rows
+    # Hard cap total worklist size to the user's SYMBOL_LIMIT. Priority rows are kept first.
+    if limit and len(rows) > limit:
+        rows = rows[:limit]
     if priority_rows:
         logger.debug(f"[priority_queue] {len(priority_rows)} priority symbol(s) at head of run: "
                      f"{[r['symbol'] for r in priority_rows]}")
@@ -850,50 +914,236 @@ def _load_all_sectors(conn) -> list[dict]:
     return [{"sector_name": r[0], "industry_name": r[1], "macro_multiplier": float(r[2])} for r in rows]
 
 
-def _call_ai_sector_pick(main_client, symbol: str, master_summary: str, sectors: list) -> str:
+def _call_ai_sector_pick(main_client, symbol: str, master_summary: str,
+                          sectors: list, hint_candidates: list[str] | None = None) -> str:
     """
-    Dedicated LLM call after all articles are scored.
-    Uses the final master_summary to pick the best sector from sectors_macro.
-    Returns 'sector_name | industry_name' string or empty string on failure.
+    Two-stage sector picker that survives a 672-entry catalog at 16k ctx.
+
+    Stage A: pick the sector_name from the ~164 distinct sectors (small list, fast).
+    Stage B: pick the industry_name from only the industries inside that sector
+             (typically 1-200 entries, but bounded to a single sector).
+
+    `hint_candidates` is an optional list of per-article `extracted_facts.
+    ai_sector_pick_hint` values from Stage 2. Most common hint is shown as
+    a soft guide in both stages.
+
+    Returns 'sector_name | industry_name' verbatim from the catalog, or
+    empty string on failure.
     """
     if not sectors or not master_summary:
         return ""
 
-    sector_list = "\n".join(
-        f"- {s['sector_name']} | {s['industry_name']}"
-        for s in sectors
-    )
+    # Aggregate hints (top-3 most common, used in both stages).
+    hint_lines = ""
+    if hint_candidates:
+        from collections import Counter
+        cnt = Counter(h.strip() for h in hint_candidates if h and h.strip())
+        if cnt:
+            top = cnt.most_common(3)
+            hint_lines = ("\nHints from per-article extraction (soft guide, final must be from list):\n"
+                          + "\n".join(f"  - {label} (×{n})" for label, n in top) + "\n")
 
-    prompt = (
-        f"You are a financial sector analyst.\n\n"
-        f"Symbol: {symbol}\n\n"
-        f"Company Summary (accumulated from all recent news):\n{master_summary}\n\n"
-        f"Available Sectors (sector_name | industry_name):\n{sector_list}\n\n"
-        f"Task: Select the SINGLE best matching sector from the list above that fits this company's "
-        f"core business and recent news activity. You must return ONLY a JSON object in this exact format:\n"
-        f"{{\"ai_sector_pick\": \"sector_name | industry_name\"}}\n\n"
-        f"Rules:\n"
-        f"- Pick ONLY from the list above. Never invent a sector.\n"
-        f"- Return the exact string as it appears in the list.\n"
-        f"- No explanation, no markdown, just the JSON object."
-    )
+    # Distinct sector list (preserves insertion order via dict)
+    sector_index: dict[str, list[dict]] = {}
+    for s in sectors:
+        sector_index.setdefault(s["sector_name"], []).append(s)
+    sector_names = list(sector_index.keys())
 
-    try:
-        resp = main_client.chat.completions.create(
+    def _ollama_kwargs(prompt: str, max_out: int) -> dict:
+        kw = dict(
             model=LLM_CONFIG["model"],
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=64,
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_out,
+            seed=42,
         )
-        raw = resp.choices[0].message.content.strip()
+        if LLM_TYPE in ("ollama", "local"):
+            kw["extra_body"] = {
+                "num_ctx":     LLM_CONFIG.get("context_size", 16384),
+                "num_predict": max_out,
+                "top_k":       1,
+                "seed":        42,
+                "format":      "json",
+            }
+            kw.pop("seed", None)
+        elif LLM_TYPE in ("api", "anthropic"):
+            kw["response_format"] = {"type": "json_object"}
+        return kw
+
+    # Cap master_summary so the prompt fits even when sector list is long.
+    ms = (master_summary or "")[:4000]
+
+    # ── Stage A: pick the sector_name ────────────────────────────────────────
+    sec_list = "\n".join(f"- {n}" for n in sector_names)
+    prompt_a = (
+        f"You are a financial sector classifier. Pick the SINGLE best matching "
+        f"sector for the company below.\n\n"
+        f"Symbol: {symbol}\n\n"
+        f"Company Summary:\n{ms}\n\n"
+        f"Sectors (pick ONE):\n{sec_list}\n"
+        f"{hint_lines}\n"
+        f"Return ONLY JSON: {{\"sector\": \"<sector_name>\"}}\n"
+        f"Rules: exact verbatim string from list, no explanation, no markdown."
+    )
+    chosen_sector: str = ""
+    try:
+        # Gemma reasoning models consume ~500-1000 hidden tokens before output —
+        # need a generous num_predict or the JSON never gets emitted.
+        resp = main_client.chat.completions.create(**_ollama_kwargs(prompt_a, 1536))
+        raw = (resp.choices[0].message.content or "").strip()
         parsed = _extract_json(raw) or {}
-        pick = parsed.get("ai_sector_pick", "").strip()
-        if pick:
-            logger.info(f"[{symbol}] ai_sector_pick → '{pick}'")
-        return pick
+        chosen_sector = (parsed.get("sector") or "").strip()
     except Exception as e:
-        logger.warning(f"[{symbol}] ai_sector_pick call failed: {e}")
+        logger.warning(f"[{symbol}] ai_sector_pick stageA failed: {e}")
+
+    # Snap stage A output to a real sector_name
+    if chosen_sector:
+        # exact, then case-insensitive, then substring
+        lookup = {n.lower(): n for n in sector_names}
+        sec_lower = chosen_sector.lower()
+        if sec_lower in lookup:
+            chosen_sector = lookup[sec_lower]
+        else:
+            hits = [n for n in sector_names if sec_lower in n.lower() or n.lower() in sec_lower]
+            chosen_sector = hits[0] if hits else ""
+
+    # Fallback: try the hint's sector half if stage A produced nothing.
+    if not chosen_sector and hint_candidates:
+        for h in hint_candidates:
+            head = (h.split("|", 1)[0] if "|" in h else h).strip()
+            for n in sector_names:
+                if head.lower() == n.lower() or head.lower() in n.lower():
+                    chosen_sector = n
+                    break
+            if chosen_sector:
+                break
+
+    if not chosen_sector:
+        logger.warning(f"[{symbol}] ai_sector_pick stageA returned no sector — skipping")
         return ""
+
+    industries_in_sector = sector_index[chosen_sector]
+
+    # ── Stage B: pick the industry_name within the chosen sector ──────────────
+    if len(industries_in_sector) == 1:
+        only = industries_in_sector[0]
+        pick = f"{only['sector_name']} | {only['industry_name']}"
+        logger.info(f"[{symbol}] ai_sector_pick → '{pick}' (single industry in sector)")
+        return pick
+
+    ind_list = "\n".join(f"[{i+1}] {s['industry_name']}" for i, s in enumerate(industries_in_sector))
+    prompt_b = (
+        f"Within the '{chosen_sector}' sector, pick the SINGLE best matching "
+        f"industry for the company below.\n\n"
+        f"Symbol: {symbol}\n\n"
+        f"Company Summary:\n{ms}\n\n"
+        f"Industries inside '{chosen_sector}' (pick ONE):\n{ind_list}\n"
+        f"{hint_lines}\n"
+        f"Return ONLY JSON: {{\"industry\": \"<industry_name>\"}}\n"
+        f"Rules: exact verbatim string, no leading '[N]' index, no explanation."
+    )
+    chosen_industry: str = ""
+    try:
+        resp = main_client.chat.completions.create(**_ollama_kwargs(prompt_b, 1536))
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _extract_json(raw) or {}
+        chosen_industry = (parsed.get("industry") or "").strip()
+    except Exception as e:
+        logger.warning(f"[{symbol}] ai_sector_pick stageB failed: {e}")
+
+    # Snap stage B output to a real industry_name inside chosen_sector
+    pick = ""
+    if chosen_industry:
+        import re as _re
+        chosen_industry = _re.sub(r"^\[\d+\]\s*", "", chosen_industry).strip("\"'")
+        lookup = {s["industry_name"].lower(): s["industry_name"] for s in industries_in_sector}
+        ci_lower = chosen_industry.lower()
+        snapped = lookup.get(ci_lower)
+        if not snapped:
+            # substring within this sector only
+            hits = [s["industry_name"] for s in industries_in_sector
+                    if ci_lower in s["industry_name"].lower() or s["industry_name"].lower() in ci_lower]
+            if hits:
+                snapped = max(hits, key=len)
+        if snapped:
+            pick = f"{chosen_sector} | {snapped}"
+
+    # Fallback: if stage B failed, take the shortest industry name in this
+    # sector (usually the most generic, e.g. just the sector again).
+    if not pick:
+        fallback = min(industries_in_sector, key=lambda s: len(s["industry_name"]))
+        pick = f"{chosen_sector} | {fallback['industry_name']}"
+        logger.info(f"[{symbol}] ai_sector_pick stageB miss — using shortest industry '{pick}'")
+    else:
+        logger.info(f"[{symbol}] ai_sector_pick → '{pick}'")
+
+    return pick
+
+
+def _snap_sector_pick(raw_pick: str, sectors: list) -> str:
+    """
+    Force-validate the LLM's sector pick against the actual sectors_macro catalog.
+
+    Accepts a variety of separators ('|', '/', '-', '>', ':', ',') and snaps
+    to the catalog entry whose 'sector_name | industry_name' best matches.
+
+    Returns the canonical 'sector_name | industry_name' string from the
+    catalog, or empty string if no plausible match.
+    """
+    if not raw_pick or not sectors:
+        return ""
+    import re as _re
+
+    # Strip JSON fences, quotes, leading "[N]" indices
+    raw = raw_pick.strip()
+    raw = _re.sub(r"^\[\d+\]\s*", "", raw)
+    raw = raw.strip(" \t\r\n\"'")
+
+    # Build canonical labels and case-folded lookup
+    canon = [f"{s['sector_name']} | {s['industry_name']}" for s in sectors]
+    canon_lower = {c.lower(): c for c in canon}
+
+    # Direct verbatim hit
+    if raw.lower() in canon_lower:
+        return canon_lower[raw.lower()]
+
+    # Normalize separators: replace any of `/`, `>`, `-`, `:`, `,` between
+    # the two parts with a pipe.
+    norm = _re.sub(r"\s*[|/>:,\-]\s*", " | ", raw, count=1)
+    if norm.lower() in canon_lower:
+        return canon_lower[norm.lower()]
+
+    # Split on the first separator, try (sector, industry) exact match
+    parts = _re.split(r"\s*[|/>:,\-]\s*", raw, maxsplit=1)
+    sector = parts[0].strip().lower() if parts else ""
+    industry = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if sector and industry:
+        for s in sectors:
+            if (s["sector_name"].lower() == sector
+                    and s["industry_name"].lower() == industry):
+                return f"{s['sector_name']} | {s['industry_name']}"
+
+    # Industry-only exact match (LLM dropped sector)
+    if industry or sector:
+        needle = industry or sector
+        for s in sectors:
+            if s["industry_name"].lower() == needle:
+                return f"{s['sector_name']} | {s['industry_name']}"
+
+    # Substring match on industry_name (most-specific wins)
+    if industry or sector:
+        needle = industry or sector
+        cand = [s for s in sectors if needle in s["industry_name"].lower()]
+        if not cand and sector:
+            cand = [s for s in sectors if sector in s["sector_name"].lower()]
+        if cand:
+            # Prefer longest industry_name (more specific)
+            best = max(cand, key=lambda s: len(s["industry_name"]))
+            return f"{best['sector_name']} | {best['industry_name']}"
+
+    return ""
 
 
 def _resolve_ai_sector_multiplier(conn, ai_sector_pick: str) -> float:
@@ -950,6 +1200,8 @@ def _save_article_result(cur, article_id: int, result: dict,
         "article_summary":         _to_str(result.get("article_summary"), 500),
         "master_summary_snapshot": master_snapshot,
         "key_events":              json.dumps(result.get("key_events") or {}),
+        "extracted_facts":         json.dumps(result.get("extracted_facts") or {}),
+        "ai_sector_pick_hint":     _to_str((result.get("extracted_facts") or {}).get("ai_sector_pick_hint"), 200),
         "score_rationale":         _to_str(result.get("score_rationale"), 1000),
         "forecast_until_earnings": _to_str(result.get("forecast_until_earnings"), 2000),
         "stage2_prompt":           stage2_prompt,
@@ -965,6 +1217,8 @@ def _save_article_result(cur, article_id: int, result: dict,
             article_summary         = %(article_summary)s,
             master_summary_snapshot = %(master_summary_snapshot)s,
             key_events              = %(key_events)s::jsonb,
+            extracted_facts         = %(extracted_facts)s::jsonb,
+            ai_sector_pick_hint     = %(ai_sector_pick_hint)s,
             pre_summary_data        = COALESCE(%(pre_summary_data)s::jsonb, pre_summary_data),
             score_rationale         = %(score_rationale)s,
             forecast_until_earnings = %(forecast_until_earnings)s,
@@ -995,11 +1249,23 @@ def _save_article_result(cur, article_id: int, result: dict,
 def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
                         forecast: str, weighted_scores: list[float],
                         macro_multiplier: float, ai_sector_pick: str = "",
-                        ai_sector_multiplier: float = 1.000):
+                        ai_sector_multiplier: float = 1.000,
+                        raw_weight_pairs: list[tuple[float, float]] | None = None):
     if not weighted_scores:
         return
-    avg_weighted = sum(weighted_scores) / len(weighted_scores)
+    # Prefer the proper weighted mean if (raw, weight) pairs were provided.
+    # Falls back to the legacy "mean of decayed scores" path for callers that
+    # haven't been migrated yet.
+    if raw_weight_pairs:
+        total_w = sum(w for _, w in raw_weight_pairs)
+        if total_w > 0:
+            avg_weighted = sum(r * w for r, w in raw_weight_pairs) / total_w
+        else:
+            avg_weighted = sum(weighted_scores) / len(weighted_scores)
+    else:
+        avg_weighted = sum(weighted_scores) / len(weighted_scores)
     final_score  = round(avg_weighted * macro_multiplier * ai_sector_multiplier, 6)
+    final_score  = max(-1.0, min(1.0, final_score))  # clamp to [-1, 1]
     cur.execute("""
         UPDATE symbols SET
             symbol_master_summary      = %s,
@@ -1074,6 +1340,8 @@ def _process_symbol(
     last_score          = sym.get("final_score") or 0.0
     last_article_summary = None
     weighted_scores     = []
+    raw_weight_pairs: list[tuple[float, float]] = []  # (raw_score, decay_weight) — for true weighted mean
+    ai_sector_hints: list[str] = []  # per-article extracted_facts.ai_sector_pick_hint values
     last_forecast       = ""
     scored  = 0
     skipped = 0
@@ -1119,7 +1387,10 @@ def _process_symbol(
             try: conn.rollback()
             except Exception: pass
 
-        if article.get("pre_summary_data"):
+        # Reuse cached pre_summary ONLY when stage 1 is enabled. When the user
+        # disables ENABLE_PRE_SUMMARIZATION we want the raw article text to
+        # go directly to stage 2 — ignore any stale cache from prior runs.
+        if ENABLE_PRE_SUMMARIZATION and article.get("pre_summary_data"):
             return _s1_pool.submit(lambda c=article["pre_summary_data"]: (c, 0.0))
         if ENABLE_PRE_SUMMARIZATION:
             raw_text = (article.get("full_text") or article.get("summary") or "")
@@ -1149,12 +1420,13 @@ def _process_symbol(
 
         # Already scored — use its weighted score for final calc but skip LLM
         if article["sentiment_score"] is not None:
-            weighted_scores.append(float(article["sentiment_score"]) *
-                                   math.exp(-SENTIMENT_LAMBDA *
-                                            max(0, (datetime.now(timezone.utc) - (
-                                                published_at if published_at.tzinfo
-                                                else published_at.replace(tzinfo=timezone.utc)
-                                            )).total_seconds() / 3600)))
+            _raw_prev = float(article["sentiment_score"])
+            if abs(_raw_prev) < NEUTRAL_SCORE_THRESHOLD:
+                skipped += 1
+                continue  # noise filter — neutral articles don't dilute the mean
+            _w_prev = _decay_weight(published_at)
+            weighted_scores.append(_raw_prev * _w_prev)
+            raw_weight_pairs.append((_raw_prev, _w_prev))
             skipped += 1
             continue
 
@@ -1205,6 +1477,7 @@ def _process_symbol(
         raw_score = max(-1.0, min(1.0, raw_score + _ob))
 
         weighted  = _time_decay(raw_score, published_at)
+        decay_w   = _decay_weight(published_at)
 
         # Save to DB
         with conn.cursor() as cur:
@@ -1218,6 +1491,11 @@ def _process_symbol(
         last_score          = raw_score
         last_article_summary = result.get("article_summary") or None
         weighted_scores.append(weighted)
+        _hint = (result.get("extracted_facts") or {}).get("ai_sector_pick_hint")
+        if _hint and isinstance(_hint, str):
+            ai_sector_hints.append(_hint)
+        if abs(raw_score) >= NEUTRAL_SCORE_THRESHOLD:
+            raw_weight_pairs.append((raw_score, decay_w))
         scored += 1
 
         title_short = (article.get("title") or "")[:60]
@@ -1232,13 +1510,15 @@ def _process_symbol(
     if weighted_scores:
         # Dedicated AI sector pick — runs once after all articles scored
         all_sectors = _load_all_sectors(conn)
-        ai_sector_pick = _call_ai_sector_pick(main_client, symbol, master_summary, all_sectors)
+        ai_sector_pick = _call_ai_sector_pick(main_client, symbol, master_summary,
+                                              all_sectors, hint_candidates=ai_sector_hints)
         ai_sector_mult = _resolve_ai_sector_multiplier(conn, ai_sector_pick)
         with conn.cursor() as cur:
             _save_symbol_scores(cur, sym_id, master_summary,
                                 last_forecast, weighted_scores, macro_mult,
                                 ai_sector_pick=ai_sector_pick,
-                                ai_sector_multiplier=ai_sector_mult)
+                                ai_sector_multiplier=ai_sector_mult,
+                                raw_weight_pairs=raw_weight_pairs)
         conn.commit()
         avg_w = sum(weighted_scores) / len(weighted_scores)
         logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
@@ -1256,9 +1536,25 @@ def _process_symbol(
 def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     """
     Score all symbols with unscored articles.
-    limit=0 → all symbols. limit=N → first N symbols only.
+
+    Effective limit (in order of precedence):
+      1. explicit `limit` argument > 0  → use it
+      2. otherwise SYMBOL_LIMIT from pipeline_config (int N → first N symbols,
+         False / 0 / None → all)
     Worker count is auto-sized from free VRAM at startup.
     """
+    # Resolve effective cap from pipeline_config when caller didn't pin one.
+    effective_limit = limit
+    if not effective_limit:
+        # SYMBOL_LIMIT may be False, 0, None, or a positive int.
+        try:
+            _sl = int(SYMBOL_LIMIT) if SYMBOL_LIMIT else 0
+        except (TypeError, ValueError):
+            _sl = 0
+        effective_limit = _sl
+    if effective_limit and effective_limit > 0:
+        logger.info(f"[sentiment_scoring] SYMBOL_LIMIT active — capping run to {effective_limit} symbols")
+
     started_at = datetime.now(timezone.utc)
     conn = get_conn()
 
@@ -1285,7 +1581,7 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
         logger.warning(f"[active_processing] init failed: {e}")
         conn.rollback()
 
-    symbols = _get_symbols_with_unscored(conn, exchange, limit)
+    symbols = _get_symbols_with_unscored(conn, exchange, effective_limit)
     if not symbols:
         logger.info("[sentiment_scoring] No symbols with unscored articles.")
         conn.close()
@@ -1458,6 +1754,12 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
                     continue
                 # Skip if already submitted AND not a fresh priority entry
                 if sid in seen_ids and sid not in pq_ids:
+                    continue
+                # Respect SYMBOL_LIMIT for non-priority refills.
+                # Priority-queue entries always jump the line (user explicitly queued them).
+                if effective_limit and effective_limit > 0 \
+                        and sid not in pq_ids \
+                        and len(seen_ids) >= effective_limit:
                     continue
                 # Rescore case: previously processed but now re-queued via priority.
                 # Only re-add if it actually has unscored articles AND isn't running.

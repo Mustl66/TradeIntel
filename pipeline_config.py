@@ -60,10 +60,11 @@ SKILLS_ENABLED = False
 
 # ── Phase 4: Sentiment Scoring ────────────────────────────────────────────────
 MAX_EVAL_ARTICLES        = 12      # rolling window per symbol (newest N articles)
-ENABLE_PRE_SUMMARIZATION = True    # Stage 1 fast summarizer before main LLM
+ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
-SENTIMENT_LAMBDA         = 0.001   # time-decay lambda (per hour) — applied only AFTER grace period
-DECAY_GRACE_MONTHS       = 6       # no decay for articles younger than this many months
+SENTIMENT_LAMBDA         = 0.005   # time-decay lambda (per hour) — applied only AFTER grace period
+DECAY_GRACE_MONTHS       = 1       # no decay for articles younger than this many months
+NEUTRAL_SCORE_THRESHOLD  = 0.1    # skip articles where |sentiment_score| < this from aggregation (noise filter)
 
 # ── Stage 1 parallel workers (gemma-4-e2b pre-summarization) ──────────────────
 # Stage 1 is stateless per article — safe to run in parallel.
