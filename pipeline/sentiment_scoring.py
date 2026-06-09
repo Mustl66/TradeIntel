@@ -172,13 +172,16 @@ def _lmstudio_unload_model(root: str, instance_id: str) -> None:
         logger.debug(f"[lmstudio_unload] '{instance_id}' error (non-fatal): {e}")
 
 
-def _lmstudio_load_model(base_url: str, model_id: str, context_length: int) -> bool:
+def _lmstudio_load_model(base_url: str, model_id: str, context_length: int,
+                         parallel_slots: int = 1) -> bool:
     """Force-load a model via LM Studio /api/v1/models/load (LM Studio >= 0.4.0).
 
     Steps:
       1. Check if model already loaded with correct context — skip if so.
       2. Unload any existing instances that have wrong context.
-      3. Load fresh with context_length from config.
+      3. Load fresh with context_length from config + N parallel inference slots
+         so ONE instance handles N concurrent chat completions (instead of
+         LM Studio's JIT spawning N duplicate instances).
 
     LM Studio 0.4.x auto-maximizes GPU layers — no gpu_offload param needed.
     Returns True on success."""
@@ -193,33 +196,50 @@ def _lmstudio_load_model(base_url: str, model_id: str, context_length: int) -> b
             for m in r.json().get("models", []):
                 if m.get("key") == model_id:
                     for inst in m.get("loaded_instances", []):
-                        inst_ctx = inst.get("config", {}).get("context_length", 0)
+                        cfg = inst.get("config", {})
+                        inst_ctx = cfg.get("context_length", 0)
+                        inst_par = cfg.get("parallel", 1) or 1
                         inst_id  = inst.get("id", model_id)
-                        if inst_ctx == context_length:
+                        if inst_ctx == context_length and inst_par == parallel_slots:
                             logger.info(
                                 f"[lmstudio_load] '{model_id}' already loaded "
-                                f"ctx={context_length} — skipping"
+                                f"ctx={context_length} parallel={parallel_slots} — skipping"
                             )
                             return True
                         else:
                             logger.info(
                                 f"[lmstudio_load] Unloading '{inst_id}' "
-                                f"(ctx={inst_ctx} → need {context_length})"
+                                f"(ctx={inst_ctx}/par={inst_par} → "
+                                f"need ctx={context_length}/par={parallel_slots})"
                             )
                             _lmstudio_unload_model(root, inst_id)
     except Exception as e:
         logger.debug(f"[lmstudio_load] state check failed (non-fatal): {e}")
 
-    # Load with desired context_length
+    # Load with desired context_length + parallel slots so a SINGLE instance
+    # serves all concurrent worker requests. Without this LM Studio's JIT
+    # auto-load spawns one fresh instance per concurrent request, multiplying
+    # VRAM use by N.
+    #
+    # LM Studio's /api/v1/models/load is strict — unknown keys are REJECTED
+    # with HTTP 400 'unrecognized_keys'. As of LM Studio 0.4.x the accepted
+    # keys for our use case are exactly: model, context_length, parallel, ttl.
+    payload = {
+        "model": model_id,
+        "context_length": context_length,
+        "parallel": parallel_slots,
+        "ttl": -1,
+    }
     try:
         resp = requests.post(
             f"{root}/api/v1/models/load",
-            json={"model": model_id, "context_length": context_length},
+            json=payload,
             timeout=120,
         )
         if resp.status_code in (200, 201):
             logger.info(
-                f"[lmstudio_load] '{model_id}' loaded — ctx={context_length}"
+                f"[lmstudio_load] '{model_id}' loaded — ctx={context_length} "
+                f"parallel_slots={parallel_slots}"
             )
             return True
         else:
@@ -248,11 +268,18 @@ def _warmup_models(main_client: OpenAI, summary_client: OpenAI) -> None:
 
     if LLM_TYPE == "local":
         # LM Studio: force-load both models via REST API with correct settings.
-        # Stage 1 (e2b) first — smaller, loads faster.
-        ok1 = _lmstudio_load_model(stage1_base_url, SUMMARY_LLM_MODEL,  ctx_size)
-        ok2 = _lmstudio_load_model(base_url,        LLM_CONFIG["model"], ctx_size)
+        # parallel_slots = worker count so a SINGLE instance serves all workers
+        # instead of LM Studio JIT-spawning N duplicate instances.
+        s1_slots = max(1, STAGE1_PARALLEL_WORKERS)
+        s2_slots = max(1, STAGE2_PARALLEL_WORKERS)
+        ok1 = _lmstudio_load_model(stage1_base_url, SUMMARY_LLM_MODEL,  ctx_size,
+                                   parallel_slots=s1_slots)
+        ok2 = _lmstudio_load_model(base_url,        LLM_CONFIG["model"], ctx_size,
+                                   parallel_slots=s2_slots)
         if ok1 and ok2:
-            logger.info("[warmup] Both models loaded via LM Studio API — GPU auto-max, ctx=%d", ctx_size)
+            logger.info("[warmup] Both models loaded via LM Studio API — GPU auto-max, "
+                        "ctx=%d, s1_slots=%d s2_slots=%d",
+                        ctx_size, s1_slots, s2_slots)
             return
         # Fallback: /api/v0/models/load unavailable — fall through to chat ping
         logger.warning("[warmup] LM Studio load API failed — falling back to chat ping (GPU/ctx from UI)")
@@ -383,7 +410,13 @@ def _call_stage1(client: OpenAI, text: str, model_override: str = None) -> Optio
         elif LLM_TYPE in ("api", "anthropic"):
             kwargs1["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs1)
-        raw = resp.choices[0].message.content.strip()
+        raw = ""
+        if resp and resp.choices:
+            msg = resp.choices[0].message
+            raw = (getattr(msg, "content", None) or "").strip()
+        if not raw:
+            logger.warning("[Stage1] Empty content from LLM")
+            return None
         return _extract_json(raw)
     except Exception as e:
         logger.warning(f"[Stage1] Failed: {e}")
@@ -411,11 +444,20 @@ def _build_stage2_prompt(
 ) -> str:
     # Article body fed to stage 2:
     #   • Stage 1 ON  → use the extracted-facts JSON (compact, structured)
-    #   • Stage 1 OFF → use raw article text. Prefer full_text; fall back to
-    #     RSS summary. If both are empty (title-only article) we leave it
-    #     empty and stage 2 has to score from the title alone.
-    raw_full   = (article.get("full_text") or "").strip()
-    raw_summary = (article.get("summary") or "").strip()
+    #   • Stage 1 OFF → use raw article text. Strip HTML, pick the longer
+    #     of full_text / RSS summary so stage 2 always sees the richest body
+    #     available. If both empty stage 2 scores from title alone.
+    def _strip_html(s: str) -> str:
+        if not s: return ""
+        import re as _re, html as _html
+        # decode entities, drop tags, collapse whitespace
+        s = _html.unescape(s)
+        s = _re.sub(r"<[^>]+>", " ", s)
+        s = _re.sub(r"\s+", " ", s).strip()
+        return s
+
+    raw_full    = _strip_html(article.get("full_text") or "")
+    raw_summary = _strip_html(article.get("summary") or "")
     if stage1_result:
         text_block = _json_dumps(stage1_result)
         current_article = {
@@ -425,13 +467,15 @@ def _build_stage2_prompt(
             "_pre_summarization": "ON",
         }
     else:
-        # Stage 1 disabled — give the scorer everything we have.
-        body = raw_full or raw_summary or ""
+        # Stage 1 disabled — give scorer the LONGEST clean text we have.
+        # Some sources stuff the full body into `summary`, others into `full_text`.
+        body = raw_full if len(raw_full) >= len(raw_summary) else raw_summary
+        secondary = raw_summary if body is raw_full else raw_full
         current_article = {
             "title":             article["title"],
             "published_at":      article["published_at"].isoformat() if hasattr(article["published_at"], "isoformat") else str(article["published_at"]),
             "raw_full_text":     body,
-            "rss_summary":       raw_summary if (raw_full and raw_summary and raw_full != raw_summary) else None,
+            "rss_summary":       secondary if (secondary and secondary != body) else None,
             "_pre_summarization": "OFF",
             "_note":             "Stage 1 pre-summarization disabled — score directly from raw text above.",
         }
@@ -503,7 +547,19 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
                     )},
                 ]
             resp = client.chat.completions.create(**kwargs)
-            raw = resp.choices[0].message.content.strip()
+            # Defensive: LM Studio (and some OpenAI-compat backends) can return
+            # 200 OK with choices=[] or message.content=None when their
+            # JSON-grammar enforcement aborts mid-generation. Treat any of
+            # those as "empty response" instead of crashing with NoneType.
+            raw = ""
+            if resp and resp.choices:
+                msg = resp.choices[0].message
+                raw = (getattr(msg, "content", None) or "").strip()
+            if not raw:
+                last_raw = ""
+                logger.warning(f"[Stage2] Attempt {attempt}/{retries}: empty content from LLM "
+                               f"(choices={len(resp.choices) if resp and resp.choices else 0})")
+                continue
             result = _extract_json(raw)
             if result is not None:
                 return result
@@ -1181,11 +1237,28 @@ def _resolve_ai_sector_multiplier(conn, ai_sector_pick: str) -> float:
 def _save_article_result(cur, article_id: int, result: dict,
                          master_snapshot: str, pre_summary: Optional[dict],
                          published_at: datetime, stage2_prompt: str = ""):
+    # Relevance gate: LLM may set is_relevant=false for off-topic articles.
+    # When false: force score to 0, weighted to 0, so downstream aggregation
+    # ignores it. Article row still saved (audit trail), but excluded from
+    # weighted-mean and counted as filtered in the viewer.
+    is_relevant_raw = result.get("is_relevant")
+    if isinstance(is_relevant_raw, str):
+        is_relevant = is_relevant_raw.strip().lower() in ("true", "1", "yes")
+    elif is_relevant_raw is None:
+        is_relevant = True  # default: legacy responses without the field stay in
+    else:
+        is_relevant = bool(is_relevant_raw)
+    relevance_reason = str(result.get("relevance_reason") or "")[:1000]
+
     score = float(result.get("sentiment_score", 0.0))
     outlook_bonus = float(result.get("outlook_bonus", 0.0))
     outlook_bonus = max(0.0, min(0.15, outlook_bonus))  # clamp bonus 0..0.15
-    score = max(-1.0, min(1.0, score + outlook_bonus))  # add bonus then clamp
-    weighted = _time_decay(score, published_at)
+    if is_relevant:
+        score = max(-1.0, min(1.0, score + outlook_bonus))  # add bonus then clamp
+        weighted = _time_decay(score, published_at)
+    else:
+        score = 0.0
+        weighted = 0.0
 
     def _to_str(v, limit):
         if v is None:
@@ -1197,6 +1270,8 @@ def _save_article_result(cur, article_id: int, result: dict,
     updates = {
         "sentiment_score":         score,
         "weighted_sentiment":      weighted,
+        "is_relevant":             is_relevant,
+        "relevance_reason":        relevance_reason,
         "article_summary":         _to_str(result.get("article_summary"), 500),
         "master_summary_snapshot": master_snapshot,
         "key_events":              json.dumps(result.get("key_events") or {}),
@@ -1214,6 +1289,8 @@ def _save_article_result(cur, article_id: int, result: dict,
         UPDATE news_articles SET
             sentiment_score         = %(sentiment_score)s,
             weighted_sentiment      = %(weighted_sentiment)s,
+            is_relevant             = %(is_relevant)s,
+            relevance_reason        = %(relevance_reason)s,
             article_summary         = %(article_summary)s,
             master_summary_snapshot = %(master_summary_snapshot)s,
             key_events              = %(key_events)s::jsonb,
@@ -1418,9 +1495,34 @@ def _process_symbol(
         daily_snap = _get_daily_snapshot(conn, sym_id, published_at)
         tv_snapshot = daily_snap if daily_snap else tv_snapshot_fallback
 
-        # Already scored — use its weighted score for final calc but skip LLM
+        # Already scored — use its weighted score for final calc but skip LLM.
+        # IMPORTANT: still propagate this article's stored master_summary_snapshot
+        # and forecast into the running tracker so the symbol-level save at the
+        # end of the loop ends up with real content (instead of NULL when ALL
+        # articles in this run were already scored).
         if article["sentiment_score"] is not None:
             _raw_prev = float(article["sentiment_score"])
+            # Pull cached snapshot fields so the tracker doesn't stay empty.
+            try:
+                with conn.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT master_summary_snapshot, forecast_until_earnings, "
+                        "article_summary "
+                        "FROM news_articles WHERE id = %s",
+                        (art_id,),
+                    )
+                    _row = _cur.fetchone()
+                if _row:
+                    _ms, _fc, _as = _row
+                    if _ms:
+                        master_summary = _ms
+                    if _fc:
+                        last_forecast = _fc if isinstance(_fc, str) else str(_fc)
+                    if _as:
+                        last_article_summary = _as
+                    last_score = _raw_prev
+            except Exception:
+                pass
             if abs(_raw_prev) < NEUTRAL_SCORE_THRESHOLD:
                 skipped += 1
                 continue  # noise filter — neutral articles don't dilute the mean
@@ -1476,7 +1578,17 @@ def _process_symbol(
         _ob = max(0.0, min(0.15, _ob))
         raw_score = max(-1.0, min(1.0, raw_score + _ob))
 
-        weighted  = _time_decay(raw_score, published_at)
+        # Relevance gate matches _save_article_result. Off-topic articles get
+        # saved with is_relevant=false but excluded from the aggregate score.
+        _rel_raw = result.get("is_relevant")
+        if isinstance(_rel_raw, str):
+            _is_relevant = _rel_raw.strip().lower() in ("true", "1", "yes")
+        elif _rel_raw is None:
+            _is_relevant = True
+        else:
+            _is_relevant = bool(_rel_raw)
+
+        weighted  = _time_decay(raw_score, published_at) if _is_relevant else 0.0
         decay_w   = _decay_weight(published_at)
 
         # Save to DB
@@ -1485,23 +1597,25 @@ def _process_symbol(
                                  master_summary, stage1_result, published_at,
                                  stage2_prompt=prompt)
         conn.commit()
-        master_summary      = result.get("updated_master_summary") or master_summary
+        master_summary      = result.get("updated_master_summary") or master_summary if _is_relevant else master_summary
         _fc = result.get("forecast_until_earnings")
         last_forecast       = str(_fc) if _fc and not isinstance(_fc, str) else (_fc or last_forecast)
         last_score          = raw_score
         last_article_summary = result.get("article_summary") or None
-        weighted_scores.append(weighted)
-        _hint = (result.get("extracted_facts") or {}).get("ai_sector_pick_hint")
-        if _hint and isinstance(_hint, str):
-            ai_sector_hints.append(_hint)
-        if abs(raw_score) >= NEUTRAL_SCORE_THRESHOLD:
-            raw_weight_pairs.append((raw_score, decay_w))
+        if _is_relevant:
+            weighted_scores.append(weighted)
+            _hint = (result.get("extracted_facts") or {}).get("ai_sector_pick_hint")
+            if _hint and isinstance(_hint, str):
+                ai_sector_hints.append(_hint)
+            if abs(raw_score) >= NEUTRAL_SCORE_THRESHOLD:
+                raw_weight_pairs.append((raw_score, decay_w))
         scored += 1
 
         title_short = (article.get("title") or "")[:60]
+        _rel_tag = "" if _is_relevant else " IRRELEVANT"
         logger.info(
             f"[{symbol}] article={art_id} score={raw_score:+.2f} bonus={_ob:+.2f} "
-            f"s1={t_s1}s s2={t_s2}s | {title_short}"
+            f"s1={t_s1}s s2={t_s2}s{_rel_tag} | {title_short}"
         )
 
         time.sleep(0.3)  # brief pause between articles

@@ -3,7 +3,7 @@
 
   "role": "Strict JSON-only financial analyst API. Output exactly ONE JSON object — no prose, no markdown, no fences.",
 
-  "objective": "Score the article against the symbol, update master_summary, and emit a full extracted_facts block.",
+  "objective": "FIRST decide is_relevant — drop articles not about THIS symbol. If relevant: score against the symbol, update master_summary, and emit a full extracted_facts block.",
 
   "input_contract": {
     "_pre_summarization=ON":  "current_article.stage1_facts holds the Stage 1 JSON — copy values verbatim into extracted_facts.",
@@ -39,6 +39,7 @@
   },
 
   "tasks": [
+    "0. RELEVANCE GATE — first decide is_relevant. If article is NOT materially about THIS symbol (wrong ticker, unrelated company, generic market wrap, off-topic noise, untranslatable foreign text), set is_relevant=false, sentiment_score=0.0, outlook_bonus=0.0, key_events all null, extracted_facts arrays=[] scalars=null, write relevance_reason explaining why, skip rubric scoring, and return. Otherwise set is_relevant=true and continue.",
     "1. Pick fact source per input_contract; populate FULL extracted_facts.",
     "2. Score per scoring_rubric; apply adjustment_factors; clamp final to [-1.0, 1.0].",
     "3. article_summary: ONE declarative sentence (no 'The article discusses…').",
@@ -51,7 +52,9 @@
   ],
 
   "output_schema": {
-    "sentiment_score":         "float [-1.0, 1.0] (unquoted)",
+    "is_relevant":             "boolean (unquoted true/false). TRUE iff article is materially about THIS symbol/company: covers its earnings, products, contracts, regulators, management, M&A, lawsuits, stock action, or any directly-attributable event. FALSE if mismatched ticker, unrelated company, generic market wrap, off-topic press release ingested by mistake, foreign-language untranslatable noise, or only a passing mention with no impact.",
+    "relevance_reason":        "≤200 chars. WHY relevant or irrelevant — name the entity match (or mismatch) and the link to the symbol. Required for both true and false.",
+    "sentiment_score":         "float [-1.0, 1.0] (unquoted). If is_relevant=false → set to 0.0.",
     "outlook_bonus":           "float [0.0, 0.15] (unquoted)",
     "outlook_bonus_rationale": "1–2 sentences citing forward evidence; explain why 0.00 if so.",
     "article_summary":         "one declarative sentence",
@@ -192,6 +195,8 @@
 
   "rules": [
     "Output ONE JSON object only — first char '{', last char '}'. No prose, no markdown, no fences.",
+    "is_relevant MUST be present (boolean). If false → sentiment_score=0.0, outlook_bonus=0.0, all key_events null, extracted_facts arrays=[], scalars=null. Still emit the full schema shape.",
+    "Examples of irrelevant: article about a different ticker that happens to share a name fragment; market-wide commentary mentioning the symbol only in passing; off-topic foreign-language press release; broker note covering 50 names without per-symbol substance.",
     "sentiment_score and outlook_bonus are unquoted JSON numbers.",
     "Final sentiment_score ∈ [-1.00, 1.00] after adjustments + clamp.",
     "outlook_bonus is ADDED by post-processing — do NOT pre-add it to sentiment_score.",

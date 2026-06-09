@@ -254,6 +254,18 @@ def create_tables() -> None:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='company_connections') THEN
                         ALTER TABLE news_articles ADD COLUMN company_connections JSONB;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='extracted_facts') THEN
+                        ALTER TABLE news_articles ADD COLUMN extracted_facts JSONB;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='ai_sector_pick_hint') THEN
+                        ALTER TABLE news_articles ADD COLUMN ai_sector_pick_hint TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='is_relevant') THEN
+                        ALTER TABLE news_articles ADD COLUMN is_relevant BOOLEAN;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='relevance_reason') THEN
+                        ALTER TABLE news_articles ADD COLUMN relevance_reason TEXT;
+                    END IF;
                 END$$;
             """)
             cur.execute("""

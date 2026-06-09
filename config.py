@@ -44,7 +44,7 @@ RSS_WORKERS      = int(os.getenv("RSS_WORKERS",  8))
 
 # ── LLM Tier system ──────────────────────────────────────────────────────────
 # TIER = 0 → auto-probe in order. TIER = 1..5 → force that tier.
-TIER = int(os.getenv("TIER", "4"))
+TIER = int(os.getenv("TIER", "3"))
 
 # Shared sampling defaults — same across all tiers unless overridden in the tier dict
 _SHARED_PARAMS = {
@@ -60,39 +60,40 @@ _SHARED_PARAMS = {
 
 _TIERS = {
     # ── Tier 1 ───────────────────────────────────────────────────────────────
+
     1: {
-        "base_url":        "http://10.11.12.163:8000/v1",
-        "api_key":         "ollama",
-        "model":           "gemma-4-26B-A4B-it-oQ8-fp16",
-        "stage1_base_url": "http://10.11.12.163:8000/v1",
-        "stage1_api_key":  "ollama",
-        "summary_model":   "gemma-4-E4B-it-oQ8",
-        "stage1_workers":  15,
-        "stage2_workers":  15,
+        "base_url": "http://10.11.12.237:1234/v1",
+        "api_key": "ollama",
+        "model": "gemma-4-26B-A4B-it-oQ8",
+        "stage1_base_url": "http://10.11.12.237:1234/v1",
+        "stage1_api_key": "ollama",
+        "summary_model": "gemma-4-26B-A4B-it-oQ8",
+        "stage1_workers": 8,
+        "stage2_workers": 8,
     },
 
     # ── Tier 2 ───────────────────────────────────────────────────────────────
     2: {
-        "base_url":        "http://10.11.12.163:1234/v1",
+        "base_url":        "http://10.11.12.237:8000/v1",
         "api_key":         "lmstudio",
-        "model":           "gemma-4-26b-a4b-it-oq8",
-        "stage1_base_url": "http://10.11.12.163:1234/v1",
+        "model":           "Qwen3.6-35B-A3B-oQ8-fp16-mtp",
+        "stage1_base_url": "http://10.11.12.237:8000/v1",
         "stage1_api_key":  "lmstudio",
-        "summary_model":   "gemma-4-26b-a4b-it-oq8",
-        "stage1_workers":  15,
-        "stage2_workers":  15,
+        "summary_model":   "Qwen3.6-35B-A3B-oQ8-fp16-mtp",
+        "stage1_workers":  1,
+        "stage2_workers":  1,
     },
 
     # ── Tier 3 ───────────────────────────────────────────────────────────────
     3: {
-        "base_url":        "http://10.11.12.163:1234/v1",
+        "base_url":        "http://10.11.12.8:11434/v1",
         "api_key":         "lmstudio",
-        "model":           "gemma-4-26b-a4b-it-oq8",
+        "model":           "gemma4:e4b-ctx16k",
         "stage1_base_url": "http://10.11.12.8:11434/v1",
         "stage1_api_key":  "ollama",
         "summary_model":   "gemma4:e4b-ctx16k",
-        "stage1_workers":  2,
-        "stage2_workers":  30,
+        "stage1_workers":  1,
+        "stage2_workers":  1,
     },
 
     # ── Tier 4 ───────────────────────────────────────────────────────────────

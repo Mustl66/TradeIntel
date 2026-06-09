@@ -787,12 +787,18 @@ def symbol_detail(sym_id: int):
 
             _mr_keywords = [k for k in ([_sector_name] + _industry_names) if len(k) > 2]
             if _mr_keywords:
+                # Word-boundary regex match (PostgreSQL ~*) instead of ILIKE '%k%'.
+                # The substring match was catching false positives like
+                # 'Bodybuilding' matching keyword 'Building Products'. Anchoring
+                # to word boundaries fixes that. Each keyword is regex-escaped.
+                import re as _re
+                _patterns = [r"\m" + _re.escape(k) + r"\M" for k in _mr_keywords]
                 _conditions = " OR ".join(
-                    ["(mra.title ILIKE %s OR mra.summary ILIKE %s)" for _ in _mr_keywords]
+                    ["(mra.title ~* %s OR mra.summary ~* %s)" for _ in _patterns]
                 )
                 _params = []
-                for k in _mr_keywords:
-                    _params += [f"%{k}%", f"%{k}%"]
+                for p in _patterns:
+                    _params += [p, p]
                 cur.execute(f"""
                     SELECT mra.title, mra.url, mra.published_at, mra.source_name, mra.summary
                     FROM market_research_articles mra
@@ -800,6 +806,22 @@ def symbol_detail(sym_id: int):
                     ORDER BY mra.published_at DESC
                     LIMIT 8
                 """, _params)
+                mr_articles = cur.fetchall()
+                # Fallback: if word-boundary match returned nothing AND we have
+                # a sector_name, retry with sector ONLY as a looser ILIKE so the
+                # panel isn't empty for symbols whose multi-word industries
+                # never appear verbatim in MR feeds.
+                if not mr_articles and _sector_name:
+                    cur.execute("""
+                        SELECT mra.title, mra.url, mra.published_at, mra.source_name, mra.summary
+                        FROM market_research_articles mra
+                        WHERE mra.llm_processed = TRUE
+                          AND (mra.title ~* %s OR mra.summary ~* %s)
+                        ORDER BY mra.published_at DESC
+                        LIMIT 8
+                    """, (r"\m" + _re.escape(_sector_name) + r"\M",
+                          r"\m" + _re.escape(_sector_name) + r"\M"))
+                    mr_articles = cur.fetchall()
             else:
                 cur.execute("""
                     SELECT mra.title, mra.url, mra.published_at, mra.source_name, mra.summary
@@ -808,7 +830,7 @@ def symbol_detail(sym_id: int):
                     ORDER BY mra.published_at DESC
                     LIMIT 5
                 """)
-            mr_articles = cur.fetchall()
+                mr_articles = cur.fetchall()
 
             # Scored articles
             cur.execute("""
@@ -1129,11 +1151,42 @@ def symbol_detail(sym_id: int):
   <div class="section-title">📊 TradingView Screener Data</div>
   <div class="tv-grid">{tv_grid}</div>
 
-  <!-- Forecast -->
-  {f'<div class="section-title">🔮 Symbol Forecast</div><div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:14px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap">{forecast}</div>' if forecast else ''}
-
-  <!-- Master summary -->
-  {f'<div class="section-title">📋 Master Summary</div><div style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;padding:14px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap">{master}</div>' if master else ''}
+  <!-- Forecast + Master Summary tabs -->
+  {(lambda: (
+    f'''<div class="section-title">🧠 Narrative</div>
+    <div class="tabbed" style="background:#0f172a;border:1px solid #1e2535;border-radius:8px;overflow:hidden">
+      <div style="display:flex;border-bottom:1px solid #1e2535;background:#161b27">
+        <button class="tabbtn active" data-tab="t-forecast"
+                style="flex:1;padding:10px 14px;background:none;border:0;color:#fcd34d;font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;border-bottom:2px solid #fcd34d">
+          🔮 Forecast
+        </button>
+        <button class="tabbtn" data-tab="t-master"
+                style="flex:1;padding:10px 14px;background:none;border:0;color:#64748b;font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;border-bottom:2px solid transparent">
+          📋 Master Summary
+        </button>
+      </div>
+      <div id="t-forecast" class="tabpane" style="padding:14px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap">{forecast or '<span style="color:#475569">No forecast yet.</span>'}</div>
+      <div id="t-master"   class="tabpane" style="padding:14px;font-size:13px;color:#cbd5e1;line-height:1.7;white-space:pre-wrap;display:none">{master or '<span style="color:#475569">No master summary yet.</span>'}</div>
+    </div>
+    <script>
+      (function() {{
+        const btns = document.querySelectorAll('.tabbtn');
+        btns.forEach(b => b.addEventListener('click', () => {{
+          btns.forEach(x => {{
+            x.classList.remove('active');
+            x.style.color = '#64748b';
+            x.style.borderBottomColor = 'transparent';
+          }});
+          b.classList.add('active');
+          b.style.color = '#fcd34d';
+          b.style.borderBottomColor = '#fcd34d';
+          document.querySelectorAll('.tabpane').forEach(p => p.style.display = 'none');
+          document.getElementById(b.dataset.tab).style.display = 'block';
+        }}));
+      }})();
+    </script>'''
+    if (forecast or master) else ''
+  ))()}
 
   <!-- Company connections -->
   <div class="section-title">🔗 Company Connections (extracted from news)</div>

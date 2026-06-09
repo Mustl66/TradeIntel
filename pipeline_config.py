@@ -18,7 +18,7 @@ START_FROM = None   # e.g. "html"  or  "sector_map"
 
 # Limit symbols processed per run. False = all symbols. Integer = first N symbols only.
 # Useful for quick test runs without waiting for the full 2800-symbol pipeline.
-SYMBOL_LIMIT = 8   # e.g. 100  or  False
+SYMBOL_LIMIT = 1   # e.g. 100  or  False
 
 PIPELINES = {
     "rss": {

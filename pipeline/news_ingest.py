@@ -100,11 +100,30 @@ def _scrape_full_text(url: str) -> Optional[str]:
     """
     Best-effort HTML scrape → extract readable body text.
     Returns None on any failure (network, parse, encoding).
+
+    Strategy: rotate to a real browser UA + try chrome-impersonation fallback
+    (cffi_requests) for sites that block plain requests (nasdaq.com, etc.).
     """
+    headers = _random_headers()
+    resp = None
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT + 15)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.content, "lxml")
+    except Exception as exc:
+        # Fall back to curl_cffi w/ chrome fingerprint — defeats most bot walls.
+        try:
+            resp = cffi_requests.get(url, impersonate='chrome124',
+                                     timeout=REQUEST_TIMEOUT + 15)
+            if resp.status_code != 200:
+                logger.debug(f"Full-text scrape cffi non-200 for {url}: {resp.status_code}")
+                return None
+        except Exception as exc2:
+            logger.debug(f"Full-text scrape failed for {url}: {exc} | cffi: {exc2}")
+            return None
+
+    try:
+        content = getattr(resp, "content", None) or resp.text.encode("utf-8", "ignore")
+        soup = BeautifulSoup(content, "lxml")
 
         # Remove nav, footer, scripts, styles
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -112,7 +131,8 @@ def _scrape_full_text(url: str) -> Optional[str]:
 
         # Try common article body selectors first
         for selector in ("article", '[class*="article-body"]', '[class*="news-body"]',
-                         '[class*="press-release"]', "main", ".content", "#content"):
+                         '[class*="press-release"]', '[class*="body__content"]',
+                         '[data-testid*="content"]', "main", ".content", "#content"):
             node = soup.select_one(selector)
             if node:
                 text = node.get_text(separator=" ", strip=True)
@@ -125,7 +145,7 @@ def _scrape_full_text(url: str) -> Optional[str]:
         return text[:MAX_FULL_TEXT_LEN] if len(text) > 200 else None
 
     except Exception as exc:
-        logger.debug(f"Full-text scrape failed for {url}: {exc}")
+        logger.debug(f"Full-text parse failed for {url}: {exc}")
         return None
 
 
