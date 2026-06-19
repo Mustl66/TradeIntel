@@ -44,6 +44,7 @@ from typing import Optional
 
 import requests
 from openai import OpenAI
+import httpx
 
 from config import LLM_CONFIG, LLM_TYPE, GPU_VRAM_GB
 from db.connection import get_conn
@@ -54,6 +55,10 @@ from pipeline_config import (  # noqa — patched below
     SENTIMENT_LAMBDA,
     DECAY_GRACE_MONTHS,
     NEUTRAL_SCORE_THRESHOLD,
+    MATERIALITY_THRESHOLD,
+    GRAVITY_GAMMA,
+    GRAVITY_GRACE_DAYS,
+    ASYMPTOTE_THRESHOLD,
     SYMBOL_LIMIT,
     STAGE1_PARALLEL_WORKERS,
     STAGE2_PARALLEL_WORKERS,
@@ -146,14 +151,28 @@ logger = logging.getLogger(__name__)
 # ── LLM clients ───────────────────────────────────────────────────────────────
 
 def _get_main_client() -> OpenAI:
-    return OpenAI(base_url=LLM_CONFIG["base_url"], api_key=LLM_CONFIG["api_key"])
+    # connect=60: gives Ollama time to load/swap model into VRAM before first byte.
+    # read=600:   long generation (5120 tokens) can take several minutes on e4b.
+    # max_retries=1: SDK retries waste time on server-load stalls — outer
+    #   _call_stage2 loop handles retries with corrective prompts instead.
+    return OpenAI(
+        base_url=LLM_CONFIG["base_url"],
+        api_key=LLM_CONFIG["api_key"],
+        timeout=httpx.Timeout(connect=60.0, read=600.0, write=120.0, pool=60.0),
+        max_retries=1,
+    )
 
 
 def _get_summary_client() -> OpenAI:
     """Stage 1 client — uses stage1_base_url if configured, otherwise shares stage2 endpoint."""
     base_url = LLM_CONFIG.get("stage1_base_url") or LLM_CONFIG["base_url"]
     api_key  = LLM_CONFIG.get("stage1_api_key")  or LLM_CONFIG["api_key"]
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=httpx.Timeout(connect=60.0, read=300.0, write=120.0, pool=60.0),
+        max_retries=1,
+    )
 
 
 def _lmstudio_unload_model(root: str, instance_id: str) -> None:
@@ -495,7 +514,63 @@ def _build_stage2_prompt(
     return _json_dumps(payload)
 
 
-def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict]:
+def _validate_stage2_result(result: dict, prev_master_summary: str = "") -> list[str]:
+    """Return a list of validation failures. Empty list = result is acceptable.
+
+    Checks enforced:
+      1. updated_master_summary must be present and non-empty (Part G).
+         If a previous master_summary exists, the output must be at least as long
+         as the input (no collapsing history).
+      2. sentiment_score must be a finite float in [-1, 1].
+      3. score_calibration must be present if sentiment_score != 0.0.
+      4. forecast_until_earnings must be present and non-empty.
+    """
+    failures: list[str] = []
+    # -- updated_master_summary --
+    ums = result.get("updated_master_summary")
+    if not ums or not str(ums).strip():
+        failures.append(
+            "CRITICAL: updated_master_summary is empty or null. "
+            "You MUST carry forward the previous master_summary and weave in new facts. "
+            "If no previous summary exists, write a 150–300 word foundation narrative."
+        )
+    elif prev_master_summary and len(str(ums).strip()) < max(100, len(prev_master_summary) // 4):
+        failures.append(
+            f"CRITICAL: updated_master_summary is too short ({len(str(ums).strip())} chars vs "
+            f"previous {len(prev_master_summary)} chars). You collapsed or deleted history. "
+            "Carry forward ALL quantified facts from the previous summary."
+        )
+    # -- sentiment_score --
+    raw_score = result.get("sentiment_score")
+    try:
+        s = float(raw_score)
+        if not (-1.0 <= s <= 1.0):
+            failures.append(f"sentiment_score {s} is outside [-1, 1].")
+        import math as _math
+        if _math.isnan(s) or _math.isinf(s):
+            failures.append("sentiment_score is NaN or Inf.")
+    except (TypeError, ValueError):
+        failures.append(f"sentiment_score is not a valid float: {raw_score!r}.")
+    # -- score_calibration --
+    try:
+        if float(result.get("sentiment_score", 0.0)) != 0.0:
+            sc = result.get("score_calibration")
+            if not sc or not isinstance(sc, dict):
+                failures.append(
+                    "score_calibration block is missing or not an object. "
+                    "Provide anchor_band_base, negative_counter_weights, final_calculated_raw."
+                )
+    except (TypeError, ValueError):
+        pass
+    # -- forecast_until_earnings --
+    fcast = result.get("forecast_until_earnings")
+    if not fcast or not str(fcast).strip():
+        failures.append("forecast_until_earnings is empty. Provide bias + confidence analysis.")
+    return failures
+
+
+def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
+                 prev_master_summary: str = "") -> Optional[dict]:
     """Main sentiment LLM call. Returns parsed dict or None. Retries on bad JSON.
 
     Determinism knobs (so same article + same prompt → same output across runs
@@ -562,7 +637,31 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3) -> Optional[dict
                 continue
             result = _extract_json(raw)
             if result is not None:
-                return result
+                # ── Schema validation + repair loop (Part G) ──────────────────
+                failures = _validate_stage2_result(result, prev_master_summary)
+                if not failures:
+                    return result
+                # Build a targeted repair prompt listing every failure
+                repair_issues = "\n".join(f"  - {f}" for f in failures)
+                logger.warning(
+                    f"[Stage2] Attempt {attempt}/{retries}: schema validation failed "
+                    f"({len(failures)} issue(s)):\n{repair_issues}"
+                )
+                last_raw = raw
+                kwargs["messages"] = [
+                    kwargs["messages"][0],  # system
+                    kwargs["messages"][1],  # original user prompt
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        "Your previous response has the following critical schema violations. "
+                        "Return a corrected JSON object that fixes ALL issues below. "
+                        "Keep all other fields unchanged. Start with { and end with }.\n\n"
+                        "VIOLATIONS TO FIX:\n"
+                        + repair_issues
+                    )},
+                ]
+                continue  # re-infer with repair context
+            # ── JSON parse failure path ────────────────────────────────────────
             last_raw = raw
             logger.warning(f"[Stage2] Attempt {attempt}/{retries}: could not parse JSON (len={len(raw)})")
             logger.warning(f"[Stage2] Attempt {attempt} raw (first 300): {raw[:300]!r}")
@@ -1252,9 +1351,56 @@ def _save_article_result(cur, article_id: int, result: dict,
 
     score = float(result.get("sentiment_score", 0.0))
     outlook_bonus = float(result.get("outlook_bonus", 0.0))
-    outlook_bonus = max(0.0, min(0.15, outlook_bonus))  # clamp bonus 0..0.15
+    # Hard cap at 0.03: outlook_bonus is a small forward-looking nudge only.
+    # The original 0.15 ceiling caused ALL positive articles to cluster at 0.999
+    # because any score ≥ 0.969 (STRONG+) + even a small bonus hit the cap.
+    # At 0.03 the bonus stays within one band step and cannot cross band ceilings.
+    outlook_bonus = max(0.0, min(0.03, outlook_bonus))
+
+    # ── Band-ceiling enforcement ───────────────────────────────────────────────
+    # The outlook_bonus MUST NOT push the score past the top of the LLM's chosen
+    # band.  Without this, a VERY_STRONG article (ceiling 0.984) + 0.01 bonus
+    # silently lands in EXCEPTIONAL territory (0.985+), violating the regulatory
+    # ladder (BLA acceptance → max STRONG, not EXCEPTIONAL).
+    #
+    # Band ceilings (positive side) — must stay in sync with stage2_instruction.json.
+    # ORDER MATTERS: longer/more-specific labels before shorter ones so substring
+    # matching works correctly (e.g. WEAK_POSITIVE before POSITIVE, VERY_STRONG
+    # before STRONG, SLIGHTLY_POSITIVE before POSITIVE).
+    _BAND_CEILINGS = [
+        ("EPOCH_DEFINING",   1.000),
+        ("TRANSFORMATIVE",   0.999),
+        ("EXCEPTIONAL",      0.994),
+        ("VERY_STRONG",      0.984),
+        ("CLEARLY_POSITIVE", 0.939),
+        ("STRONG",           0.969),
+        ("SLIGHTLY_POSITIVE",0.799),
+        ("WEAK_POSITIVE",    0.599),
+        ("POSITIVE",         0.899),
+        ("NEUTRAL",          0.000),
+    ]
+    # Parse anchor band from score_rationale (e.g. "VERY_STRONG band; ...")
+    _rationale = str(result.get("score_rationale") or "").upper()
+    _band_ceiling = None
+    for _band_label, _ceil in _BAND_CEILINGS:
+        if _band_label in _rationale:
+            _band_ceiling = _ceil
+            break
+    # ── ──────────────────────────────────────────────────────────────────────
+
     if is_relevant:
-        score = max(-1.0, min(1.0, score + outlook_bonus))  # add bonus then clamp
+        if score < 1.0:
+            # Outlook bonus can improve the score but must not silently push a
+            # sub-EPOCH_DEFINING article to 1.0 via arithmetic overflow.
+            # Only the model may output 1.0 directly (after passing the
+            # EPOCH_DEFINING litmus test in the instruction).  Post-processing
+            # caps at 0.999 so the distinction is preserved in the DB.
+            score = min(0.999, score + outlook_bonus)
+            # Also enforce band ceiling so bonus never crosses into a higher band.
+            if _band_ceiling is not None and score > 0.0:
+                score = min(score, _band_ceiling)
+        # score == 1.0 → model explicitly chose EPOCH_DEFINING; keep as-is.
+        score = max(-1.0, score)
         weighted = _time_decay(score, published_at)
     else:
         score = 0.0
@@ -1270,6 +1416,7 @@ def _save_article_result(cur, article_id: int, result: dict,
     updates = {
         "sentiment_score":         score,
         "weighted_sentiment":      weighted,
+        "outlook_bonus":           outlook_bonus,
         "is_relevant":             is_relevant,
         "relevance_reason":        relevance_reason,
         "article_summary":         _to_str(result.get("article_summary"), 500),
@@ -1289,6 +1436,7 @@ def _save_article_result(cur, article_id: int, result: dict,
         UPDATE news_articles SET
             sentiment_score         = %(sentiment_score)s,
             weighted_sentiment      = %(weighted_sentiment)s,
+            outlook_bonus           = %(outlook_bonus)s,
             is_relevant             = %(is_relevant)s,
             relevance_reason        = %(relevance_reason)s,
             article_summary         = %(article_summary)s,
@@ -1323,16 +1471,81 @@ def _save_article_result(cur, article_id: int, result: dict,
         pass
 
 
+def _apply_asymptotic_multiplier(base: float, multiplier: float,
+                                  threshold: float = ASYMPTOTE_THRESHOLD) -> float:
+    """Apply sector/macro multiplier with asymptotic compression near ±1.
+
+    For |base| <= threshold: plain linear scaling (multiplier*base) — no distortion
+    for mid-range scores.  For |base| > threshold: the remaining headroom to ±1 is
+    compressed so the multiplier can never push the score into hard-clip territory.
+
+    Formula (positive side):
+        headroom = 1.0 - base
+        effective = 1.0 - headroom * (2.0 - multiplier)
+        i.e.  multiplier=1.042 compresses 0.9923 → ~0.9950 instead of clipping 1.034.
+
+    Symmetric for negative side.  Falls back to linear for |base| <= threshold.
+    Always returns a value in [-1.0, 1.0].
+    """
+    if base == 0.0:
+        return 0.0
+
+    sign = 1.0 if base > 0.0 else -1.0
+    abs_base = abs(base)
+
+    if abs_base <= threshold:
+        # Linear region — clamp to avoid overflow with extreme multipliers
+        return max(-1.0, min(1.0, base * multiplier))
+
+    # Clamp multiplier so we can't accidentally invert direction
+    # (multiplier >2.0 would flip the headroom term negative)
+    m = max(0.5, min(multiplier, 2.0))
+    headroom = 1.0 - abs_base
+    compressed = 1.0 - headroom * (2.0 - m)
+    return sign * max(abs_base, min(1.0, compressed))
+
+
+def _apply_gravity(score: float, newest_material_pub: Optional[datetime],
+                   gamma: float = GRAVITY_GAMMA,
+                   grace_days: float = GRAVITY_GRACE_DAYS) -> float:
+    """Apply inactivity gravity: penalty based on age of the newest material article.
+
+    Inside grace_days: no penalty (symbol is active).
+    Beyond grace_days: score *= exp(-gamma * hours_past_grace).
+    gamma=0.0005/hr → half-life ≈ 58 days after grace window.
+
+    Score sign is preserved; zero-score symbols unchanged.
+    """
+    if not newest_material_pub or gamma == 0.0 or score == 0.0:
+        return score
+    now = datetime.now(timezone.utc)
+    pub = newest_material_pub
+    if pub.tzinfo is None:
+        pub = pub.replace(tzinfo=timezone.utc)
+    age_hours = max(0.0, (now - pub).total_seconds() / 3600.0)
+    grace_hours = grace_days * 24.0
+    if age_hours <= grace_hours:
+        return score
+    return round(score * math.exp(-gamma * (age_hours - grace_hours)), 6)
+
+
 def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
                         forecast: str, weighted_scores: list[float],
                         macro_multiplier: float, ai_sector_pick: str = "",
                         ai_sector_multiplier: float = 1.000,
-                        raw_weight_pairs: list[tuple[float, float]] | None = None):
+                        raw_weight_pairs: list[tuple[float, float]] | None = None,
+                        newest_material_pub: Optional[datetime] = None):
+    """Compute and store final_score using selectivity-enhanced aggregation.
+
+    Math pipeline:
+      1. Weighted mean:  avg = Σ(raw_i * w_i) / Σ(w_i)
+      2. Asymptotic multiplier application (prevents hard-clip at ±1 from sector boosts)
+      3. Gravity penalty (inactivity: score decays if newest catalyst is weeks old)
+      4. Clamp [-1, 1]
+    """
     if not weighted_scores:
         return
-    # Prefer the proper weighted mean if (raw, weight) pairs were provided.
-    # Falls back to the legacy "mean of decayed scores" path for callers that
-    # haven't been migrated yet.
+    # ── Step 1: weighted mean ──────────────────────────────────────────────────
     if raw_weight_pairs:
         total_w = sum(w for _, w in raw_weight_pairs)
         if total_w > 0:
@@ -1341,8 +1554,17 @@ def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
             avg_weighted = sum(weighted_scores) / len(weighted_scores)
     else:
         avg_weighted = sum(weighted_scores) / len(weighted_scores)
-    final_score  = round(avg_weighted * macro_multiplier * ai_sector_multiplier, 6)
-    final_score  = max(-1.0, min(1.0, final_score))  # clamp to [-1, 1]
+
+    # ── Step 2: asymptotic sector × macro multiplier ───────────────────────────
+    combined_mult = macro_multiplier * ai_sector_multiplier
+    final_score = _apply_asymptotic_multiplier(avg_weighted, combined_mult)
+
+    # ── Step 3: gravity — inactivity penalty on symbol level ──────────────────
+    final_score = _apply_gravity(final_score, newest_material_pub)
+
+    # ── Step 4: clamp ─────────────────────────────────────────────────────────
+    final_score = round(max(-1.0, min(1.0, final_score)), 6)
+
     cur.execute("""
         UPDATE symbols SET
             symbol_master_summary      = %s,
@@ -1422,6 +1644,7 @@ def _process_symbol(
     last_forecast       = ""
     scored  = 0
     skipped = 0
+    newest_material_pub: Optional[datetime] = None  # pub date of newest article above MATERIALITY_THRESHOLD
 
     # Fallback TV snapshot from symbols row (used when no daily snapshot exists)
     tv_fields_fallback = [
@@ -1523,12 +1746,15 @@ def _process_symbol(
                     last_score = _raw_prev
             except Exception:
                 pass
-            if abs(_raw_prev) < NEUTRAL_SCORE_THRESHOLD:
+            if abs(_raw_prev) < MATERIALITY_THRESHOLD:
                 skipped += 1
-                continue  # noise filter — neutral articles don't dilute the mean
+                continue  # noise filter — below materiality threshold, exclude from mean
             _w_prev = _decay_weight(published_at)
             weighted_scores.append(_raw_prev * _w_prev)
             raw_weight_pairs.append((_raw_prev, _w_prev))
+            # Track newest material pub for gravity calculation (articles oldest→newest)
+            if newest_material_pub is None or published_at > newest_material_pub:
+                newest_material_pub = published_at
             skipped += 1
             continue
 
@@ -1558,7 +1784,7 @@ def _process_symbol(
             except Exception: pass
 
         _t0 = time.time()
-        result = _call_stage2(main_client, prompt)
+        result = _call_stage2(main_client, prompt, prev_master_summary=master_summary)
         t_s2 = round(time.time() - _t0, 1)
 
         if result is None:
@@ -1607,8 +1833,11 @@ def _process_symbol(
             _hint = (result.get("extracted_facts") or {}).get("ai_sector_pick_hint")
             if _hint and isinstance(_hint, str):
                 ai_sector_hints.append(_hint)
-            if abs(raw_score) >= NEUTRAL_SCORE_THRESHOLD:
+            if abs(raw_score) >= MATERIALITY_THRESHOLD:
                 raw_weight_pairs.append((raw_score, decay_w))
+                # Track newest material pub for gravity calculation
+                if newest_material_pub is None or published_at > newest_material_pub:
+                    newest_material_pub = published_at
         scored += 1
 
         title_short = (article.get("title") or "")[:60]
@@ -1632,7 +1861,8 @@ def _process_symbol(
                                 last_forecast, weighted_scores, macro_mult,
                                 ai_sector_pick=ai_sector_pick,
                                 ai_sector_multiplier=ai_sector_mult,
-                                raw_weight_pairs=raw_weight_pairs)
+                                raw_weight_pairs=raw_weight_pairs,
+                                newest_material_pub=newest_material_pub)
         conn.commit()
         avg_w = sum(weighted_scores) / len(weighted_scores)
         logger.info(f"[{symbol}] scored={scored} skipped={skipped} "

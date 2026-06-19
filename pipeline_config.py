@@ -18,7 +18,7 @@ START_FROM = None   # e.g. "html"  or  "sector_map"
 
 # Limit symbols processed per run. False = all symbols. Integer = first N symbols only.
 # Useful for quick test runs without waiting for the full 2800-symbol pipeline.
-SYMBOL_LIMIT = 1   # e.g. 100  or  False
+SYMBOL_LIMIT = False   # e.g. 100  or  False
 
 PIPELINES = {
     "rss": {
@@ -62,9 +62,23 @@ SKILLS_ENABLED = False
 MAX_EVAL_ARTICLES        = 12      # rolling window per symbol (newest N articles)
 ENABLE_PRE_SUMMARIZATION = False    # Stage 1 fast summarizer before main LLM
 SUMMARY_LLM_MODEL        = LLM_CONFIG.get("summary_model", LLM_CONFIG["model"])   # Stage 1 model
-SENTIMENT_LAMBDA         = 0.005   # time-decay lambda (per hour) — applied only AFTER grace period
+SENTIMENT_LAMBDA         = 0.0007   # time-decay lambda (per hour) — applied only AFTER grace period
 DECAY_GRACE_MONTHS       = 1       # no decay for articles younger than this many months
-NEUTRAL_SCORE_THRESHOLD  = 0.1    # skip articles where |sentiment_score| < this from aggregation (noise filter)
+NEUTRAL_SCORE_THRESHOLD  = 0.1    # legacy alias — kept for viewer/recompute compat; use MATERIALITY_THRESHOLD internally
+MATERIALITY_THRESHOLD    = 0.25   # skip articles where |sentiment_score| < this from aggregation
+                                   # 0.25 = only real signal articles included (was 0.1 — PR fluff crept in)
+
+# ── Symbol-level aggregation selectivity ──────────────────────────────────────
+# Gravity: exponential penalty on final_score based on age of NEWEST material
+# article. If the most recent real catalyst is weeks old, symbol drifts → 0.
+# Applied on top of per-article time-decay.
+GRAVITY_GAMMA            = 0.0005  # per hour; half-life ≈ 58 days after grace (was 0.0003)
+GRAVITY_GRACE_DAYS       = 14      # no gravity within this many days of newest material article
+
+# Asymptote threshold: above this |score|, linear multiplier application is
+# replaced by asymptotic compression so sector/macro boosts never hard-clip.
+# Below threshold, plain linear scaling unchanged (no distortion of mid scores).
+ASYMPTOTE_THRESHOLD      = 0.85   # scores above this get asymptotic treatment
 
 # ── Stage 1 parallel workers (gemma-4-e2b pre-summarization) ──────────────────
 # Stage 1 is stateless per article — safe to run in parallel.

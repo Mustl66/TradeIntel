@@ -266,6 +266,9 @@ def create_tables() -> None:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='relevance_reason') THEN
                         ALTER TABLE news_articles ADD COLUMN relevance_reason TEXT;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='news_articles' AND column_name='outlook_bonus') THEN
+                        ALTER TABLE news_articles ADD COLUMN outlook_bonus NUMERIC(5,4) DEFAULT 0;
+                    END IF;
                 END$$;
             """)
             cur.execute("""

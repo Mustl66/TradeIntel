@@ -85,15 +85,24 @@ _TIERS = {
     },
 
     # ── Tier 3 ───────────────────────────────────────────────────────────────
+    # Ollama on Debian (10.11.12.8:11434).  Modelfile num_ctx=16384 — must
+    # override shared context_size=50000 here so extra_body sends num_ctx=16384
+    # instead of 50000.  Sending 50000 to Ollama forces a model reload with a
+    # much larger KV cache; if VRAM is tight the server hangs or OOMs.
+    # max_tokens capped to leave headroom inside the 16384 window:
+    #   system_prompt ~6300 tok + article ~4000 tok = ~10300 input → ~6000 free
     3: {
         "base_url":        "http://10.11.12.8:11434/v1",
-        "api_key":         "lmstudio",
+        "api_key":         "ollama",
         "model":           "gemma4:e4b-ctx16k",
         "stage1_base_url": "http://10.11.12.8:11434/v1",
         "stage1_api_key":  "ollama",
-        "summary_model":   "gemma4:e4b-ctx16k",
+        "summary_model":   "gemma4:e2b-ctx16k",
         "stage1_workers":  1,
         "stage2_workers":  1,
+        "context_size":    16384,   # match Modelfile num_ctx — do NOT send 50000
+        "max_tokens":      5120,    # safe ceiling within 16384 window
+        "llm_type":        "ollama", # warmup: use chat ping, not LM Studio load API
     },
 
     # ── Tier 4 ───────────────────────────────────────────────────────────────
@@ -103,9 +112,12 @@ _TIERS = {
         "model":           "gemma4:e4b-ctx16k",
         "stage1_base_url": "http://10.11.12.8:11434/v1",
         "stage1_api_key":  "ollama",
-        "summary_model":   "gemma4:e4b-ctx16k",
+        "summary_model":   "gemma4:e2b-ctx16k",
         "stage1_workers":  4,
         "stage2_workers":  1,
+        "context_size":    16384,   # match Modelfile num_ctx
+        "max_tokens":      5120,
+        "llm_type":        "ollama",
     },
 
     # ── Tier 5 ───────────────────────────────────────────────────────────────
@@ -201,8 +213,11 @@ LLM_CONFIG: dict = {
 STAGE1_PARALLEL_WORKERS: int = int(os.getenv("STAGE1_WORKERS", str(_ACTIVE.get("stage1_workers", 4))))
 STAGE2_PARALLEL_WORKERS: int = int(os.getenv("STAGE2_WORKERS", str(_ACTIVE.get("stage2_workers", 1))))
 
-# Back-compat: some scripts still read LLM_TYPE
-LLM_TYPE = os.getenv("LLM_TYPE", "local").lower()
+# Back-compat: some scripts still read LLM_TYPE.
+# Tier dict can override via "llm_type" key — e.g. Ollama tiers set "ollama"
+# so warmup skips the LM Studio /api/v1/models/load call (which times out on
+# Ollama servers that don't implement that endpoint).
+LLM_TYPE = (_ACTIVE.get("llm_type") or os.getenv("LLM_TYPE", "local")).lower()
 
 # Optional: set GPU_VRAM_GB=16 in .env to skip local nvidia-smi detection
 GPU_VRAM_GB: float = float(os.getenv("GPU_VRAM_GB", "0"))

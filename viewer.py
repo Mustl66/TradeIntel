@@ -7,10 +7,11 @@ Run: python viewer.py
 """
 
 import json
+import math
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -25,6 +26,181 @@ app = FastAPI(title="TradeIntel Viewer", docs_url=None, redoc_url=None)
 
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
+
+
+# ── Decay constants (must match pipeline_config.py) ───────────────────────────
+_DECAY_LAMBDA      = 0.001   # per hour — matches SENTIMENT_LAMBDA in pipeline_config.py
+_DECAY_GRACE_MONTHS = 1      # months before decay starts
+
+def _decay_factor(published_at: datetime) -> float:
+    """Return e^(-λt) multiplier for this article's age. 1.0 inside grace window."""
+    now = datetime.now(timezone.utc)
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    age_h = max(0.0, (now - published_at).total_seconds() / 3600.0)
+    grace_h = _DECAY_GRACE_MONTHS * 30.44 * 24
+    if age_h <= grace_h:
+        return 1.0
+    return math.exp(-_DECAY_LAMBDA * (age_h - grace_h))
+
+
+def _news_contrib_html(articles: list, sc: float, macro: float, ai_mult: float) -> str:
+    """Build the News Score Contribution panel shown below the score hero."""
+    scored = [a for a in articles if a.get("sentiment_score") is not None]
+    if not scored:
+        return ""
+
+    total_abs = sum(abs(float(a["weighted_sentiment"] or 0)) for a in scored)
+    n = len(scored)
+    avg_w = sum(float(a["weighted_sentiment"] or 0) for a in scored) / n if n else 0.0
+
+    rows_html = ""
+    for a in sorted(scored, key=lambda x: abs(float(x["weighted_sentiment"] or 0)), reverse=True):
+        raw   = float(a["sentiment_score"])
+        w     = float(a["weighted_sentiment"] or 0)
+        pub   = a["published_at"]
+        df    = _decay_factor(pub) if pub else 1.0
+        contrib = abs(w) / total_abs * 100 if total_abs > 0 else 0.0
+        sc_col  = score_color(raw)
+        df_col  = "#4ade80" if df > 0.5 else "#f59e0b" if df > 0.05 else "#f87171"
+        w_col   = score_color(w)
+        bar_w   = min(contrib, 100)
+        title_s = (a["title"] or "")[:65].replace("<", "&lt;")
+
+        # age label
+        if pub:
+            if pub.tzinfo is None:
+                pub_utc = pub.replace(tzinfo=timezone.utc)
+            else:
+                pub_utc = pub
+            age_d = (datetime.now(timezone.utc) - pub_utc).total_seconds() / 86400
+            grace_d = _DECAY_GRACE_MONTHS * 30.44
+            if age_d <= grace_d:
+                age_lbl = f"{age_d:.0f}d (grace)"
+                age_col = "#4ade80"
+            else:
+                age_lbl = f"{age_d:.0f}d old"
+                age_col = "#64748b"
+        else:
+            age_lbl = "?"
+            age_col = "#475569"
+
+        rows_html += (
+            f'<div style="display:grid;grid-template-columns:64px 10px 52px 10px 64px 1fr 44px 180px;'
+            f'align-items:center;gap:4px;margin-bottom:5px;padding:6px 8px;'
+            f'background:#0f172a;border-radius:6px;border-left:3px solid {sc_col}">'
+            f'<div style="text-align:right;font-size:13px;font-weight:900;color:{sc_col}">{fmt_score(raw)}</div>'
+            f'<div style="text-align:center;font-size:10px;color:#475569">×</div>'
+            f'<div style="text-align:right;font-size:12px;color:{df_col}">{df:.4f}</div>'
+            f'<div style="text-align:center;font-size:10px;color:#475569">=</div>'
+            f'<div style="text-align:right;font-size:13px;font-weight:700;color:{w_col}">{fmt_score(w)}</div>'
+            f'<div style="padding:0 6px">'
+            f'  <div style="background:#1e2535;border-radius:3px;height:6px;overflow:hidden">'
+            f'    <div style="height:6px;border-radius:3px;width:{bar_w:.1f}%;background:{sc_col}"></div>'
+            f'  </div>'
+            f'  <div style="font-size:9px;color:{age_col};margin-top:2px">{age_lbl}</div>'
+            f'</div>'
+            f'<div style="text-align:right;font-size:11px;color:#a78bfa;font-weight:700">{contrib:.1f}%</div>'
+            f'<div style="font-size:10px;color:#64748b;white-space:nowrap;overflow:hidden;'
+            f'text-overflow:ellipsis;padding-left:6px">{title_s}</div>'
+            f'</div>'
+        )
+
+    header_row = (
+        '<div style="display:grid;grid-template-columns:64px 10px 52px 10px 64px 1fr 44px 180px;'
+        'align-items:center;gap:4px;margin-bottom:6px;padding:0 8px">'
+        '<div style="text-align:right;font-size:9px;color:#475569">SCORE</div>'
+        '<div></div>'
+        '<div style="text-align:right;font-size:9px;color:#475569">DECAY</div>'
+        '<div></div>'
+        '<div style="text-align:right;font-size:9px;color:#475569">WEIGHTED</div>'
+        '<div style="padding:0 6px;font-size:9px;color:#475569">CONTRIBUTION BAR</div>'
+        '<div style="text-align:right;font-size:9px;color:#475569">SHARE</div>'
+        '<div style="padding-left:6px;font-size:9px;color:#475569">TITLE</div>'
+        '</div>'
+    )
+
+    footer = (
+        f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #1e2535;'
+        f'font-size:11px;color:#475569;line-height:1.8">'
+        f'avg({n} articles) = <span style="color:#fcd34d;font-weight:700">{avg_w:.4f}</span>'
+        f' × macro <span style="color:#60a5fa;font-weight:700">{macro:.4f}</span>'
+        f' × ai_sector <span style="color:#a78bfa;font-weight:700">{ai_mult:.4f}</span>'
+        f' = <span style="font-size:14px;font-weight:900;color:{score_color(sc)}">{fmt_score(sc)}</span>'
+        f'</div>'
+    )
+
+    return (
+        '<div style="margin-bottom:16px;background:#161b27;border:1px solid #1e2535;'
+        'border-radius:10px;padding:14px 18px">'
+        '<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;'
+        'letter-spacing:.5px;margin-bottom:10px">📊 News Score — Contribution to Final Score</div>'
+        + header_row
+        + rows_html
+        + footer
+        + '</div>'
+    )
+
+
+def _news_contribution_panel(arts, sc, macro, ai_mult):
+    """Render the News Score → Symbol Final Score contribution table."""
+    if not arts:
+        return ""
+    scored = [a for a in arts if a["sentiment_score"] is not None]
+    if not scored:
+        return ""
+
+    total_abs = max(sum(abs(float(a["weighted_sentiment"] or 0)) for a in scored), 1e-9)
+    rows_html = ""
+    for a in sorted(scored, key=lambda x: abs(float(x["weighted_sentiment"] or 0)), reverse=True):
+        s  = float(a["sentiment_score"] or 0)
+        w  = float(a["weighted_sentiment"] or 0)
+        df = _decay_factor(a["published_at"]) if a["published_at"] else 1.0
+        contrib = abs(w) / total_abs * 100
+        sc_col  = score_color(s)
+        df_col  = "#4ade80" if df > 0.5 else "#f59e0b" if df > 0.05 else "#f87171"
+        w_col   = score_color(w)
+        bar_w   = min(contrib, 100)
+        title   = (a["title"] or "")[:55].replace("<", "&lt;").replace(">", "&gt;")
+        rows_html += (
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;padding:6px 8px;'
+            f'background:#0f172a;border-radius:6px;border-left:3px solid {sc_col}">'
+            f'<div style="flex-shrink:0;width:62px;text-align:right;font-size:13px;font-weight:900;color:{sc_col}">{fmt_score(s)}</div>'
+            f'<div style="flex-shrink:0;width:20px;text-align:center;font-size:10px;color:#475569">×</div>'
+            f'<div style="flex-shrink:0;width:50px;text-align:right;font-size:12px;color:{df_col}">{df:.4f}</div>'
+            f'<div style="flex-shrink:0;width:20px;text-align:center;font-size:10px;color:#475569">=</div>'
+            f'<div style="flex-shrink:0;width:62px;text-align:right;font-size:14px;font-weight:900;color:{w_col}">{fmt_score(w)}</div>'
+            f'<div style="flex:1;margin-left:6px">'
+            f'  <div style="background:#1e2535;border-radius:3px;height:5px;overflow:hidden">'
+            f'    <div style="height:5px;border-radius:3px;width:{bar_w:.1f}%;background:{sc_col}"></div>'
+            f'  </div>'
+            f'</div>'
+            f'<div style="flex-shrink:0;width:38px;text-align:right;font-size:11px;color:#a78bfa;font-weight:700">{contrib:.1f}%</div>'
+            f'<div style="flex-shrink:0;width:190px;font-size:10px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-left:6px">{title}</div>'
+            f'</div>'
+        )
+
+    n = len(scored)
+    avg_w = sum(float(a["weighted_sentiment"] or 0) for a in scored) / n
+    return (
+        f'<div style="margin-bottom:16px;background:#161b27;border:1px solid #1e2535;border-radius:10px;padding:14px 18px">'
+        f'<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">'
+        f'📊 News Score — Contribution to Final Score</div>'
+        f'<div style="font-size:10px;color:#475569;margin-bottom:8px;display:flex;gap:16px;align-items:center">'
+        f'<span>Article Score <span style="color:#94a3b8">×</span> Decay</span>'
+        f'<span style="color:#475569">=</span>'
+        f'<span style="color:#fcd34d;font-weight:700">Weighted Score</span>'
+        f'<span style="color:#475569">→ bar = % of pool → feeds avg</span>'
+        f'</div>'
+        f'{rows_html}'
+        f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #1e2535;font-size:11px;color:#475569">'
+        f'avg({n} articles) = <span style="color:#fcd34d">{avg_w:.4f}</span>'
+        f' × macro <span style="color:#60a5fa">{macro:.4f}</span>'
+        f' × ai_sector <span style="color:#a78bfa">{ai_mult:.4f}</span>'
+        f' = <span style="font-size:14px;font-weight:900;color:{score_color(sc)}">{fmt_score(sc)}</span>'
+        f'</div>'
+        f'</div>'
+    )
 
 
 def score_color(s):
@@ -564,33 +740,53 @@ def index(sort: str = "final_score", dir: str = "desc"):
     </summary>
     <div style="margin-top:14px;font-size:12px;color:#94a3b8;line-height:1.7">
       <div style="margin-bottom:12px">
-        <span style="color:#60a5fa;font-weight:700">Step 1 — Raw article score</span><br>
-        Each article is scored by the LLM on a scale from <b style="color:#f87171">−1.0</b> (very bearish) to <b style="color:#4ade80">+1.0</b> (very bullish), using the scoring rubric:
+        <span style="color:#60a5fa;font-weight:700">Step 1 — Anchor band selection (17 bands)</span><br>
+        Each article is matched to a band based on event type and magnitude. The LLM scores on <b style="color:#f87171">−1.0</b> to <b style="color:#4ade80">+1.0</b>:
         <table style="margin-top:8px;border-collapse:collapse;width:100%">
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#4ade80">+0.70 → +1.00</td><td style="padding:4px 8px">Very positive — earnings beat &gt;10%, major acquisition, FDA approval, large contract win</td></tr>
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#86efac">+0.30 → +0.69</td><td style="padding:4px 8px">Positive — in-line earnings + guidance, new product, analyst upgrade</td></tr>
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#d1fae5">+0.05 → +0.29</td><td style="padding:4px 8px">Mildly positive — minor partnership, conference mention, routine filing</td></tr>
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#94a3b8">−0.04 → +0.04</td><td style="padding:4px 8px">Neutral — no material information</td></tr>
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#fca5a5">−0.29 → −0.05</td><td style="padding:4px 8px">Mildly negative — minor setback, noise</td></tr>
-          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#f87171">−0.69 → −0.30</td><td style="padding:4px 8px">Negative — earnings miss, guidance cut, litigation</td></tr>
-          <tr><td style="padding:4px 8px;color:#ef4444">−1.00 → −0.70</td><td style="padding:4px 8px">Very negative — fraud, bankruptcy, regulatory shutdown</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#4ade80;white-space:nowrap">+1.000</td><td style="padding:4px 8px">EPOCH_DEFINING — >50% fundamental revaluation (disease cure, 100%+ premium acquisition)</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#4ade80;white-space:nowrap">+0.995–0.999</td><td style="padding:4px 8px">TRANSFORMATIVE — revenue guidance >300%, world-class resource deposit, breakthrough proven</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#86efac;white-space:nowrap">+0.985–0.994</td><td style="padding:4px 8px">EXCEPTIONAL — earnings beat >100%, FDA final approval, first-in-class Phase 3 success</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#86efac;white-space:nowrap">+0.970–0.984</td><td style="padding:4px 8px">VERY_STRONG — revenue beat >50%, BLA/NDA submitted, FDA AdCom positive vote</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#d1fae5;white-space:nowrap">+0.940–0.969</td><td style="padding:4px 8px">STRONG — beat 20–50%, BLA/NDA accepted (admin step), Priority Review, IND cleared</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#d1fae5;white-space:nowrap">+0.900–0.939</td><td style="padding:4px 8px">CLEARLY_POSITIVE — beat 5–20% + raised guidance, analyst upgrade, margin improvement</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#fbbf24;white-space:nowrap">+0.800–0.899</td><td style="padding:4px 8px">POSITIVE — small beat, moderate contract, cost reduction program</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#94a3b8;white-space:nowrap">+0.600–0.799</td><td style="padding:4px 8px">SLIGHTLY_POSITIVE — non-exclusive partnership, product update, MOU signed</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#94a3b8;white-space:nowrap">+0.001–0.599</td><td style="padding:4px 8px">WEAK_POSITIVE — generic announcements, conference participation, minor improvements</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#94a3b8;white-space:nowrap">0.000</td><td style="padding:4px 8px">NEUTRAL — no material information, routine disclosures</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#fca5a5;white-space:nowrap">−0.001–−0.399</td><td style="padding:4px 8px">SLIGHTLY_NEGATIVE — minor delay, small contract loss, Hold initiation</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#fca5a5;white-space:nowrap">−0.400–−0.699</td><td style="padding:4px 8px">MILDLY_NEGATIVE — guidance cut <20%, analyst downgrade, minor regulatory setback</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#f87171;white-space:nowrap">−0.700–−0.899</td><td style="padding:4px 8px">NEGATIVE — earnings miss 5–20%, margin deterioration, write-down</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#f87171;white-space:nowrap">−0.900–−0.969</td><td style="padding:4px 8px">VERY_NEGATIVE — miss >20–50%, FDA CRL/IRL (de facto rejection), production shutdown</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#ef4444;white-space:nowrap">−0.970–−0.989</td><td style="padding:4px 8px">EXTREMELY_NEGATIVE — guidance cut >50%, loss of largest customer, flagship Phase 3 failure</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:4px 8px;color:#ef4444;white-space:nowrap">−0.990–−0.999</td><td style="padding:4px 8px">EXISTENTIAL_THREAT — acute liquidity crisis, DOJ/SEC criminal investigation</td></tr>
+          <tr><td style="padding:4px 8px;color:#dc2626;white-space:nowrap">−1.000</td><td style="padding:4px 8px">CATASTROPHIC — bankruptcy, fraud proven, core product banned</td></tr>
         </table>
       </div>
       <div style="margin-bottom:12px">
-        <span style="color:#60a5fa;font-weight:700">Step 2 — Time decay</span><br>
-        Old news matters less. Each score is decayed by age:<br>
-        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d">weighted = score × e^(−0.02 × hours_old)</code><br>
-        <span style="color:#64748b">Example: a +0.95 article from 48 hours ago → +0.95 × e^(−0.96) ≈ +0.36</span>
+        <span style="color:#60a5fa;font-weight:700">Step 2 — 10-factor calibration within band</span><br>
+        F1 Surprise · F2 Revenue Impact · F3 Profit Impact · F4 Strategic Importance · F5 Competitive Moat · F6 Regulatory Impact · F7 LT Value Creation · F8 Management Credibility · F9 Recurrence Penalty · F10 Market Cap Scale<br>
+        <span style="color:#64748b">Each factor adds or subtracts ±0.005 to ±0.020 to place the score precisely within the selected band.</span>
       </div>
       <div style="margin-bottom:12px">
-        <span style="color:#60a5fa;font-weight:700">Step 3 — Symbol final score</span><br>
-        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d">final_score = avg(all weighted scores) × sector_multiplier</code><br>
-        <span style="color:#64748b">The sector multiplier (from macro_multiplier step) adjusts for macro tailwinds/headwinds. Default = 1.0.</span>
+        <span style="color:#60a5fa;font-weight:700">Step 3 — Outlook bonus (0.00–0.03)</span><br>
+        A small forward-looking nudge for articles with specific named catalysts + dates. Max +0.03 — stays within one band step.<br>
+        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d">article_score = raw_score + outlook_bonus</code>
+      </div>
+      <div style="margin-bottom:12px">
+        <span style="color:#60a5fa;font-weight:700">Step 4 — Time decay</span><br>
+        Old news matters less. Each score is decayed by age (grace period: 6 months, then exponential):<br>
+        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d">weighted = article_score × e^(−λ × hours_after_grace)</code><br>
+        <span style="color:#64748b">λ = 0.001/hr → half-life ~29 days after grace ends. Fresh articles stay at full weight.</span>
+      </div>
+      <div style="margin-bottom:12px">
+        <span style="color:#60a5fa;font-weight:700">Step 5 — Symbol final score</span><br>
+        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d">final_score = weighted_mean(all decayed scores) × macro_multiplier × ai_sector_multiplier</code><br>
+        <span style="color:#64748b">Macro and AI-sector multipliers adjust for industry tailwinds/headwinds. Default = 1.0.</span>
       </div>
       <div>
         <span style="color:#60a5fa;font-weight:700">Why high raw scores → low final score?</span><br>
-        If most articles are old (weeks/months), their time-decayed weighted scores approach 0.00 even if raw scores were high. Many neutral (0.00) articles also dilute the average.
-        The score reflects <em>current</em> sentiment momentum, not historical highs.
+        If most articles are old (weeks/months), time-decay brings weighted scores toward 0.00. Many neutral (0.00) articles also dilute the weighted mean.
+        The final score reflects <em>current</em> sentiment momentum, not historical highs.
       </div>
       <div style="margin-top:14px;border-top:1px solid #1e2535;padding-top:10px">
         <span style="color:#60a5fa;font-weight:700">Signal legend</span><br>
@@ -835,7 +1031,7 @@ def symbol_detail(sym_id: int):
             # Scored articles
             cur.execute("""
                 SELECT id, title, url, published_at, source_name,
-                       sentiment_score, weighted_sentiment,
+                       sentiment_score, weighted_sentiment, outlook_bonus,
                        article_summary, score_rationale, forecast_until_earnings,
                        key_events, pre_summary_data, master_summary_snapshot,
                        stage2_prompt, company_connections,
@@ -849,7 +1045,7 @@ def symbol_detail(sym_id: int):
     finally:
         conn.close()
 
-    sc = sym["final_score"]
+    sc = sym["final_score"] or 0.0
     col = score_color(sc)
     lbl, lcol = score_label(sc)
     upd = sym["score_updated_at"].strftime("%Y-%m-%d %H:%M") if sym["score_updated_at"] else "—"
@@ -956,15 +1152,94 @@ def symbol_detail(sym_id: int):
     if not mr_html:
         mr_html = '<div style="color:#475569;font-size:13px">No market research articles available.</div>'
 
+    # Pre-compute total absolute weighted sum for contribution % calculation
+    _total_abs_weighted = sum(abs(float(a["weighted_sentiment"] or 0)) for a in articles)
+
     # Articles HTML
     arts_html = ""
     for i, a in enumerate(articles):
-        ascore = a["sentiment_score"]
+        ascore    = a["sentiment_score"]
+        abonus    = float(a["outlook_bonus"] or 0) if a.get("outlook_bonus") is not None else 0.0
+        araw      = round(float(ascore) - abonus, 4) if ascore is not None else None
+        aweighted = a.get("weighted_sentiment")
+        pub_dt    = a["published_at"]
+
+        # Real decay factor: e^(-λt) computed from published_at
+        if pub_dt is not None:
+            df = _decay_factor(pub_dt)
+            now_utc = datetime.now(timezone.utc)
+            if pub_dt.tzinfo is None:
+                pub_dt_utc = pub_dt.replace(tzinfo=timezone.utc)
+            else:
+                pub_dt_utc = pub_dt
+            age_days = (now_utc - pub_dt_utc).total_seconds() / 86400.0
+            grace_days = _DECAY_GRACE_MONTHS * 30.44
+            in_grace = age_days <= grace_days
+        else:
+            df = 1.0
+            age_days = 0.0
+            in_grace = True
+
+        # Contribution % of this article to total weighted pool
+        if _total_abs_weighted > 0 and aweighted is not None:
+            contrib_pct = abs(float(aweighted)) / _total_abs_weighted * 100
+        else:
+            contrib_pct = 0.0
+
         acol = score_color(ascore)
         albl, alcol = score_label(ascore)
         pub = a["published_at"].strftime("%Y-%m-%d %H:%M") if a["published_at"] else "?"
         title = (a["title"] or "Untitled").replace("<","&lt;").replace(">","&gt;")
         src_link = f'<a href="{a["url"]}" target="_blank" style="color:#60a5fa">↗ Source</a>' if a.get("url") else ""
+
+        # Score breakdown mini-table
+        grace_label = (f'<span style="color:#4ade80;font-size:9px">IN GRACE — no decay yet</span>'
+                       if in_grace else
+                       f'<span style="color:#f59e0b;font-size:9px">{age_days:.0f}d old · {age_days - grace_days:.0f}d past grace</span>')
+        w_col = score_color(aweighted)
+        score_breakdown = f"""
+        <div style="margin-top:8px;background:#0a1628;border:1px solid #1e2535;border-radius:8px;padding:10px 14px;font-size:12px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <span style="font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.5px">📐 Score Breakdown</span>
+            <span style="font-size:11px;color:#475569">LLM {fmt_score(araw)}
+              {"<span style='color:#4ade80'> + bonus " + f"+{abonus:.4f}</span>" if abonus else ""}
+              → stored {fmt_score(ascore)}
+              × decay <span style="color:{'#4ade80' if df > 0.5 else '#f59e0b' if df > 0.05 else '#f87171'}">{df:.4f}</span>
+              = <span style="font-weight:900;color:{w_col}">{fmt_score(aweighted)}</span>
+            </span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 2fr 1fr;gap:8px;align-items:center">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;text-align:center">
+              <div style="background:#0f172a;border:1px solid #1e2535;border-radius:6px;padding:6px 4px">
+                <div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px">LLM Raw</div>
+                <div style="font-size:14px;font-weight:900;color:{score_color(araw)}">{fmt_score(araw)}</div>
+              </div>
+              <div style="background:#0f172a;border:1px solid #1e2535;border-radius:6px;padding:6px 4px">
+                <div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px">Bonus</div>
+                <div style="font-size:14px;font-weight:900;color:{'#4ade80' if abonus else '#475569'}">{f'+{abonus:.4f}' if abonus else '—'}</div>
+              </div>
+              <div style="background:#0f172a;border:1px solid #1e2535;border-radius:6px;padding:6px 4px">
+                <div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px">Stored</div>
+                <div style="font-size:14px;font-weight:900;color:{acol}">{fmt_score(ascore)}</div>
+              </div>
+              <div style="background:#0f172a;border:1px solid #1e2535;border-radius:6px;padding:6px 4px">
+                <div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px">Decay ×</div>
+                <div style="font-size:14px;font-weight:900;color:{'#4ade80' if df>0.5 else '#f59e0b' if df>0.05 else '#f87171'}">{df:.4f}</div>
+                <div style="font-size:8px;margin-top:1px">{grace_label}</div>
+              </div>
+            </div>
+            <div style="background:#0d1f0d;border:2px solid {w_col};border-radius:8px;padding:8px 6px;text-align:center">
+              <div style="font-size:8px;font-weight:700;color:{w_col};text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px">↳ Contributes</div>
+              <div style="font-size:20px;font-weight:900;color:{w_col};line-height:1">{fmt_score(aweighted)}</div>
+              <div style="font-size:8px;color:#475569;margin-top:2px">stored × decay</div>
+            </div>
+            <div style="background:#0f172a;border:1px solid #a78bfa33;border-radius:8px;padding:10px 8px;text-align:center">
+              <div style="font-size:9px;color:#a78bfa;text-transform:uppercase;letter-spacing:.3px;margin-bottom:4px">Share of Pool</div>
+              <div style="font-size:24px;font-weight:900;color:#a78bfa">{contrib_pct:.1f}%</div>
+              <div style="font-size:9px;color:#475569;margin-top:4px">of all weighted scores</div>
+            </div>
+          </div>
+        </div>"""
 
         # Key events
         ke = a.get("key_events") or {}
@@ -1061,10 +1336,11 @@ def symbol_detail(sym_id: int):
           <div style="font-size:11px;color:#475569;display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px">
             <span>📅 {pub}</span>
             <span>🔗 {a.get('source_name') or '?'}</span>
-            <span>⚖ weighted: {fmt_score(a.get('weighted_sentiment'))}</span>
+            <span style="color:{score_color(aweighted)}">⚖ weighted {fmt_score(aweighted)}</span>
             {src_link}
           </div>
-          {('<div style="font-size:13px;color:#94a3b8;margin-bottom:6px">'+a['article_summary'].replace('<','&lt;')+'</div>') if a.get('article_summary') else ''}
+          {score_breakdown}
+          {('<div style="font-size:13px;color:#94a3b8;margin-top:8px;margin-bottom:6px">'+a['article_summary'].replace('<','&lt;')+'</div>') if a.get('article_summary') else ''}
           {('<details style="margin-bottom:6px"><summary style="cursor:pointer;font-size:10px;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.5px">Rationale</summary><div style="margin-top:6px;font-size:12px;color:#cbd5e1;line-height:1.6">' + a['score_rationale'].replace('<','&lt;') + '</div></details>') if a.get('score_rationale') else ''}
           {('<details style="margin-bottom:6px"><summary style="cursor:pointer;font-size:10px;font-weight:700;color:#a78bfa;text-transform:uppercase;letter-spacing:.5px">Forecast</summary><div style="margin-top:6px;font-size:12px;color:#cbd5e1;line-height:1.6">' + a['forecast_until_earnings'].replace('<','&lt;') + '</div></details>') if a.get('forecast_until_earnings') else ''}
           {ke_html}
@@ -1105,7 +1381,7 @@ def symbol_detail(sym_id: int):
 <div class="detail-page">
 
   <!-- Score hero -->
-  <div style="display:flex;align-items:center;gap:20px;margin-bottom:24px;padding:20px;background:#161b27;border:1px solid #1e2535;border-radius:12px">
+  <div style="display:flex;align-items:center;gap:20px;margin-bottom:16px;padding:20px;background:#161b27;border:1px solid #1e2535;border-radius:12px">
     <div>
       <div style="font-size:48px;font-weight:900;color:{col}">{fmt_score(sc)}</div>
       <div style="font-size:14px;font-weight:700;color:{lcol}">{lbl}</div>
@@ -1146,6 +1422,56 @@ def symbol_detail(sym_id: int):
       ))() if (sym.get("macro_multiplier") or sym.get("ai_sector_multiplier")) else '<div style="font-size:12px;color:#475569;margin-top:4px">No multipliers</div>'}
     </div>
   </div>
+
+  <!-- News Score Contribution to Final Score -->
+  {_news_contrib_html(articles, sc, float(sym.get("macro_multiplier") or 1.0), float(sym.get("ai_sector_multiplier") or 1.0))}
+
+  <!-- Score band legend -->
+  <details style="margin-bottom:16px;background:#161b27;border:1px solid #1e2535;border-radius:8px;padding:10px 16px">
+    <summary style="cursor:pointer;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;user-select:none">
+      📐 Scoring System — how article scores and the symbol score are calculated
+    </summary>
+    <div style="margin-top:12px;font-size:12px;color:#94a3b8;line-height:1.7">
+      <div style="margin-bottom:10px">
+        <span style="color:#60a5fa;font-weight:700">Article score pipeline</span><br>
+        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d;font-size:11px">
+          LLM raw score + outlook_bonus (max 0.03) = final score → × time-decay = weighted score
+        </code><br>
+        <span style="color:#475569;font-size:11px">Scores decay exponentially after a 6-month grace period (λ=0.001/hr → half-life ~29 days after grace).</span>
+      </div>
+      <div style="margin-bottom:10px">
+        <span style="color:#60a5fa;font-weight:700">Symbol final score</span><br>
+        <code style="background:#0f1117;padding:2px 6px;border-radius:4px;color:#fcd34d;font-size:11px">
+          avg(all weighted scores) × macro_multiplier × ai_sector_multiplier
+        </code>
+      </div>
+      <div style="margin-bottom:10px">
+        <span style="color:#60a5fa;font-weight:700">17-band scoring rubric (anchor bands)</span>
+        <table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:11px">
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#f8fafc;font-weight:800">1.000</td><td style="padding:3px 8px;color:#fbbf24;font-weight:700">EPOCH-DEFINING</td><td style="padding:3px 8px">Fundamental valuation revised &gt;50% — disease cure, 100%+ acquisition premium. &lt;1 in 1000 articles.</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#4ade80">0.995–0.999</td><td style="padding:3px 8px;color:#4ade80;font-weight:700">TRANSFORMATIVE</td><td style="padding:3px 8px">Revenue guidance &gt;300% raise, massive sovereign contract, world-class resource confirmed.</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#4ade80">0.985–0.994</td><td style="padding:3px 8px;color:#4ade80;font-weight:700">EXCEPTIONAL</td><td style="padding:3px 8px">FDA final approval, Phase 3 success (first-in-class), earnings beat &gt;100%. +20% to +100%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#86efac">0.970–0.984</td><td style="padding:3px 8px;color:#86efac;font-weight:700">VERY STRONG</td><td style="padding:3px 8px">Revenue beat &gt;50%, BLA/NDA submitted, FDA Advisory Committee positive. +10% to +50%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#86efac">0.940–0.969</td><td style="padding:3px 8px;color:#86efac;font-weight:700">STRONG</td><td style="padding:3px 8px">Beat 20–50%, BLA accepted (admin step), Priority Review granted, IND cleared. +5% to +30%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#d1fae5">0.900–0.939</td><td style="padding:3px 8px;color:#d1fae5;font-weight:700">CLEARLY POSITIVE</td><td style="padding:3px 8px">Beat 5–20% + raised guidance, analyst upgrade, IND cleared for secondary asset. +3% to +15%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#94a3b8">0.800–0.899</td><td style="padding:3px 8px;color:#94a3b8;font-weight:700">POSITIVE</td><td style="padding:3px 8px">Beat &lt;5%, moderate contract, cost reduction. +1% to +10%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#64748b">0.600–0.799</td><td style="padding:3px 8px;color:#64748b;font-weight:700">SLIGHTLY POSITIVE</td><td style="padding:3px 8px">Non-exclusive partnership, product update, MOU/LOI. 0% to +5%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#475569">0.001–0.599</td><td style="padding:3px 8px;color:#475569;font-weight:700">WEAK POSITIVE</td><td style="padding:3px 8px">Generic announcements, conference participation. &lt;1%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#94a3b8">0.000</td><td style="padding:3px 8px;color:#94a3b8;font-weight:700">NEUTRAL</td><td style="padding:3px 8px">No material information. Routine procedural disclosures.</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#475569">−0.001–−0.399</td><td style="padding:3px 8px;color:#fb923c;font-weight:700">SLIGHTLY NEGATIVE</td><td style="padding:3px 8px">Minor delay, small contract loss. 0% to −3%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#fb923c">−0.400–−0.699</td><td style="padding:3px 8px;color:#fb923c;font-weight:700">MILDLY NEGATIVE</td><td style="padding:3px 8px">Guidance cut &lt;20%, analyst downgrade. −3% to −15%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#fca5a5">−0.700–−0.899</td><td style="padding:3px 8px;color:#fca5a5;font-weight:700">NEGATIVE</td><td style="padding:3px 8px">Earnings miss 5–20%, write-down, FDA CRL/IRL (de facto rejection). −5% to −30%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#f87171">−0.900–−0.969</td><td style="padding:3px 8px;color:#f87171;font-weight:700">VERY NEGATIVE</td><td style="padding:3px 8px">Miss &gt;20–50%, flagship product failure, FDA final rejection. −15% to −50%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#ef4444">−0.970–−0.989</td><td style="padding:3px 8px;color:#ef4444;font-weight:700">EXTREMELY NEGATIVE</td><td style="padding:3px 8px">Revenue cut &gt;50%, loss of largest customer. −30% to −70%</td></tr>
+          <tr style="border-bottom:1px solid #1e2535"><td style="padding:3px 8px;color:#dc2626">−0.990–−0.999</td><td style="padding:3px 8px;color:#dc2626;font-weight:700">EXISTENTIAL THREAT</td><td style="padding:3px 8px">Liquidity crisis, DOJ/SEC criminal investigation. −40% to −90%</td></tr>
+          <tr><td style="padding:3px 8px;color:#991b1b">−1.000</td><td style="padding:3px 8px;color:#991b1b;font-weight:700">CATASTROPHIC</td><td style="padding:3px 8px">Bankruptcy, fraud proven, core product banned. −50% to −100%</td></tr>
+        </table>
+      </div>
+      <div style="margin-top:8px;color:#475569;font-size:11px">
+        Scores use 10-factor calibration: F1 Surprise · F2 Revenue Impact · F3 Profit Impact · F4 Strategic · F5 Moat · F6 Regulatory · F7 LT Value · F8 Management · F9 Duplicate Penalty · F10 Market Cap Scale
+      </div>
+    </div>
+  </details>
 
   <!-- TradingView data -->
   <div class="section-title">📊 TradingView Screener Data</div>
