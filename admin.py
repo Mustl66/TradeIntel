@@ -91,12 +91,71 @@ def _ensure_priority_queue_table():
                 CREATE INDEX IF NOT EXISTS scoring_events_kind_time_idx
                 ON scoring_events (kind, scored_at DESC)
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scoring_control (
+                    id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                    paused      BOOL NOT NULL DEFAULT FALSE,
+                    active_tier INT  NOT NULL DEFAULT 3,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            # Always sync active_tier to config.ACTIVE_TIER on startup —
+            # config.py is the source of truth for the default tier.
+            # The UI dropdown is a session override that lives until next restart.
+            try:
+                from config import ACTIVE_TIER as _cfg_tier
+            except Exception:
+                _cfg_tier = 3
+            cur.execute("""
+                INSERT INTO scoring_control (id, paused, active_tier)
+                VALUES (1, FALSE, %s)
+                ON CONFLICT (id) DO UPDATE SET active_tier = EXCLUDED.active_tier
+            """, (_cfg_tier,))
         conn.commit()
     finally:
         conn.close()
 
 
-# ── HTML shell ────────────────────────────────────────────────────────────────
+def _get_scoring_control() -> dict:
+    """Return current scoring_control row as dict."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused, active_tier FROM scoring_control WHERE id = 1")
+            row = cur.fetchone()
+        return {"paused": bool(row[0]) if row else False,
+                "active_tier": int(row[1]) if row else 3}
+    finally:
+        conn.close()
+
+
+def _set_paused(paused: bool) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE scoring_control SET paused = %s, updated_at = NOW() WHERE id = 1",
+                (paused,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_active_tier(tier: int) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE scoring_control SET active_tier = %s, updated_at = NOW() WHERE id = 1",
+                (tier,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
 
 def page(body: str, title: str = "TradeIntel Admin") -> str:
     return f"""<!DOCTYPE html>
@@ -314,6 +373,15 @@ def page(body: str, title: str = "TradeIntel Admin") -> str:
          hx-swap="innerHTML"
          style="display:inline-flex">
       <span style="color:#475569;font-size:11px">loading capacity…</span>
+    </div>
+    <div id="scoring-ctrl"
+         hx-get="/scoring/status"
+         hx-trigger="load, every 5s"
+         hx-swap="outerHTML"
+         style="display:inline-flex;align-items:center;gap:10px;
+                background:#0b1220;border:1px solid #1e293b;border-radius:8px;
+                padding:5px 12px;font-size:11px">
+      <span style="color:#475569;font-size:11px">loading…</span>
     </div>
     <button
       hx-get="/market-research"
@@ -3184,7 +3252,87 @@ async def priority_clear():
     return await priority_panel()
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+# ── Scoring control endpoints ──────────────────────────────────────────────────
+
+@app.get("/scoring/status", response_class=HTMLResponse)
+async def scoring_status():
+    """Returns the scoring-control widget HTML (polled every 5 s by the header)."""
+    ctrl = _get_scoring_control()
+    paused = ctrl["paused"]
+    tier   = ctrl["active_tier"]
+
+    # Tier options
+    tier_opts = "".join(
+        f'<option value="{n}" {"selected" if n == tier else ""}>{n}</option>'
+        for n in range(1, 6)
+    )
+
+    pause_btn = (
+        f'<button hx-post="/scoring/resume" hx-target="#scoring-ctrl" hx-swap="outerHTML" '
+        f'style="background:#14532d;color:#4ade80;border:1px solid #166534;padding:5px 14px;'
+        f'border-radius:6px;cursor:pointer;font-size:12px;font-weight:700">▶ Resume</button>'
+        if paused else
+        f'<button hx-post="/scoring/pause" hx-target="#scoring-ctrl" hx-swap="outerHTML" '
+        f'style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;padding:5px 14px;'
+        f'border-radius:6px;cursor:pointer;font-size:12px;font-weight:700">⏸ Pause</button>'
+    )
+
+    # Tier dropdown: only enabled when paused
+    tier_disabled = "" if paused else "disabled title='Pause scoring first to change tier'"
+    tier_widget = (
+        f'<label style="font-size:11px;color:#64748b;margin-right:4px">Tier</label>'
+        f'<select name="tier" {tier_disabled} '
+        f'hx-post="/scoring/set-tier" hx-target="#scoring-ctrl" hx-swap="outerHTML" '
+        f'hx-include="[name=tier]" '
+        f'style="background:#0f1117;border:1px solid {"#3b82f6" if paused else "#2d3748"};'
+        f'color:{"#e2e8f0" if paused else "#475569"};border-radius:6px;padding:4px 8px;font-size:12px">'
+        f'{tier_opts}</select>'
+    )
+
+    status_dot = (
+        '<span style="color:#fbbf24;font-weight:700;font-size:12px">⏸ PAUSED</span>'
+        if paused else
+        '<span style="color:#4ade80;font-weight:700;font-size:12px">▶ RUNNING</span>'
+    )
+
+    return HTMLResponse(
+        f'<div id="scoring-ctrl" '
+        f'hx-get="/scoring/status" hx-trigger="every 5s" hx-swap="outerHTML" '
+        f'style="display:inline-flex;align-items:center;gap:10px;'
+        f'background:#0b1220;border:1px solid #1e293b;border-radius:8px;'
+        f'padding:5px 12px;font-size:11px">'
+        f'{status_dot}'
+        f'{pause_btn}'
+        f'{tier_widget}'
+        f'</div>'
+    )
+
+
+@app.post("/scoring/pause", response_class=HTMLResponse)
+async def scoring_pause():
+    _set_paused(True)
+    return await scoring_status()
+
+
+@app.post("/scoring/resume", response_class=HTMLResponse)
+async def scoring_resume():
+    _set_paused(False)
+    return await scoring_status()
+
+
+@app.post("/scoring/set-tier", response_class=HTMLResponse)
+async def scoring_set_tier(tier: int = Form(...)):
+    ctrl = _get_scoring_control()
+    if not ctrl["paused"]:
+        # Safety guard: reject tier change while running
+        return await scoring_status()
+    if tier not in range(1, 6):
+        return await scoring_status()
+    _set_active_tier(tier)
+    return await scoring_status()
+
+
+
 
 if __name__ == "__main__":
     _ensure_priority_queue_table()

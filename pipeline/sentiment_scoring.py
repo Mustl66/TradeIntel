@@ -67,6 +67,82 @@ from pipeline_config import (  # noqa — patched below
     INCLUDE_TV_SNAPSHOT,
 )
 
+# ── Pause / tier-reload controls ──────────────────────────────────────────────
+
+class ScoringPaused(Exception):
+    """Raised when the pause flag is detected — mid-stream or between articles."""
+    pass
+
+
+# In-process pause event — set = paused, clear = running.
+# Updated by _pause_poller() background thread; checked cheaply in hot paths.
+_PAUSE_EVENT = threading.Event()
+_POLLER_STARTED = False   # guard: only one poller per process
+
+
+def _is_paused() -> bool:
+    """Fast in-process pause check (no DB hit — uses _PAUSE_EVENT)."""
+    return _PAUSE_EVENT.is_set()
+
+
+def _start_pause_poller() -> None:
+    """Start background thread that syncs _PAUSE_EVENT with scoring_control.paused every 2 s.
+    Called once at the top of run(). Safe to call multiple times — only one thread starts."""
+    global _POLLER_STARTED
+    if _POLLER_STARTED:
+        return
+    _POLLER_STARTED = True
+
+    def _poll():
+        while True:
+            try:
+                c = get_conn()
+                with c.cursor() as cur:
+                    cur.execute("SELECT paused FROM scoring_control WHERE id = 1")
+                    row = cur.fetchone()
+                c.close()
+                if row and row[0]:
+                    _PAUSE_EVENT.set()
+                else:
+                    _PAUSE_EVENT.clear()
+            except Exception:
+                pass  # DB blip — keep previous state
+            time.sleep(2.0)
+
+    t = threading.Thread(target=_poll, name="pause-poller", daemon=True)
+    t.start()
+    logger.debug("[pause_poller] started")
+
+
+def _reload_tier(tier_num: int) -> None:
+    """Hot-reload LLM_CONFIG + worker counts from config._TIERS[tier_num] in-place.
+
+    Called at the top of run() when scoring_control.active_tier differs from the
+    currently loaded tier — allows tier switches while paused without restarting.
+    """
+    global LLM_TYPE, STAGE1_PARALLEL_WORKERS, STAGE2_PARALLEL_WORKERS, SUMMARY_LLM_MODEL
+    try:
+        import config as _cfg
+        t = _cfg._TIERS.get(tier_num)
+        if not t or not _cfg._is_configured(t):
+            logger.warning(f"[tier_reload] Tier {tier_num} not configured — keeping current")
+            return
+        merged = {**_cfg._SHARED_PARAMS, **t}
+        LLM_CONFIG.update(merged)
+        LLM_TYPE = (t.get("llm_type") or "local").lower()
+        STAGE1_PARALLEL_WORKERS = int(t.get("stage1_workers", 4))
+        STAGE2_PARALLEL_WORKERS = int(t.get("stage2_workers", 1))
+        SUMMARY_LLM_MODEL = str(
+            merged.get("summary_model") or merged.get("model") or SUMMARY_LLM_MODEL
+        )
+        logger.info(
+            f"[tier_reload] → TIER={tier_num}  model={t['model']}  "
+            f"s1_workers={STAGE1_PARALLEL_WORKERS}  s2_workers={STAGE2_PARALLEL_WORKERS}"
+        )
+    except Exception as e:
+        logger.warning(f"[tier_reload] Failed to reload tier {tier_num}: {e}")
+
+
 # ── JSON helper — handles Decimal / NaN from psycopg2 ─────────────────────────
 
 class _SafeEncoder(json.JSONEncoder):
@@ -571,14 +647,15 @@ def _validate_stage2_result(result: dict, prev_master_summary: str = "") -> list
 
 def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
                  prev_master_summary: str = "") -> Optional[dict]:
-    """Main sentiment LLM call. Returns parsed dict or None. Retries on bad JSON.
+    """Main sentiment LLM call. Streams tokens and checks pause flag every chunk.
 
-    Determinism knobs (so same article + same prompt → same output across runs
-    and across models that honor these settings):
-      - temperature pinned to 0.0
-      - top_p pinned to 1.0
-      - seed=42 (API providers that honor it)
-      - For Ollama: top_k=1 (greedy) + extra_body seed + format=json
+    If _PAUSE_EVENT is set mid-stream the stream is closed immediately and
+    ScoringPaused is raised — the article stays unscored and will be re-evaluated
+    on resume.
+
+    Determinism knobs:
+      - temperature 0.0, top_p 1.0, seed=42
+      - Ollama: top_k=1 (greedy), num_ctx from config
     """
     kwargs = {
         "model":             LLM_CONFIG["model"],
@@ -588,6 +665,7 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
         "frequency_penalty": LLM_CONFIG["frequency_penalty"],
         "presence_penalty":  LLM_CONFIG["presence_penalty"],
         "seed":              42,
+        "stream":            True,   # ← streaming for interruptibility
         "messages": [
             {"role": "system", "content": _STAGE2_SYSTEM},
             {"role": "user",   "content": prompt},
@@ -597,51 +675,67 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
         kwargs["extra_body"] = {
             "num_ctx":     LLM_CONFIG.get("context_size", 16384),
             "num_predict": LLM_CONFIG.get("max_tokens", 4096),
-            "top_k":       1,        # greedy decoding for determinism
+            "top_k":       1,
             "seed":        42,
-            "format":      "json",   # force JSON-mode grammar — no prose prefix
+            "format":      "json",
         }
-        # Ollama doesn't honor top-level seed — extra_body version is what reaches the runtime.
         kwargs.pop("seed", None)
     elif LLM_TYPE in ("api", "anthropic"):
         kwargs["response_format"] = {"type": "json_object"}
-    last_raw = None
+
+    last_raw: Optional[str] = None
+
     for attempt in range(1, retries + 1):
+        # Inject corrective turn on retry
+        if attempt > 1 and last_raw is not None:
+            kwargs["messages"] = [
+                kwargs["messages"][0],  # system
+                kwargs["messages"][1],  # original user prompt
+                {"role": "assistant", "content": last_raw},
+                {"role": "user", "content": (
+                    "Your previous response was NOT valid JSON. "
+                    "You returned markdown/prose. "
+                    "Return ONLY a raw JSON object — no markdown fences, no explanation, no preamble. "
+                    "Start your response with { and end with }."
+                )},
+            ]
+
         try:
-            # On retry: inject corrective turn showing model what it did wrong
-            if attempt > 1 and last_raw is not None:
-                kwargs["messages"] = [
-                    kwargs["messages"][0],  # system
-                    kwargs["messages"][1],  # original user prompt
-                    {"role": "assistant", "content": last_raw},
-                    {"role": "user", "content": (
-                        "Your previous response was NOT valid JSON. "
-                        "You returned markdown/prose. "
-                        "Return ONLY a raw JSON object — no markdown fences, no explanation, no preamble. "
-                        "Start your response with { and end with }."
-                    )},
-                ]
-            resp = client.chat.completions.create(**kwargs)
-            # Defensive: LM Studio (and some OpenAI-compat backends) can return
-            # 200 OK with choices=[] or message.content=None when their
-            # JSON-grammar enforcement aborts mid-generation. Treat any of
-            # those as "empty response" instead of crashing with NoneType.
-            raw = ""
-            if resp and resp.choices:
-                msg = resp.choices[0].message
-                raw = (getattr(msg, "content", None) or "").strip()
+            chunks: list[str] = []
+            stream = client.chat.completions.create(**kwargs)
+            try:
+                for chunk in stream:
+                    # ── Hard-stop check every token ───────────────────────────
+                    if _PAUSE_EVENT.is_set():
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        raise ScoringPaused("Pause detected mid-stream — article stays unscored")
+
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    text  = (getattr(delta, "content", None) or "") if delta else ""
+                    if text:
+                        chunks.append(text)
+            except ScoringPaused:
+                raise   # propagate immediately — do not fall into retry logic
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+            raw = "".join(chunks).strip()
             if not raw:
                 last_raw = ""
-                logger.warning(f"[Stage2] Attempt {attempt}/{retries}: empty content from LLM "
-                               f"(choices={len(resp.choices) if resp and resp.choices else 0})")
+                logger.warning(f"[Stage2] Attempt {attempt}/{retries}: empty response from LLM")
                 continue
+
             result = _extract_json(raw)
             if result is not None:
-                # ── Schema validation + repair loop (Part G) ──────────────────
                 failures = _validate_stage2_result(result, prev_master_summary)
                 if not failures:
                     return result
-                # Build a targeted repair prompt listing every failure
                 repair_issues = "\n".join(f"  - {f}" for f in failures)
                 logger.warning(
                     f"[Stage2] Attempt {attempt}/{retries}: schema validation failed "
@@ -649,8 +743,8 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
                 )
                 last_raw = raw
                 kwargs["messages"] = [
-                    kwargs["messages"][0],  # system
-                    kwargs["messages"][1],  # original user prompt
+                    kwargs["messages"][0],
+                    kwargs["messages"][1],
                     {"role": "assistant", "content": raw},
                     {"role": "user", "content": (
                         "Your previous response has the following critical schema violations. "
@@ -660,15 +754,21 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
                         + repair_issues
                     )},
                 ]
-                continue  # re-infer with repair context
-            # ── JSON parse failure path ────────────────────────────────────────
+                continue
+
             last_raw = raw
             logger.warning(f"[Stage2] Attempt {attempt}/{retries}: could not parse JSON (len={len(raw)})")
             logger.warning(f"[Stage2] Attempt {attempt} raw (first 300): {raw[:300]!r}")
+
+        except ScoringPaused:
+            raise   # never swallow — let _process_symbol handle it
         except Exception as e:
             logger.warning(f"[Stage2] Attempt {attempt}/{retries}: {e}")
+
     logger.warning(f"[Stage2] All {retries} attempts failed — using neutral fallback")
     return None
+
+
 
 
 # ── Time-decay ────────────────────────────────────────────────────────────────
@@ -1760,6 +1860,13 @@ def _process_symbol(
 
         stage1_result, t_s1 = stage1_futures[art_id].result()  # wait if S1 still running
 
+        # ── Pause check — BEFORE calling Stage 2 ──────────────────────────────
+        # Checked after S1 completes (S1 is fast / cached) but before the slow S2
+        # LLM call, so the article stays unscored and will be re-evaluated on resume.
+        if _is_paused():
+            logger.info(f"[{symbol}] Scoring paused — stopping before article {art_id}")
+            raise ScoringPaused(f"Paused before article {art_id}")
+
         # Previous article's DB summary (article_summary from last scored article)
         prev_art_summary = last_article_summary if idx > 0 else None
 
@@ -1899,10 +2006,25 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
     if effective_limit and effective_limit > 0:
         logger.info(f"[sentiment_scoring] SYMBOL_LIMIT active — capping run to {effective_limit} symbols")
 
+    # ── Start pause poller (syncs _PAUSE_EVENT from DB every 2 s) ────────────────
+    _start_pause_poller()
+
+    # ── Reload tier from scoring_control (set via admin while paused) ────────────
+    try:
+        _sc = get_conn()
+        with _sc.cursor() as _cur:
+            _cur.execute("SELECT active_tier FROM scoring_control WHERE id = 1")
+            _sc_row = _cur.fetchone()
+        _sc.close()
+        if _sc_row and _sc_row[0]:
+            _reload_tier(int(_sc_row[0]))
+    except Exception as _sc_e:
+        logger.debug(f"[scoring_control] tier check failed (non-fatal): {_sc_e}")
+
     started_at = datetime.now(timezone.utc)
     conn = get_conn()
 
-    # ── Auto-dedup cross-language articles before scoring ──────────────────────
+    # ── Auto-dedup cross-language articles before scoring
     _dedup_languages(conn)
 
     # Ensure active_processing table exists + clear stale rows from prior crashes
@@ -1957,6 +2079,10 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
         summary_client = _get_summary_client()
     _warmup_models(main_client, summary_client)
 
+    # Mutable containers so _drain_worker can hot-swap clients after a tier change
+    _clients = {"main": main_client, "summary": summary_client}
+    _active_tier_at_start = LLM_CONFIG.get("model", "")  # track for change detection
+
     # ── Semaphore caps concurrent symbol-level (Stage 2) work ─────────────────
     semaphore = threading.Semaphore(n_workers)
 
@@ -1992,9 +2118,12 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
                 w_conn.rollback()
             try:
                 result = _process_symbol(
-                    w_conn, main_client, summary_client, sym,
+                    w_conn, _clients["main"], _clients["summary"], sym,
                     single_model_mode, s1_pool=shared_s1_pool,
                 )
+            except ScoringPaused as _sp:
+                logger.info(f"[{sym['symbol']}] Paused mid-symbol: {_sp}")
+                result = {"symbol": sym["symbol"], "scored": 0, "skipped": 0, "paused": True}
             except Exception as e:
                 logger.error(f"[{sym['symbol']}] Unhandled error: {e}", exc_info=True)
                 try:
@@ -2132,7 +2261,38 @@ def run(exchange: str = "NASDAQ", limit: int = 0) -> dict:
 
     # Worker loop — N workers pull symbols off worklist until empty + drained
     def _drain_worker():
+        _was_paused = False
         while True:
+            # Stop pulling new symbols when paused — wait until unpaused
+            if _is_paused():
+                _was_paused = True
+                time.sleep(2.0)
+                continue
+
+            # Just unpaused — check if tier changed and rebuild clients if so
+            if _was_paused:
+                _was_paused = False
+                try:
+                    _sc_conn = get_conn()
+                    with _sc_conn.cursor() as _sc_cur:
+                        _sc_cur.execute("SELECT active_tier FROM scoring_control WHERE id = 1")
+                        _sc_row = _sc_cur.fetchone()
+                    _sc_conn.close()
+                    if _sc_row and _sc_row[0]:
+                        new_tier = int(_sc_row[0])
+                        _reload_tier(new_tier)
+                        # Rebuild clients with new base_url / api_key from updated LLM_CONFIG
+                        _clients["main"]    = _get_main_client()
+                        _clients["summary"] = _get_summary_client()
+                        logger.info(
+                            f"[tier_switch] Clients rebuilt → "
+                            f"model={LLM_CONFIG['model']} "
+                            f"base_url={LLM_CONFIG['base_url']}"
+                        )
+                        _warmup_models(_clients["main"], _clients["summary"])
+                except Exception as _te:
+                    logger.warning(f"[tier_switch] Failed to reload tier on resume: {_te}")
+
             sym = _next_symbol()
             if sym is None:
                 # Worklist empty; wait briefly in case poller adds more

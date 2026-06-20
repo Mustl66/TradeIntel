@@ -122,12 +122,12 @@ _TIERS = {
 
     # ── Tier 5 ───────────────────────────────────────────────────────────────
     5: {
-        "base_url":        "",
+        "base_url":        "http://127.0.0.1:1234/v1",
         "api_key":         "ollama",
-        "model":           "",
-        "stage1_base_url": "",
+        "model":           "gemma-4-e4b",
+        "stage1_base_url": "http://127.0.0.1:1234/v1",
         "stage1_api_key":  "ollama",
-        "summary_model":   "",
+        "summary_model":   "gemma-4-e4b",
         "stage1_workers":  4,
         "stage2_workers":  1,
     },

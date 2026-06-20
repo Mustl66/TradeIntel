@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import psycopg2
 import psycopg2.extras
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import DB_CONFIG
@@ -230,6 +230,7 @@ def fmt_score(s):
 BASE_STYLE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://unpkg.com/htmx.org@1.9.10"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -695,6 +696,11 @@ def index(sort: str = "final_score", dir: str = "desc"):
   <span class="badge" style="color:#86efac">↑ {fmt_score(stats['max_fs'])}</span>
   <span class="badge" style="color:#fca5a5">↓ {fmt_score(stats['min_fs'])}</span>
   <span id="throughput-badge" class="badge" style="color:#94a3b8;font-size:11px">⚡ loading…</span>
+  <span id="scoring-ctrl-v"
+        hx-get="/scoring/status"
+        hx-trigger="load, every 5s"
+        hx-swap="outerHTML"
+        class="badge" style="color:#475569;font-size:11px">⏸ …</span>
   <span class="badge" style="color:#475569;margin-left:auto">🕐 {now}</span>
 </div>
 <script>
@@ -1534,6 +1540,72 @@ def symbol_detail(sym_id: int):
 </div>
 </body>
 </html>""")
+
+
+# ── Scoring control (viewer: pause/resume only, no tier) ──────────────────────
+
+def _get_scoring_control_v() -> dict:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused FROM scoring_control WHERE id = 1")
+            row = cur.fetchone()
+        return {"paused": bool(row[0]) if row else False}
+    except Exception:
+        return {"paused": False}
+    finally:
+        conn.close()
+
+
+def _set_paused_v(paused: bool) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE scoring_control SET paused = %s, updated_at = NOW() WHERE id = 1",
+                (paused,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.get("/scoring/status", response_class=HTMLResponse)
+def viewer_scoring_status():
+    """Small pause/resume widget for the viewer header (no tier control)."""
+    paused = _get_scoring_control_v()["paused"]
+    pause_btn = (
+        '<button hx-post="/scoring/resume" hx-target="#scoring-ctrl-v" hx-swap="outerHTML" '
+        'style="background:#14532d;color:#4ade80;border:1px solid #166534;padding:4px 12px;'
+        'border-radius:6px;cursor:pointer;font-size:11px;font-weight:700">▶ Resume</button>'
+        if paused else
+        '<button hx-post="/scoring/pause" hx-target="#scoring-ctrl-v" hx-swap="outerHTML" '
+        'style="background:#450a0a;color:#fca5a5;border:1px solid #991b1b;padding:4px 12px;'
+        'border-radius:6px;cursor:pointer;font-size:11px;font-weight:700">⏸ Pause</button>'
+    )
+    status = (
+        '<span style="color:#fbbf24;font-size:11px;font-weight:700">⏸ PAUSED</span>'
+        if paused else
+        '<span style="color:#4ade80;font-size:11px;font-weight:700">▶ RUNNING</span>'
+    )
+    return HTMLResponse(
+        f'<span id="scoring-ctrl-v" '
+        f'hx-get="/scoring/status" hx-trigger="every 5s" hx-swap="outerHTML" '
+        f'class="badge" style="display:inline-flex;align-items:center;gap:6px">'
+        f'{status}{pause_btn}</span>'
+    )
+
+
+@app.post("/scoring/pause", response_class=HTMLResponse)
+def viewer_scoring_pause():
+    _set_paused_v(True)
+    return viewer_scoring_status()
+
+
+@app.post("/scoring/resume", response_class=HTMLResponse)
+def viewer_scoring_resume():
+    _set_paused_v(False)
+    return viewer_scoring_status()
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
