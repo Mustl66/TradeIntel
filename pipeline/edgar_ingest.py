@@ -1220,15 +1220,21 @@ def run(
         for (symbol_id, ticker), forms_to_fetch in symbol_form_map.items():
             if ticker not in cik_map:
                 sym_skipped += 1
+                sym_processed += 1
+                if sym_processed % 10 == 0:
+                    logger.info(f"[edgar] {sym_processed}/{len(symbol_form_map)} processed | inserted={sum(totals.values())} | no_cik={sym_skipped}")
                 continue
 
             cik      = cik_map[ticker]
             filings  = _fetch_symbol_filings(ticker, cik, seen_hashes, forms_to_fetch)
 
             if not filings:
-                sym_skipped += 1
-                if sym_processed % 100 == 0:
-                    logger.info(f"[edgar] {sym_processed}/{len(symbol_form_map)} symbols done")
+                sym_processed += 1
+                if sym_processed % 10 == 0:
+                    logger.info(
+                        f"[edgar] {sym_processed}/{len(symbol_form_map)} processed | "
+                        f"inserted={sum(totals.values())} | no_cik={sym_skipped}"
+                    )
                 continue
 
             feed_id = _ensure_edgar_feed_row(conn, symbol_id, ticker)
@@ -1254,10 +1260,10 @@ def run(
                 logger.debug(f"[edgar] sec_modifier recompute failed {ticker}: {e}")
 
             sym_processed += 1
-            if sym_processed % 50 == 0:
+            if sym_processed % 10 == 0:
                 logger.info(
                     f"[edgar] Progress: {sym_processed}/{len(symbol_form_map)} | "
-                    + " | ".join(f"{ft}={c}" for ft, c in totals.items() if c > 0)
+                    + (" | ".join(f"{ft}={c}" for ft, c in totals.items() if c > 0) or "0 new inserts")
                 )
 
         summary = {
