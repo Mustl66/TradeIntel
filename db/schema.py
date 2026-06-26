@@ -329,6 +329,75 @@ def create_tables() -> None:
                     ON symbol_daily_snapshots (symbol_id, snapshot_date DESC);
             """)
 
+            # ── SEC EDGAR: news_articles new columns ─────────────────────
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='news_articles' AND column_name='form_type') THEN
+                        ALTER TABLE news_articles ADD COLUMN form_type VARCHAR(20);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='news_articles' AND column_name='filing_tier') THEN
+                        ALTER TABLE news_articles ADD COLUMN filing_tier SMALLINT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='news_articles' AND column_name='sec_source_weight') THEN
+                        ALTER TABLE news_articles ADD COLUMN sec_source_weight NUMERIC(4,2) DEFAULT 1.00;
+                    END IF;
+                END$$;
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_news_form_type
+                    ON news_articles (symbol_id, form_type, published_at DESC)
+                    WHERE form_type IS NOT NULL;
+            """)
+
+            # ── SEC EDGAR: symbols new columns ────────────────────────────
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='symbols' AND column_name='sec_score_modifier') THEN
+                        ALTER TABLE symbols ADD COLUMN sec_score_modifier NUMERIC(5,4) DEFAULT 0.0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='symbols' AND column_name='sec_modifier_updated_at') THEN
+                        ALTER TABLE symbols ADD COLUMN sec_modifier_updated_at TIMESTAMPTZ;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='symbols' AND column_name='last_10k_filed') THEN
+                        ALTER TABLE symbols ADD COLUMN last_10k_filed TIMESTAMPTZ;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='symbols' AND column_name='last_10q_filed') THEN
+                        ALTER TABLE symbols ADD COLUMN last_10q_filed TIMESTAMPTZ;
+                    END IF;
+                END$$;
+            """)
+
+            # ── sec_signals — deterministic signal table ──────────────────
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sec_signals (
+                    id             SERIAL PRIMARY KEY,
+                    symbol_id      INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    form_type      VARCHAR(20) NOT NULL,
+                    filed_at       TIMESTAMPTZ NOT NULL,
+                    signal_type    VARCHAR(50) NOT NULL,
+                    signal_value   NUMERIC(12,4),
+                    signal_text    TEXT,
+                    score_modifier NUMERIC(5,4) NOT NULL DEFAULT 0.0,
+                    source_url     TEXT,
+                    article_id     BIGINT REFERENCES news_articles(id) ON DELETE SET NULL,
+                    is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_sec_signals_symbol
+                    ON sec_signals (symbol_id, filed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_sec_signals_active
+                    ON sec_signals (symbol_id, is_active) WHERE is_active = TRUE;
+            """)
+
         conn.commit()
         logger.info("Database schema verified / created successfully.")
     except Exception as e:

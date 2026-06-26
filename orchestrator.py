@@ -46,6 +46,7 @@ from pipeline_config import (
     HTML_DELAY_RANGE,
     SUMMARY_LLM_MODEL,
 )
+from pipeline_config import WORKER4_INTERVAL, WORKER5_INTERVAL
 from config import LLM_CONFIG
 
 # ── Worker 2 FIFO queue ────────────────────────────────────────────────────────
@@ -284,6 +285,43 @@ def worker3_tick():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Worker 4 — SEC EDGAR Live Events (every 6 hours)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def worker4_tick():
+    """EDGAR live tracker — Tier 1 events (8-K) + Tier 2 (S-3, NT) + Tier 3 (Form4, 13D, 13G). Every 6 hours."""
+    try:
+        logger.info("[Worker4] Starting EDGAR live tick (event-driven forms)...")
+        from pipeline.edgar_ingest import run as edgar_run
+        result = edgar_run(
+            tier_filter=[1, 2, 3],
+            forms_only=[
+                "8-K", "8-K/A",
+                "S-3", "S-3/A", "424B1", "424B3", "424B4", "424B5",
+                "NT 10-K", "NT 10-Q",
+                "4", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A",
+            ],
+        )
+        logger.info(f"[Worker4] EDGAR live tick done: {result}")
+    except Exception as e:
+        logger.error(f"[Worker4] Error: {e}", exc_info=True)
+
+
+def worker5_tick():
+    """EDGAR daily — Tier 1 annual/quarterly reports (10-K, 10-Q). Every 24 hours."""
+    try:
+        logger.info("[Worker5] Starting EDGAR daily tick (10-K, 10-Q)...")
+        from pipeline.edgar_ingest import run as edgar_run
+        result = edgar_run(
+            tier_filter=[1],
+            forms_only=["10-K", "10-K/A", "10-Q", "10-Q/A"],
+        )
+        logger.info(f"[Worker5] EDGAR daily tick done: {result}")
+    except Exception as e:
+        logger.error(f"[Worker5] Error: {e}", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Generic worker loop wrapper
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -336,6 +374,8 @@ def main():
     logger.info(f"  Worker1 (GlobeNewswire live): every {WORKER1_INTERVAL}s")
     logger.info(f"  Worker2 (News pipeline):      every {WORKER2_INTERVAL}s  [ACTIVE — FIFO queue]")
     logger.info(f"  Worker3 (Macro research):     every {WORKER3_INTERVAL}s  [DISABLED]")
+    logger.info(f"  Worker4 (EDGAR live events): every {WORKER4_INTERVAL}s [6h]")
+    logger.info(f"  Worker5 (EDGAR 10-K/10-Q):   every {WORKER5_INTERVAL}s [24h]")
     logger.info("=" * 60)
 
     _warmup_models()
@@ -365,6 +405,18 @@ def main():
         #     daemon=True,
         #     name="Worker3-Macro",
         # ),
+        threading.Thread(
+            target=_run_worker,
+            args=("Worker4", WORKER4_INTERVAL, worker4_tick),
+            daemon=True,
+            name="Worker4-EDGAR-Live",
+        ),
+        threading.Thread(
+            target=_run_worker,
+            args=("Worker5", WORKER5_INTERVAL, worker5_tick),
+            daemon=True,
+            name="Worker5-EDGAR-Daily",
+        ),
     ]
 
     for t in threads:

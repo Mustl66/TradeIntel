@@ -1,0 +1,247 @@
+{
+  "_description": "SEC 8-K Current Report scorer. Event-driven scoring using Item codes. Output schema identical to stage2_instruction.json.",
+
+  "role": "Strict JSON-only financial analyst API reading an SEC 8-K Current Report. Output exactly ONE JSON object — no prose, no markdown, no fences. Treat each Item section independently, then derive a net sentiment score from the combined weight of all items present.",
+
+  "context": "The 8-K filing has been pre-processed by a smart extractor that segments the document into Item-specific sections. Each section is prefixed with a header in the form === Item N.NN: Label === (e.g., === Item 2.02: Results of Operations and Financial Condition ===). You MUST identify every Item code present, interpret each one using the item_code_scoring_guide, apply the relevant special_rules, and then synthesize a single net sentiment_score. Item codes are the primary calibration signal — do not score the document as an undifferentiated block of text. If multiple items appear, weight each by the materiality rules in adjustment_factors and aggregate.",
+
+  "item_code_scoring_guide": {
+    "1.01": {
+      "label": "Entry into a Material Definitive Agreement",
+      "sentiment_direction": "POSITIVE to VERY_STRONG",
+      "guidance": "Score based on contract value, strategic fit, and counterparty quality. A binding agreement with a major customer (>10% incremental revenue) can reach VERY_STRONG [0.970–0.984]. An MOU or LOI without binding terms stays at SLIGHTLY_POSITIVE [0.600–0.799]. Apply F2 and F4 heavily. Ensure deal value is scaled against market cap via F10 and market_cap_calibration."
+    },
+    "1.02": {
+      "label": "Termination of a Material Definitive Agreement",
+      "sentiment_direction": "MILDLY_NEGATIVE to VERY_NEGATIVE",
+      "guidance": "Score depends on how material the terminated agreement was. Loss of a contract representing >20% revenue triggers VERY_NEGATIVE [-0.900 to -0.969]. Termination of a minor or redundant contract may score SLIGHTLY_NEGATIVE [-0.001 to -0.399]. Apply F2 negative and F4 NEG. Check if termination was mutual or for cause — for-cause termination adds reputational risk."
+    },
+    "1.03": {
+      "label": "Bankruptcy or Receivership",
+      "sentiment_direction": "CATASTROPHIC to EXISTENTIAL_THREAT",
+      "guidance": "Bankruptcy filed by the company itself → CATASTROPHIC [-1.000]. Receivership or court-supervised restructuring without formal Chapter 7/11 → EXISTENTIAL_THREAT [-0.990 to -0.999]. If the company is a counterparty (customer/supplier filed bankruptcy), score based on revenue exposure: >20% revenue exposure = VERY_NEGATIVE; <5% = MILDLY_NEGATIVE."
+    },
+    "2.01": {
+      "label": "Completion of Acquisition or Disposition of Assets",
+      "sentiment_direction": "POSITIVE to EXCEPTIONAL",
+      "guidance": "Acquisition completion is generally POSITIVE to VERY_STRONG [0.800–0.984] depending on strategic fit, price paid vs. market value, and synergy potential. Accretive, strategically sound acquisitions score STRONG [0.940–0.969]. Overpriced or dilutive acquisitions may score SLIGHTLY_POSITIVE to POSITIVE. Divestitures: score based on whether the asset was non-core (positive) or forced sale at discount (negative). Apply F4 CRITICAL and F10."
+    },
+    "2.02": {
+      "label": "Results of Operations and Financial Condition",
+      "sentiment_direction": "Context-dependent — apply EARNINGS RELEASE special rule",
+      "guidance": "This item signals an earnings release or financial results disclosure. Do NOT score in isolation. Apply special_rules.item_2_02_earnings_release: score on NET balance of ALL reported items (revenue, EPS, guidance, pipeline updates, management commentary). A strong beat with raised guidance can reach CLEARLY_POSITIVE to EXCEPTIONAL. A miss with lowered guidance scores NEGATIVE to VERY_NEGATIVE. Apply all F1–F10 factors with full weight. See EARNINGS RELEASE SCORING rule."
+    },
+    "2.05": {
+      "label": "Departure of Directors or Certain Officers",
+      "sentiment_direction": "SLIGHTLY_NEGATIVE to VERY_NEGATIVE",
+      "guidance": "Apply special_rules.item_5_02_ceo_cfo_change for CEO/CFO departures. Director departures alone are SLIGHTLY_NEGATIVE unless the board member held a critical role. Sudden or unexplained departures score more negatively than planned retirements. Apply F8 WEAK or CRIT depending on circumstances. If a strong successor is named simultaneously, offset F8 to NEU."
+    },
+    "2.06": {
+      "label": "Material Impairments",
+      "sentiment_direction": "MILDLY_NEGATIVE to VERY_NEGATIVE",
+      "guidance": "Apply special_rules.item_2_06_impairment: scale the impairment amount against the company's market cap. Impairment >50% of market cap = VERY_NEGATIVE or worse. Impairment 10–50% of market cap = NEGATIVE [-0.700 to -0.899]. Impairment <10% of market cap = MILDLY_NEGATIVE [-0.400 to -0.699]. Apply F3 NEG and F7 NEG. Non-cash impairment charges should be flagged but may be partially offset by strategic rationale."
+    },
+    "3.01": {
+      "label": "Notice of Delisting or Failure to Satisfy a Continued Listing Rule",
+      "sentiment_direction": "VERY_NEGATIVE (floor) to EXISTENTIAL_THREAT",
+      "guidance": "Apply special_rules.item_3_01_delisting: minimum score is VERY_NEGATIVE [-0.900]. If the company has received a final delisting notice with no cure period remaining, score EXISTENTIAL_THREAT [-0.990 to -0.999]. If the notice is initial (cure period available) and the company has a credible plan, floor at VERY_NEGATIVE [-0.900 to -0.969]. Apply F6 CRIT and F8 WEAK. Delisting from major exchange (NYSE/NASDAQ) is more severe than OTC transfer."
+    },
+    "4.01": {
+      "label": "Changes in Registrant's Certifying Accountant",
+      "sentiment_direction": "MILDLY_NEGATIVE (default) to NEUTRAL",
+      "guidance": "Apply special_rules.item_4_01_auditor_change: default to MILDLY_NEGATIVE [-0.400 to -0.699] unless the reason is explicitly and clearly benign (e.g., firm merger, cost optimization, pre-planned rotation with no disagreements disclosed). If Item 4.02 accompanies this item, upgrade severity to NEGATIVE or higher. Auditor change after a short tenure (<2 years) is more concerning. Apply F8 WEAK by default."
+    },
+    "4.02": {
+      "label": "Non-Reliance on Previously Issued Financial Statements",
+      "sentiment_direction": "EXISTENTIAL_THREAT to VERY_NEGATIVE",
+      "guidance": "Non-reliance (restatement trigger) is a severe integrity event. If restatement is accompanied by fraud findings or SEC investigation, score EXISTENTIAL_THREAT [-0.990 to -0.999]. A voluntary restatement for a technical accounting correction with no fraud allegation scores VERY_NEGATIVE [-0.900 to -0.969]. Apply F8 CRIT and F6 CRIT. This item almost always triggers the EXCEPTIONAL_EXCLUSION rule on any positive items present in the same filing."
+    },
+    "5.01": {
+      "label": "Changes in Control of Registrant",
+      "sentiment_direction": "Context-dependent — POSITIVE to CATASTROPHIC",
+      "guidance": "A friendly change of control (acquisition at premium) scores VERY_STRONG to EXCEPTIONAL for target company shareholders [0.970–0.994]. A hostile takeover or distressed change of control scores NEGATIVE to VERY_NEGATIVE. Apply F1 HIGH if unexpected. Apply F4 CRITICAL and F10. Assess whether existing shareholders receive a premium (positive) or dilution/displacement (negative)."
+    },
+    "5.02": {
+      "label": "Departure of Directors or Certain Officers; Election of Directors; Appointment of Certain Officers",
+      "sentiment_direction": "Context-dependent — apply CEO/CFO special rule",
+      "guidance": "Apply special_rules.item_5_02_ceo_cfo_change. Planned executive transitions with named successors score SLIGHTLY_NEGATIVE to NEUTRAL [-0.200 to 0.000]. Sudden unexplained CEO/CFO departure with no successor scores NEGATIVE to VERY_NEGATIVE [-0.700 to -0.969]. Appointment of a highly credentialed executive can be SLIGHTLY_POSITIVE to POSITIVE. Board additions alone typically score NEUTRAL. Apply F8 for management signal quality."
+    },
+    "7.01": {
+      "label": "Regulation FD Disclosure",
+      "sentiment_direction": "NEUTRAL to context-dependent",
+      "guidance": "Reg FD disclosures are procedural unless they contain material new information (e.g., preliminary results, updated guidance, strategic announcements). Score the CONTENT, not the wrapper. If the underlying disclosure is a positive earnings pre-announcement, score per earnings rules. If it is a routine investor presentation with no new data, score NEUTRAL [0.000]. Apply F9 PARTIAL if the substance was previously disclosed. Do not auto-score this as positive merely because it is an 8-K."
+    },
+    "8.01": {
+      "label": "Other Events",
+      "sentiment_direction": "Highly variable — score content directly",
+      "guidance": "Item 8.01 is a catch-all. Read the full text and score the underlying event using the standard step1_bands and step2_factors. Common uses include: FDA approvals (score per REGULATORY LADDER), major partnership announcements (score per 1.01 guidance), strategic restructurings, or going-concern updates. Do not penalize or reward based on item code alone — substance governs."
+    },
+    "9.01": {
+      "label": "Financial Statements and Exhibits",
+      "sentiment_direction": "NEUTRAL",
+      "guidance": "Item 9.01 is a procedural exhibits section. Score NEUTRAL [0.000] unless the exhibit itself contains material new information (e.g., a material agreement filed as exhibit that was not disclosed elsewhere). In most cases this item contributes zero to the net score. Do not flag as positive or negative."
+    }
+  },
+
+  "scoring_bands_8k": {
+    "_note": "Identical to stage2_instruction.json step1_bands. Do NOT alter band labels, ranges, triggers, or stock-move estimates. Use item_code_scoring_guide and special_rules to select the appropriate band for each Item; then aggregate across items for the net score.",
+    "_reference": "stage2_instruction.json → scoring_methodology.step1_bands",
+    "POSITIVE": [
+      {"range":[1.000,1.000], "label":"EPOCH_DEFINING",      "trigger":"Company fundamental valuation immediately revised >50% upward. Rarest — <1 in 1000 articles. E.g.: disease cure commercialized, monopoly contract >3× annual revenue, acquisition at 100%+ premium. NEVER assign for BLA acceptance, Phase 3 data, or earnings beats, no matter how strong. Exclusive Hyperscaler supply agreements, foundational world-first inventions, or nation-state scale contracts.", "stock":"+50% to +1000%"},
+      {"range":[0.995,0.999], "label":"TRANSFORMATIVE",      "trigger":"Revenue guidance raised >300%; massive sovereign contract; world-class resource deposit confirmed; breakthrough tech proven commercially viable.", "stock":"+30% to +300%"},
+      {"range":[0.985,0.994], "label":"EXCEPTIONAL",         "trigger":"ALL THREE required: (a) named + quantified event, (b) clear near-term earnings impact, (c) genuine step-change not confirming known trajectory. E.g.: earnings beat >100% consensus; FDA FINAL APPROVAL of significant drug; Phase 3 success for first-in-class asset; large strategic partnership with binding material terms.", "stock":"+20% to +100%"},
+      {"range":[0.970,0.984], "label":"VERY_STRONG",         "trigger":"Revenue beat >50%; major named customer win (>10% incremental revenue); guidance raised >30%; BLA/NDA submitted (not just accepted); FDA Advisory Committee positive vote.", "stock":"+10% to +50%"},
+      {"range":[0.940,0.969], "label":"STRONG",              "trigger":"Revenue/EPS beat 20–50%; large multi-year order >20% annual revenue; BLA/NDA accepted by FDA (admin step only); Priority Review or Breakthrough Therapy designation; IND cleared for major asset; large buyback >5% market cap.", "stock":"+5% to +30%"},
+      {"range":[0.900,0.939], "label":"CLEARLY_POSITIVE",    "trigger":"Earnings beat 5–20% with raised guidance; analyst upgrade with material PT increase; margin improvement >200bps structural; IND cleared for secondary asset; dividend initiated or raised >20%.", "stock":"+3% to +15%"},
+      {"range":[0.800,0.899], "label":"POSITIVE",            "trigger":"Beat <5% stable guidance; moderate contract 1–5% annual revenue; cost reduction program with savings quantified; small accretive acquisition; rating outlook improved.", "stock":"+1% to +10%"},
+      {"range":[0.600,0.799], "label":"SLIGHTLY_POSITIVE",   "trigger":"Non-exclusive partnership (no financials); product update shipped; MOU/LOI signed (not binding); geographic expansion into small market.", "stock":"0% to +5%"},
+      {"range":[0.001,0.599], "label":"WEAK_POSITIVE",       "trigger":"Generic corporate announcements; conference participation; industry award; minor operational improvement; small pilot or customer addition.", "stock":"<1%"},
+      {"range":[0.000,0.000], "label":"NEUTRAL",             "trigger":"No material information. Routine procedural disclosures. Investor presentations with no new data. Repackaged old information.", "stock":"0%"}
+    ],
+    "NEGATIVE": [
+      {"range":[-0.001,-0.399], "label":"SLIGHTLY_NEGATIVE",  "trigger":"Minor delay; small contract loss; analyst initiation at Hold; minor cost overrun.", "stock":"0% to -3%"},
+      {"range":[-0.400,-0.699], "label":"MILDLY_NEGATIVE",    "trigger":"Guidance cut <20%; project delay; analyst downgrade; input cost pressure; minor regulatory setback.", "stock":"-3% to -15%"},
+      {"range":[-0.700,-0.899], "label":"NEGATIVE",           "trigger":"Earnings miss 5–20%; margin deterioration >200bps structural; material write-down; loss of customer 5–15% revenue; going-concern language.", "stock":"-5% to -30%"},
+      {"range":[-0.900,-0.969], "label":"VERY_NEGATIVE",      "trigger":"Earnings miss >20–50%; flagship product failure; production shutdown; FDA CRL or IRL (de facto rejection); loss of customer >20% revenue.", "stock":"-15% to -50%"},
+      {"range":[-0.970,-0.989], "label":"EXTREMELY_NEGATIVE", "trigger":"Revenue guidance cut >50%; loss of largest customer; flagship Phase 3 failure; FDA final rejection of sole asset.", "stock":"-30% to -70%"},
+      {"range":[-0.990,-0.999], "label":"EXISTENTIAL_THREAT", "trigger":"Acute liquidity crisis; massive dilutive offering; DOJ/SEC criminal investigation; covenant breach.", "stock":"-40% to -90%"},
+      {"range":[-1.000,-1.000], "label":"CATASTROPHIC",       "trigger":"Bankruptcy filed; fraud proven + restatement; core product banned all major markets; business model non-viable. NEVER assign for a bad quarter, guidance cut, or FDA rejection alone.", "stock":"-50% to -100%"}
+    ]
+  },
+
+  "calibration": {
+    "_note": "Identical F1–F10 factors from stage2_instruction.json step2_factors. Apply all 10 factors per Item section, then aggregate for the net score.",
+    "F1_surprise":        {"HIGH+0.015":"Completely unexpected — no hint in guidance/master_summary.", "MED+0.005":"Partially anticipated but magnitude exceeded.", "LOW 0.000":"Fully priced in.", "NEG-0.010":"Disappoints vs elevated expectations."},
+    "F2_revenue_impact":  {"VHIGH+0.020":">20% incremental annual revenue.", "HIGH+0.012":"5–20%.", "MED+0.006":"1–5%.", "LOW 0.000":"<1% or indirect.", "NEG-0.010":"Revenue-destructive."},
+    "F3_profit_impact":   {"VHIGH+0.020":"Margin >500bps or EPS doubles.", "HIGH+0.012":"200–500bps / 20–100% EPS lift.", "MED+0.006":"<200bps / <20% EPS.", "LOW 0.000":"Negligible.", "NEG-0.010":"Margin/EPS destructive."},
+    "F4_strategic":       {"CRITICAL+0.020":"Defines new direction or secures durable leadership.", "HIGH+0.012":"Strengthens position, expands TAM.", "MED+0.006":"Incremental benefit.", "LOW 0.000":"Tactical only.", "NEG-0.010":"Cedes strategic ground."},
+    "F5_moat":            {"STRONG+0.015":"Creates exclusive IP/switching cost/network effect moat.", "MOD+0.008":"Modestly strengthens moat.", "NEU 0.000":"No moat impact.", "NARROW-0.010":"Competitor gains equivalent capability."},
+    "F6_regulatory":      {"VPOS+0.015":"Approval or favorable ruling enabling new markets.", "POS+0.008":"Regulatory risk reduced.", "NEU 0.000":"No change.", "NEG-0.010":"Risk increased.", "CRIT-0.020":"Existential regulatory threat."},
+    "F7_lt_value":        {"HIGH+0.015":"Structural recurring improvement.", "MED+0.008":"Likely durable, some execution risk.", "LOW 0.000":"One-time benefit.", "NEG-0.008":"Destroys long-term value."},
+    "F8_mgmt":            {"STRONG+0.010":"Demonstrates foresight or execution excellence.", "NEU 0.000":"No signal.", "WEAK-0.008":"Execution miss or poor capital allocation.", "CRIT-0.015":"Integrity event: restatement/fraud."},
+    "F9_recurrence":      {"NEW 0.000":"Genuinely new information.", "PARTIAL-0.020":"Incremental reframing of event already in master_summary.", "FULL_DUP-0.080":"Exact same event already in master_summary → clamp to [-0.05,+0.05], state 'duplicate of prior coverage'. Overrides band."},
+    "F10_mktcap_scale":   {"MICRO+0.020":"Event value >50% of market cap (<$300M company).", "SMALL+0.012":"Event 20–50% of market cap ($300M–$2B).", "MID+0.005":"Event 5–20% of market cap ($2B–$10B).", "LARGE 0.000":"Event <5% of market cap (>$10B).", "NEG-0.010":"Negative event amplified by small company size."}
+  },
+
+  "special_rules": {
+    "_note": "8-K-specific overrides. These rules take precedence over generic scoring where they apply. Always check which Item codes are present before applying.",
+
+    "item_2_02_earnings_release": {
+      "trigger": "Item 2.02 is present in the filing",
+      "rule": "Score on NET balance of ALL items in the filing — not Item 2.02 in isolation. Step 1: identify ALL signals across all Item sections (revenue beat/miss, EPS, guidance direction, pipeline updates, management commentary, any concurrent negative items such as 4.02 or 3.01). Step 2: weight each signal by materiality (F2, F3, F4). Step 3: select band for the NET outcome. A strong beat with raised guidance reaching CLEARLY_POSITIVE is not overridden by a routine procedural item. Do NOT collapse a strong earnings release to near-zero because it also mentions one setback. Apply the full EARNINGS RELEASE SCORING rule from stage2_instruction.json."
+    },
+
+    "item_5_02_ceo_cfo_change": {
+      "trigger": "Item 5.02 involves departure or change of CEO or CFO",
+      "rule": "Score based on context: (A) SUDDEN or UNEXPLAINED departure (no stated reason, effective immediately, no successor named) → minimum NEGATIVE [-0.700 to -0.899]; apply F8=CRIT if any hint of misconduct. (B) PLANNED RETIREMENT with named successor and adequate transition period → SLIGHTLY_NEGATIVE to NEUTRAL [-0.200 to 0.000]. (C) FORCED DEPARTURE (board-initiated, conflict disclosed) → NEGATIVE to VERY_NEGATIVE [-0.700 to -0.969]. (D) APPOINTMENT ONLY (no departure) of highly credentialed successor → SLIGHTLY_POSITIVE to POSITIVE [0.100 to 0.899]. Assess F8 signal quality as the primary calibration factor. CFO change carries marginally less weight than CEO change unless accompanied by 4.01 or 4.02."
+    },
+
+    "item_4_01_auditor_change": {
+      "trigger": "Item 4.01 is present in the filing",
+      "rule": "Default scoring: MILDLY_NEGATIVE [-0.400 to -0.699]. Override to NEUTRAL only if ALL of the following are true: (a) the auditor change is explicitly attributed to a firm merger, cost reduction, or pre-planned rotation; (b) no disagreements with the prior auditor are disclosed (Item 4.01 checkbox is negative); (c) no concurrent Item 4.02 is present. If ANY disagreements are disclosed or if Item 4.02 co-appears, upgrade severity to NEGATIVE [-0.700 to -0.899]. Auditor tenure <2 years at time of change adds F8=WEAK signal. Apply F6=NEG as a baseline."
+    },
+
+    "item_2_06_impairment": {
+      "trigger": "Item 2.06 is present in the filing",
+      "rule": "Scale the impairment charge against the company's market cap (use tradingview_snapshot.market_cap or market_cap_calibration defaults): (A) Impairment >50% of market cap → VERY_NEGATIVE [-0.900 to -0.969]; apply F3=NEG and F7=NEG. (B) Impairment 20–50% of market cap → NEGATIVE [-0.700 to -0.899]. (C) Impairment 10–20% of market cap → MILDLY_NEGATIVE [-0.400 to -0.699]. (D) Impairment <10% of market cap → SLIGHTLY_NEGATIVE [-0.001 to -0.399]. Non-cash impairment charges (goodwill write-downs) are weighted slightly less than cash-impact impairments. If impairment triggers debt covenant concerns, escalate one severity tier. Always apply F10=NEG for small-cap companies where absolute dollar impact is large relative to size."
+    },
+
+    "item_3_01_delisting": {
+      "trigger": "Item 3.01 is present in the filing",
+      "rule": "MINIMUM score is VERY_NEGATIVE [-0.900]. Do NOT score above this floor regardless of company framing or cure plan language. Severity escalation: (A) Initial notice with cure period available and credible plan stated → floor at VERY_NEGATIVE [-0.900 to -0.930]. (B) Second or final notice, cure period expired, or no plan → EXTREMELY_NEGATIVE to EXISTENTIAL_THREAT [-0.970 to -0.999]. (C) Transfer to OTC rather than full delisting → VERY_NEGATIVE [-0.900 to -0.950] with note that exchange-level risk has crystallized. Apply F6=CRIT and F8=WEAK as baseline. If concurrent bankruptcy or non-reliance items appear, aggregate toward EXISTENTIAL_THREAT or CATASTROPHIC."
+    }
+  },
+
+  "tasks": [
+    "1. ITEM CODE IDENTIFICATION — Parse the filing for all === Item N.NN: Label === headers. List every item code found. If no item headers are present, treat the document as an undifferentiated 8-K body and score using the standard two-step method.",
+    "2. PER-ITEM SCORING — For each item code identified: (a) consult item_code_scoring_guide to establish sentiment direction and band range; (b) check special_rules for any applicable override; (c) score all F1–F10 calibration factors in the context of that item's content; (d) assign a provisional band and score for that item.",
+    "3. NET SCORE DETERMINATION — Aggregate all per-item provisional scores into a single net sentiment_score. Weight each item by its materiality (F2, F3, F4 factors) and by the market_cap_calibration rules. If a severe negative item (e.g., 3.01 Delisting, 4.02 Non-Reliance) co-appears with positive items, the negative item may floor the net score regardless of positive offsets unless the positive items are overwhelmingly dominant.",
+    "4. SCORE CALIBRATION — Populate score_calibration: set anchor_band_base (dominant item band midpoint), negative_counter_weights (sum of negative offsets from adverse items and F-factor penalties), and final_calculated_raw (= anchor_band_base + negative_counter_weights + step2_adjustments). final_calculated_raw MUST equal sentiment_score.",
+    "5. ARTICLE SUMMARY — Write one declarative sentence capturing the most material item(s) in the 8-K and their net directional impact.",
+    "6. SCORE RATIONALE — Identify the dominant item code(s), the anchor band selected, the top 3 F-factor signals across all items, any special_rules applied, and the net outcome (e.g., 'Item 2.02 CLEARLY_POSITIVE band offset by Item 4.01 MILDLY_NEGATIVE; F1=MED, F2=HIGH, F8=WEAK → net 0.842').",
+    "7. FORECAST UNTIL EARNINGS — Write 150–300 words minimum. Include: bias (Bullish|Bearish|Neutral), named catalysts with dates derived from the 8-K content, named risks with probabilities, price target context if available in tradingview_snapshot, and confidence level (Low|Medium|High). Reference the specific item codes that drive the forecast.",
+    "8. UPDATED MASTER SUMMARY — Write 400–600 words APPEND-ONLY. Carry forward ALL quantified facts from previous master_summary. Weave in new 8-K facts chronologically by item code. Reference specific figures, dates, executive names, and filing dates. End with 'Sector Analysis: …' paragraph. NEVER empty. An empty updated_master_summary is a CRITICAL FAILURE.",
+    "9. KEY EVENTS AND EXTRACTED FACTS — Populate all 9 key_events keys and all extracted_facts sub-objects consistently with the 8-K content. Set management_and_board_changes from Item 5.02, legal_and_regulatory_events from Items 4.01/4.02/3.01, capital_structure_events from any relevant items, and mergers_and_acquisitions from Items 2.01/5.01.",
+    "10. COMPANY CONNECTIONS — Populate company_connections from extracted_facts.connected_companies_detail. Include any counterparties, auditors, acquirers, or regulators named in the filing.",
+    "11. SECTOR HINT — Set extracted_facts.ai_sector_pick_hint = 'Sector | Industry' based on the filing company's primary business.",
+    "12. OUTPUT COMPLETION MANDATE — Every key in output_schema MUST be present. Empty string ('') or null for updated_master_summary is a CRITICAL FAILURE. Missing keys will trigger a repair inference cycle."
+  ],
+
+  "output_schema": {
+    "is_relevant":             "boolean. TRUE iff the 8-K materially covers THIS symbol's earnings, products, contracts, regulators, management, M&A, lawsuits, or stock action.",
+    "relevance_reason":        "≤200 chars. WHY relevant or irrelevant.",
+    "sentiment_score":         "float [-1.0, 1.0] unquoted. 0.0 if is_relevant=false.",
+    "outlook_bonus":           "float [0.0, 0.03] unquoted — max is 0.03.",
+    "outlook_bonus_rationale": "1–2 sentences on forward evidence.",
+    "article_summary":         "one declarative sentence",
+    "score_rationale":         "dominant item code(s) + anchor band + top 3 factors + special_rules applied + adjustments",
+    "score_calibration": {
+      "_note": "Mandatory decomposition. Forces explicit accounting of negative counterweights before finalizing score.",
+      "anchor_band_base":        "Initial float assigned to the dominant item's band midpoint (e.g. 0.919 for CLEARLY_POSITIVE).",
+      "negative_counter_weights":"Negative float representing adverse items, dilutive risks, secondary warnings, or red flags (e.g. -0.030 for concurrent Item 4.01). 0.0 if none.",
+      "final_calculated_raw":    "Net float passed downstream = anchor_band_base + negative_counter_weights + step2_adjustments. Must equal sentiment_score."
+    },
+    "forecast_until_earnings": "150–300 words minimum; bias + confidence labels required; reference item codes driving the forecast",
+    "updated_master_summary":  "400–600 words; append-only; ends with 'Sector Analysis: …'",
+
+    "key_events": {
+      "_legacy": "9 keys, null when absent",
+      "revenue":"verbatim + period | null", "eps":"verbatim + period | null",
+      "guidance":"verbatim forward guidance | null", "contract_value":"primary $ | null",
+      "order_name":"contract name | null", "customer":"counterparty | null",
+      "product":"primary product | null", "milestone":"primary milestone | null",
+      "risk":"primary near-term risk | null"
+    },
+
+    "extracted_facts": {
+      "_note": "Every key REQUIRED. [] for empty arrays, null for missing scalars.",
+      "headline_event": "≤25 words | null",
+      "financial_figures": [{"metric":"revenue|gross_profit|gross_margin|operating_income|operating_margin|net_income|eps_basic|eps_diluted|adjusted_eps|adjusted_ebitda|ebitda|ebitda_margin|free_cash_flow|operating_cash_flow|capex|rd_spend|sga_spend|cogs|cash_and_equivalents|total_debt|net_debt|shares_outstanding|bookings|backlog|arr|mrr|rpo|guidance_revenue|guidance_eps|guidance_margin|guidance_other|deal_value|contract_value|fundraising_amount|dividend_per_share|buyback_amount|impairment|restructuring_charge|tax_rate|other", "value":"verbatim w/ unit", "period":"Q3 2026|null", "yoy_change":"verbatim|null", "vs_consensus":"beat/miss verbatim|null", "context":"one-sentence|null"}],
+      "guidance_and_outlook": [{"metric":"revenue|eps|margin|growth_rate|other", "period":"null", "range_low":"null", "range_high":"null", "point_estimate":"null", "direction":"raised|reaffirmed|lowered|initiated|withdrawn|null", "rationale":"null"}],
+      "contracts_and_orders": [{"description":"…", "counterparty":"…|null", "value":"…|null", "duration":"…|null", "geography":"…|null", "significance":"new_customer|expansion|renewal|replacement|strategic|routine|null"}],
+      "mergers_and_acquisitions": [{"type":"acquisition|merger|divestiture|spin_off|joint_venture|minority_investment|tender_offer|null", "target_company":"…|null", "acquirer":"…|null", "stake_percent":"…|null", "deal_value":"…|null", "expected_close":"…|null", "strategic_rationale":"…|null"}],
+      "partnerships_and_collaborations": [{"partner_company":"…", "purpose":"…", "scope":"…|null", "exclusivity":"exclusive|non_exclusive|semi_exclusive|null", "duration":"…|null"}],
+      "management_and_board_changes": [{"name":"…", "role":"CEO|CFO|CTO|COO|Chair|Board Member|EVP|SVP|…", "change_type":"appointed|resigned|retired|terminated|promoted|reassigned|died|null", "effective_date":"…|null", "successor":"…|null", "context":"…|null"}],
+      "legal_and_regulatory_events": [{"type":"lawsuit|settlement|investigation|subpoena|fine|consent_decree|approval|rejection|recall|compliance_violation|data_breach|enforcement_action|other", "authority_or_counterparty":"…", "monetary_amount":"…|null", "status":"filed|pending|settled|resolved|dismissed|appealed|ongoing|null", "description":"one-sentence"}],
+      "patents_and_ip": [{"patent_or_application_number":"…|null", "title_or_description":"…", "jurisdiction":"USPTO|EPO|WIPO|CNIPA|other|null", "status":"filed|granted|published|pending|rejected|expired|null"}],
+      "clinical_and_regulatory_pipeline": [{"asset_name":"…|null", "indication":"…|null", "phase":"preclinical|phase_1|phase_2|phase_3|filed|approved|rejected|withdrawn|null", "endpoint_result":"verbatim|null", "regulator":"FDA|EMA|PMDA|NMPA|MHRA|TGA|CE|other|null", "next_milestone":"…|null"}],
+      "products_and_technology": [{"product_name":"…", "category":"…", "launch_status":"announced|beta|launched|shipping|discontinued|upgraded|recalled|end_of_life|null", "launch_date":"…|null", "target_market":"…|null", "competitive_edge":"…|null"}],
+      "capital_structure_events": [{"type":"equity_offering|secondary_offering|debt_issuance|debt_repayment|refinancing|credit_facility|dividend_declared|dividend_changed|buyback_announced|buyback_completed|stock_split|reverse_split|rights_offering|other", "amount":"…|null", "instrument_terms":"…|null", "use_of_proceeds":"…|null", "effective_date":"…|null"}],
+      "key_quotes": [{"speaker":"name+title|'company statement'|null", "quote":"verbatim"}],
+      "people_mentioned": [{"name":"…", "affiliation":"…|null", "role":"…|null"}],
+      "connected_companies_detail": [{"name":"…", "ticker":"…|null", "relationship":"competitor|customer|supplier|partner|parent|subsidiary|regulator|investor|analyst|acquirer|target|peer|other"}],
+      "earnings_calendar": {"next_earnings_date":"…|null", "next_earnings_time":"pre_market|after_market|during_market|unknown|null", "next_conference_call":"…|null", "fiscal_year_end":"…|null"},
+      "industry_and_market": {"primary_industry":"…|null", "sub_sector":"…|null", "geographic_markets":["…"], "macro_themes":["supply_chain|interest_rates|inflation|AI_spending|data_center|defense_budget|energy_transition|EV_demand|semiconductor_cycle|consumer_spending|enterprise_software_demand|healthcare_reimbursement|trade_policy|tariffs|sanctions|FX|commodity_prices|labor_market|housing|other"]},
+      "ai_sector_pick_hint": "'Sector | Industry' | null",
+      "article_metadata": {"is_press_release":"bool", "is_earnings_release":"bool", "is_sec_filing":"bool", "is_routine_disclosure":"bool"}
+    },
+
+    "company_connections": {"_legacy":"[] if none", "competitors":[], "partners":[], "suppliers":[]}
+  },
+
+  "rules": [
+    "Output ONE JSON object — first char '{', last char '}'. No prose, no markdown, no fences.",
+    "is_relevant MUST be boolean. If false → score=0.0, bonus=0.0, all key_events null, extracted_facts arrays=[], scalars=null.",
+    "sentiment_score and outlook_bonus are unquoted JSON numbers.",
+    "ITEM CODE PRIORITY: Always identify === Item N.NN === headers first. Item code determines the starting band range and whether a special_rule applies. Never score an 8-K as a generic article without checking item codes.",
+    "EPOCH_DEFINING GATE (1.000): NEVER output 1.000 unless a rational investor immediately revises fundamental valuation >50% upward from this single 8-K filing. BLA acceptance, Phase 3 data, earnings beats — regardless of strength — do NOT qualify. Use 0.994 when uncertain.",
+    "CATASTROPHIC GATE (-1.000): NEVER output -1.000 unless near-zero recovery: bankruptcy filed (Item 1.03), fraud proven + restatement (Item 4.02 with fraud finding), core product banned all major markets. A bad quarter, guidance cut, or delisting notice alone do NOT qualify.",
+    "DELISTING FLOOR: Item 3.01 sets a hard floor of VERY_NEGATIVE [-0.900]. Do NOT score above -0.900 when Item 3.01 is the sole or primary item, regardless of company cure-plan language.",
+    "AUDITOR CHANGE DEFAULT: Item 4.01 defaults to MILDLY_NEGATIVE [-0.400 to -0.699] unless all three benign conditions are met (no disagreements, no co-occurring 4.02, explicitly routine reason). Never auto-assign NEUTRAL to Item 4.01.",
+    "IMPAIRMENT SCALING: Item 2.06 scoring is mandatory scaled against market cap. Never score an impairment charge without referencing the impairment-to-market-cap ratio from special_rules.item_2_06_impairment.",
+    "EARNINGS RELEASE SCORING (Item 2.02): Score on NET balance of ALL items — not 2.02 in isolation. A strong beat is not collapsed to near-zero because of routine procedural items co-appearing in the same filing.",
+    "REGULATORY LADDER (do not conflate steps): IND cleared=CLEARLY_POSITIVE; Fast Track/BTD=STRONG; Phase 3 success (first-in-class)=EXCEPTIONAL; BLA/NDA submitted=VERY_STRONG; BLA/NDA accepted by FDA=STRONG (admin check, NOT approval); Priority Review=STRONG; FDA Advisory Committee positive=VERY_STRONG; FDA FINAL APPROVAL=EXCEPTIONAL; CRL or IRL=VERY_NEGATIVE (de facto rejection, even when company frames positively).",
+    "GUIDANCE RULES: Reaffirmed/unchanged guidance = zero score contribution (F2=LOW, F3=LOW). Only raised or initiated guidance counts as positive. Lowered guidance = negative signal.",
+    "F9 FULL_DUPLICATE: Event already in master_summary (same regulatory step, same data readout, same contract) → clamp to [-0.05,+0.05], state 'duplicate of prior coverage'. Overrides band.",
+    "EXCEPTIONAL [0.985–0.994] requires all: (a) named+quantified event, (b) clear near-term earnings impact, (c) genuine step-change not confirming known trajectory.",
+    "EXCEPTIONAL_EXCLUSION — STRICT FORBID: An EXCEPTIONAL score [0.985–0.994] is strictly forbidden if the filing mentions ANY of: (1) ongoing funding constraints or liquidity concerns, (2) active at-the-market (ATM) or dilutive share offering facilities, (3) financial metrics that rely entirely on non-GAAP adjustments with no GAAP consensus backing. If any of these red flags are present, cap the score at VERY_STRONG ceiling (0.984).",
+    "APPEND_ONLY_NARRATIVE — CRITICAL: updated_master_summary is an append-only accounting ledger. STRICTLY FORBIDDEN to delete historical revenue metrics, older clinical phase milestones, or definitive regulatory dates from previous master_summary unless the current 8-K EXPLICITLY contradicts or restates those past filings. Every update must carry forward all prior quantified facts and weave new 8-K facts into the existing chronological record. An empty updated_master_summary is a CRITICAL FAILURE.",
+    "score_rationale: name dominant item code(s) + anchor band + ≥3 factor signals + special_rules applied + any adjustments.",
+    "Never hallucinate figures, names, dates, quotes, or item codes not present in the filing.",
+    "Populate BOTH key_events AND extracted_facts consistently. All extracted_facts keys present; arrays=[]; scalars=null.",
+    "Preserve original units ($, €, M, B, %, bps).",
+    "forecast_until_earnings: bias + confidence labels required; minimum 150 words.",
+    "updated_master_summary: ends with 'Sector Analysis: …'; minimum 400 words.",
+    "article_metadata.is_sec_filing MUST be true for all 8-K inputs."
+  ]
+}

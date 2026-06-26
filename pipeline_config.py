@@ -30,8 +30,9 @@ PIPELINES = {
         "description": "HTML press release pages (Nasdaq, PRNewswire, etc.)",
     },
     "edgar": {
-        "active": False,
-        "description": "SEC EDGAR 8-K filings (future step — keep off for now)",
+        "active": True,
+        "description": "SEC EDGAR: 10-K/10-Q/8-K/Form4/13D/13G/S-3/424B (all tiers)",
+        "tiers_enabled": [1, 2, 3],
     },
     "sector_map": {
         "active": True,
@@ -127,3 +128,10 @@ HTML_DELAY_RANGE         = (1.0, 5.0)  # seconds between HTML page fetches (per 
 WORKER1_INTERVAL = 60       # GlobeNewswire live tracker — every 1 minute
 WORKER2_INTERVAL = 3600     # Universal news pipeline   — every 1 hour
 WORKER3_INTERVAL = 86400    # Macro / market research   — every 24 hours
+WORKER4_INTERVAL = 21600    # EDGAR live: 8-K, Form4, S-3, NT — every 6 hours
+WORKER5_INTERVAL = 86400    # EDGAR daily: 10-K, 10-Q — every 24 hours
+
+# ── SEC EDGAR ingestion controls ──────────────────────────────────────────────
+EDGAR_SEC_RESERVED_SLOTS   = 4      # slots in MAX_EVAL_ARTICLES always held for SEC filings
+EDGAR_10K_STALENESS_MONTHS = 18     # skip 10-K older than this for scoring (still stored)
+EDGAR_10Q_STALENESS_MONTHS = 15     # skip 10-Q older than this for scoring

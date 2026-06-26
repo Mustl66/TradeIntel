@@ -1,0 +1,102 @@
+{
+  "_description": "SC 13D Activist Investor scorer. Almost always positive — activist entry is a change catalyst. Score based on purpose statement (Item 4) and stake size.",
+  "role": "analyst reading an SC 13D filed by an activist investor",
+  "context": "Sections extracted are Item 3 (source of funds), Item 4 (PURPOSE — most important), Item 5 (ownership %), Item 6 (agreements). Item 4 is the key signal. A 13D filing requires >5% ownership and signals intent to influence company direction.",
+  "item_reference": {
+    "Item_3": "Source and amount of funds used to acquire the position",
+    "Item_4": "PURPOSE OF THE TRANSACTION — primary scoring signal. Describes what the activist intends to do.",
+    "Item_5": "Ownership percentage and number of shares held",
+    "Item_6": "Contracts, arrangements, or agreements related to the position"
+  },
+  "purpose_scoring_guide": {
+    "seeking_board_seats": {
+      "label": "CLEARLY_POSITIVE",
+      "score_min": 0.900,
+      "note": "Direct governance pressure — board representation forces management accountability"
+    },
+    "seeking_sale_of_company": {
+      "label": "VERY_STRONG",
+      "score_min": 0.970,
+      "note": "Sale of company typically delivers maximum shareholder value — highest catalyst signal"
+    },
+    "strategic_alternatives": {
+      "label": "STRONG to EXCEPTIONAL",
+      "score_range": [0.940, 0.994],
+      "note": "Broad mandate including spin-offs, divestitures, or sale — strong value-unlock signal"
+    },
+    "operational_improvements": {
+      "label": "CLEARLY_POSITIVE",
+      "score_min": 0.900,
+      "note": "Cost cuts, margin improvement, or capital allocation changes — credible value creation path"
+    },
+    "passive_monitoring": {
+      "label": "SLIGHTLY_POSITIVE",
+      "score_min": 0.600,
+      "note": "Likely mislabeled 13D — filer claims passive intent despite >5% threshold; treat as weak signal"
+    },
+    "oppose_management_proposal": {
+      "label": "CLEARLY_POSITIVE",
+      "score_min": 0.900,
+      "note": "Active opposition to dilutive deals, bad acquisitions, or entrenchment — shareholder-aligned"
+    }
+  },
+  "stake_amplifier": {
+    "description": "Adjust score upward based on ownership percentage — larger stake = greater conviction and influence",
+    "tiers": {
+      "5_to_10_pct": {
+        "range": "5% to 10%",
+        "adjustment": 0.000,
+        "note": "Baseline — meets 13D threshold, standard activist position"
+      },
+      "10_to_25_pct": {
+        "range": "10% to 25%",
+        "adjustment": 0.020,
+        "note": "Significant block — meaningful influence over shareholder votes"
+      },
+      "above_25_pct": {
+        "range": ">25%",
+        "adjustment": 0.040,
+        "note": "Near-control position — activist can block major transactions and force change"
+      }
+    },
+    "note": "Add stake_amplifier adjustment to base purpose score, then cap at 0.994"
+  },
+  "mandatory_floor": {
+    "label": "SLIGHTLY_POSITIVE",
+    "value": 0.600,
+    "note": "A >5% activist filing 13D is NEVER neutral. Minimum score is 0.600 regardless of stated purpose."
+  },
+  "tasks": [
+    "Extract filer name and organization type from the cover page",
+    "Extract ownership stake percentage from Item 5",
+    "Classify the activist's purpose by carefully reading Item 4 — map to closest purpose_scoring_guide key",
+    "Determine base score from purpose_scoring_guide (use score_min or midpoint of score_range)",
+    "Apply stake_amplifier based on ownership percentage tier",
+    "Compute final score = base_score + stake_amplifier, capped at 0.994, floored at 0.600",
+    "Write a 1-sentence summary identifying the filer, stake size, and stated purpose",
+    "Write a short forecast (1-3 sentences) on likely near-term corporate actions and price impact",
+    "Update master_summary with filer name, filing date, stake %, classified purpose, and score"
+  ],
+  "output_schema": {
+    "score": "float in [0.600, 0.994] — almost always positive",
+    "label": "string — sentiment label matching score tier",
+    "summary": "string — 1-sentence description identifying filer, stake, and purpose",
+    "forecast": "string — 1-3 sentence outlook on expected activist actions and market impact",
+    "filer_name": "string — name of the activist investor or fund",
+    "stake_pct": "float — ownership percentage from Item 5",
+    "classified_purpose": "string — key from purpose_scoring_guide",
+    "base_score": "float — score from purpose_scoring_guide before amplifier",
+    "stake_amplifier_applied": "float — adjustment added for stake tier (0.0, 0.02, or 0.04)",
+    "master_summary_update": "object — fields to append/update in master_summary"
+  },
+  "rules": [
+    "mandatory_floor: final score must never fall below 0.600 for a valid 13D filing",
+    "never negative: activist entry, by definition, is a catalyst — even passive 13Ds carry some positive signal",
+    "exception: score may go below 0.600 ONLY if activist purpose is clearly value-destructive (e.g. hostile takeover with clear evidence it destroys shareholder value)",
+    "stake_amplifier is additive — apply after determining base purpose score",
+    "cap final score at 0.994 — certainty of outcome is never 100%",
+    "Item 4 is the primary signal — prioritize its language over any other section",
+    "if Item 4 is vague or boilerplate, default to 'passive_monitoring' category",
+    "always record filer name and stake in master_summary for tracking follow-up 13D/A amendments"
+  ]
+}

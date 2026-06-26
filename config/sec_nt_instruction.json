@@ -1,0 +1,83 @@
+{
+  "_description": "SEC NT 10-K / NT 10-Q Late Filing Notice scorer. Always negative. Severity depends on stated reason.",
+  "role": "analyst reading an NT (notification of late filing) form",
+  "context": "NT filings are short (usually 1-2 pages). The company states WHY it cannot file on time. The reason is the primary scoring signal.",
+  "reason_severity_map": {
+    "system_or_administrative": {
+      "label": "SLIGHTLY_NEGATIVE",
+      "score_range": [-0.050, -0.150],
+      "note": "Benign — technical or administrative delay with no fundamental concern"
+    },
+    "complex_transaction_or_acquisition": {
+      "label": "SLIGHTLY_NEGATIVE to MILDLY_NEGATIVE",
+      "score_range": [-0.100, -0.300],
+      "note": "Deal complexity can justify delay but introduces uncertainty"
+    },
+    "revenue_recognition_review": {
+      "label": "MILDLY_NEGATIVE",
+      "score_range": [-0.300, -0.500],
+      "note": "Accounting issue — potential restatement risk, elevated concern"
+    },
+    "restatement_needed": {
+      "label": "NEGATIVE to VERY_NEGATIVE",
+      "score_range": [-0.500, -0.800],
+      "note": "Material accounting error requiring restatement — significant red flag"
+    },
+    "auditor_change_during_filing": {
+      "label": "MILDLY_NEGATIVE",
+      "score_range": [-0.250, -0.400],
+      "note": "Mid-cycle auditor change creates process disruption and raises questions"
+    },
+    "no_reason_stated": {
+      "label": "MILDLY_NEGATIVE",
+      "score_range": [-0.300, -0.300],
+      "note": "Unknown reason is treated as worse — lack of transparency is itself a signal"
+    },
+    "going_concern_investigation": {
+      "label": "VERY_NEGATIVE",
+      "score_range": [-0.700, -0.900],
+      "note": "Existential risk signal — company may not be a going concern"
+    }
+  },
+  "mandatory_floor": {
+    "label": "SLIGHTLY_NEGATIVE",
+    "value": -0.050,
+    "note": "NT filings are NEVER neutral or positive. Minimum penalty is -0.050 regardless of reason."
+  },
+  "escalation_rule": {
+    "description": "If this is the Nth NT filing in the past 24 months, apply an additional penalty per prior NT.",
+    "penalty_per_prior_nt": -0.100,
+    "lookback_window_months": 24,
+    "data_source": "Check master_summary for prior NT filing dates",
+    "note": "Recurring inability to file on time is a strong negative pattern signal"
+  },
+  "tasks": [
+    "Identify the NT type: NT 10-K (annual) or NT 10-Q (quarterly)",
+    "Extract the stated reason for the late filing from the form text",
+    "Classify the reason using reason_severity_map — pick the closest matching category",
+    "Apply escalation_rule: count prior NTs in master_summary within 24 months and add -0.100 per prior NT",
+    "Compute final score within the mapped range, respecting mandatory_floor of -0.050",
+    "Write a 1-sentence summary describing the NT type and classified reason",
+    "Write a short forecast (1-3 sentences) on likely next steps and risk outlook",
+    "Update master_summary with this NT filing date, type, and classified reason"
+  ],
+  "output_schema": {
+    "score": "float in [-0.900, -0.050] — never positive or zero",
+    "label": "string — sentiment label matching score tier",
+    "summary": "string — 1-sentence description of the filing and reason",
+    "forecast": "string — 1-3 sentence outlook on risk and next steps",
+    "classified_reason": "string — key from reason_severity_map",
+    "nt_type": "string — '10-K' or '10-Q'",
+    "prior_nt_count_24m": "integer — number of prior NTs found in master_summary within 24 months",
+    "escalation_penalty_applied": "float — total additional penalty from escalation rule (0.0 if none)",
+    "master_summary_update": "object — fields to append/update in master_summary"
+  },
+  "rules": [
+    "mandatory_floor: final score must never exceed -0.050 (never neutral, never positive)",
+    "never positive: NT filings represent failure to meet regulatory deadline — no upside scenario",
+    "pattern escalation: apply -0.100 per prior NT filing within 24 months on top of base score",
+    "if no reason is stated in the filing, default to 'no_reason_stated' category",
+    "when reason could fit multiple categories, choose the more severe classification",
+    "always update master_summary with this filing's date and classification for future escalation checks"
+  ]
+}

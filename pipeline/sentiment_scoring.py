@@ -38,7 +38,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -221,6 +221,32 @@ def _load_instruction(filename: str) -> str:
 
 _STAGE1_INSTRUCTION_JSON = _load_instruction("stage1_instruction.json")
 _STAGE2_INSTRUCTION_JSON = _load_instruction("stage2_instruction.json")
+
+# ── SEC per-form instruction files ────────────────────────────────────────────
+# Maps form_type → config filename. Loaded lazily on first use.
+_FORM_TYPE_TO_INSTRUCTION: dict[str, str] = {
+    "10-K":     "sec_10k_instruction.json",
+    "10-K/A":   "sec_10k_instruction.json",
+    "10-Q":     "sec_10q_instruction.json",
+    "10-Q/A":   "sec_10q_instruction.json",
+    "8-K":      "sec_8k_instruction.json",
+    "8-K/A":    "sec_8k_instruction.json",
+    "S-3":      "sec_s3_424b_instruction.json",
+    "S-3/A":    "sec_s3_424b_instruction.json",
+    "424B1":    "sec_s3_424b_instruction.json",
+    "424B3":    "sec_s3_424b_instruction.json",
+    "424B4":    "sec_s3_424b_instruction.json",
+    "424B5":    "sec_s3_424b_instruction.json",
+    "NT 10-K":  "sec_nt_instruction.json",
+    "NT 10-Q":  "sec_nt_instruction.json",
+    "4":        "sec_form4_instruction.json",
+    "SC 13D":   "sec_13d_instruction.json",
+    "SC 13D/A": "sec_13d_instruction.json",
+    "SC 13G":   "sec_13g_instruction.json",
+    "SC 13G/A": "sec_13g_instruction.json",
+}
+# Cache: fname → fully-built system prompt string
+_SEC_SYSTEM_CACHE: dict[str, str] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +554,40 @@ _STAGE2_SYSTEM = (
 )
 
 
+def _get_stage2_system(form_type: Optional[str]) -> str:
+    """Return the correct Stage 2 system prompt for this article.
+
+    News articles (form_type=None) → existing _STAGE2_SYSTEM (unchanged behaviour).
+    SEC filings → load the tailor-made per-form instruction JSON, build system
+    prompt once, cache it for the lifetime of this process.
+    """
+    if not form_type:
+        return _STAGE2_SYSTEM  # news / press release — no change
+
+    fname = _FORM_TYPE_TO_INSTRUCTION.get(form_type)
+    if not fname:
+        logger.debug(f"[sec_router] Unknown form_type '{form_type}' — falling back to news prompt")
+        return _STAGE2_SYSTEM
+
+    if fname not in _SEC_SYSTEM_CACHE:
+        instr = _load_instruction(fname)
+        if instr == "{}":
+            logger.warning(f"[sec_router] Instruction file '{fname}' missing — falling back to news prompt")
+            _SEC_SYSTEM_CACHE[fname] = _STAGE2_SYSTEM
+        else:
+            _SEC_SYSTEM_CACHE[fname] = (
+                "You are a professional financial analyst AI operating under the following "
+                "SEC filing instruction schema.\n\n"
+                + instr
+                + "\n\nReturn ONLY valid JSON matching the output_schema above. "
+                  "No markdown, no explanation."
+                + _load_skills()
+            )
+        logger.debug(f"[sec_router] Loaded SEC instruction: {fname} for form_type={form_type}")
+
+    return _SEC_SYSTEM_CACHE[fname]
+
+
 def _build_stage2_prompt(
     symbol: str,
     tv_snapshot: dict,
@@ -646,17 +706,14 @@ def _validate_stage2_result(result: dict, prev_master_summary: str = "") -> list
 
 
 def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
-                 prev_master_summary: str = "") -> Optional[dict]:
+                 prev_master_summary: str = "",
+                 system_prompt: Optional[str] = None) -> Optional[dict]:
     """Main sentiment LLM call. Streams tokens and checks pause flag every chunk.
 
-    If _PAUSE_EVENT is set mid-stream the stream is closed immediately and
-    ScoringPaused is raised — the article stays unscored and will be re-evaluated
-    on resume.
-
-    Determinism knobs:
-      - temperature 0.0, top_p 1.0, seed=42
-      - Ollama: top_k=1 (greedy), num_ctx from config
+    system_prompt: if provided, overrides the default _STAGE2_SYSTEM.
+                   Used to inject SEC-specific instruction JSONs per form type.
     """
+    sys_msg = system_prompt if system_prompt is not None else _STAGE2_SYSTEM
     kwargs = {
         "model":             LLM_CONFIG["model"],
         "temperature":       0.0,
@@ -667,7 +724,7 @@ def _call_stage2(client: OpenAI, prompt: str, retries: int = 3,
         "seed":              42,
         "stream":            True,   # ← streaming for interruptibility
         "messages": [
-            {"role": "system", "content": _STAGE2_SYSTEM},
+            {"role": "system", "content": sys_msg},
             {"role": "user",   "content": prompt},
         ],
     }
@@ -1127,20 +1184,128 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
 
 
 def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
-    """Get rolling window: newest MAX_EVAL_ARTICLES, returned oldest→newest."""
+    """Get rolling window for scoring: newest MAX_EVAL_ARTICLES articles, oldest→newest.
+
+    SEC-reserved slot strategy:
+      - Always include most recent 10-K (if ≤18 months old) — up to 1 slot
+      - Always include most recent 3 10-Qs (if ≤15 months old) — up to 3 slots
+      - Always include most recent Tier-2/3 SEC filings in last 90 days — up to 2 slots
+      - Remaining slots filled with standard news (current behaviour)
+
+    This ensures fundamental filings always influence scoring even when there
+    are many recent news articles that would otherwise crowd them out.
+    """
+    from pipeline_config import EDGAR_SEC_RESERVED_SLOTS, EDGAR_10K_STALENESS_MONTHS, EDGAR_10Q_STALENESS_MONTHS
+    now = datetime.now(timezone.utc)
+    cutoff_10k = now - timedelta(days=EDGAR_10K_STALENESS_MONTHS * 30.44)
+    cutoff_10q = now - timedelta(days=EDGAR_10Q_STALENESS_MONTHS * 30.44)
+    cutoff_t23 = now - timedelta(days=90)
+
+    SEC_COLS = "id, title, summary, full_text, published_at, sentiment_score, pre_summary_data, form_type, sec_source_weight"
+
+    # ── 1. Most recent 10-K (1 slot, max staleness 18 months) ────────────────
+    reserved: list[dict] = []
+    reserved_ids: set[int] = set()
+
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, title, summary, full_text, published_at,
-                   sentiment_score, pre_summary_data
+        cur.execute(f"""
+            SELECT {SEC_COLS}
             FROM news_articles
             WHERE symbol_id = %s
+              AND form_type IN ('10-K', '10-K/A')
+              AND published_at >= %s
+            ORDER BY published_at DESC
+            LIMIT 1
+        """, (symbol_id, cutoff_10k))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            reserved.append(row)
+            reserved_ids.add(row["id"])
+
+    # ── 2. Most recent 3 10-Qs (up to 3 slots, max staleness 15 months) ──────
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {SEC_COLS}
+            FROM news_articles
+            WHERE symbol_id = %s
+              AND form_type IN ('10-Q', '10-Q/A')
+              AND published_at >= %s
+            ORDER BY published_at DESC
+            LIMIT 3
+        """, (symbol_id, cutoff_10q))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            if row["id"] not in reserved_ids:
+                reserved.append(row)
+                reserved_ids.add(row["id"])
+
+    # ── 3. Most recent Tier-2/3 events in last 90 days (up to 2 slots) ───────
+    tier23_forms = ("S-3","S-3/A","424B1","424B3","424B4","424B5",
+                    "NT 10-K","NT 10-Q","SC 13D","SC 13D/A","SC 13G","SC 13G/A","4")
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {SEC_COLS}
+            FROM news_articles
+            WHERE symbol_id = %s
+              AND form_type = ANY(%s)
+              AND published_at >= %s
+            ORDER BY published_at DESC
+            LIMIT 2
+        """, (symbol_id, list(tier23_forms), cutoff_t23))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            if row["id"] not in reserved_ids:
+                reserved.append(row)
+                reserved_ids.add(row["id"])
+
+    # ── 4. News articles fill remaining slots ─────────────────────────────────
+    news_limit = max(1, MAX_EVAL_ARTICLES - len(reserved))
+    excl = list(reserved_ids) if reserved_ids else [-1]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {SEC_COLS}
+            FROM news_articles
+            WHERE symbol_id = %s
+              AND (form_type IS NULL OR form_type NOT IN (
+                  '10-K','10-K/A','10-Q','10-Q/A',
+                  'S-3','S-3/A','424B1','424B3','424B4','424B5',
+                  'NT 10-K','NT 10-Q','SC 13D','SC 13D/A','SC 13G','SC 13G/A','4',
+                  '8-K','8-K/A'
+              ))
+              AND id != ALL(%s)
             ORDER BY published_at DESC
             LIMIT %s
-        """, (symbol_id, MAX_EVAL_ARTICLES))
+        """, (symbol_id, excl, news_limit))
         cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    # flip: oldest → newest for stateful processing
-    return list(reversed(rows))
+        news_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    # Also grab recent 8-K filings not in reserved (they fit in the news slots)
+    eight_k_limit = max(0, news_limit - len(news_rows))
+    if eight_k_limit > 0:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT {SEC_COLS}
+                FROM news_articles
+                WHERE symbol_id = %s
+                  AND form_type IN ('8-K', '8-K/A')
+                  AND id != ALL(%s)
+                ORDER BY published_at DESC
+                LIMIT %s
+            """, (symbol_id, excl, eight_k_limit))
+            cols = [d[0] for d in cur.description]
+            for r in cur.fetchall():
+                row = dict(zip(cols, r))
+                if row["id"] not in reserved_ids:
+                    news_rows.append(row)
+
+    # ── 5. Merge: reserved (SEC) first, then news, sorted oldest→newest ───────
+    all_rows = reserved + news_rows
+    all_rows.sort(key=lambda x: x["published_at"])
+    return all_rows
 
 
 def _get_macro_multiplier(conn, industry: str) -> float:
@@ -1571,6 +1736,26 @@ def _save_article_result(cur, article_id: int, result: dict,
         pass
 
 
+def _get_sec_modifier(conn, symbol_id: int) -> float:
+    """Sum all active sec_signals modifiers for this symbol (last 180 days).
+    Returns a value capped at ±0.20. Returns 0.0 if no signals or table missing.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(score_modifier), 0.0)
+                FROM sec_signals
+                WHERE symbol_id = %s
+                  AND is_active  = TRUE
+                  AND filed_at  > NOW() - INTERVAL '180 days'
+            """, (symbol_id,))
+            row = cur.fetchone()
+        return round(float(row[0]) if row else 0.0, 4)
+    except Exception as e:
+        logger.debug(f"[sec_modifier] read failed (non-fatal): {e}")
+        return 0.0
+
+
 def _apply_asymptotic_multiplier(base: float, multiplier: float,
                                   threshold: float = ASYMPTOTE_THRESHOLD) -> float:
     """Apply sector/macro multiplier with asymptotic compression near ±1.
@@ -1634,7 +1819,8 @@ def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
                         macro_multiplier: float, ai_sector_pick: str = "",
                         ai_sector_multiplier: float = 1.000,
                         raw_weight_pairs: list[tuple[float, float]] | None = None,
-                        newest_material_pub: Optional[datetime] = None):
+                        newest_material_pub: Optional[datetime] = None,
+                        conn=None):
     """Compute and store final_score using selectivity-enhanced aggregation.
 
     Math pipeline:
@@ -1661,6 +1847,14 @@ def _save_symbol_scores(cur, symbol_id: int, master_summary: str,
 
     # ── Step 3: gravity — inactivity penalty on symbol level ──────────────────
     final_score = _apply_gravity(final_score, newest_material_pub)
+
+    # ── Step 3b: SEC deterministic signal modifier ─────────────────────────────
+    # Additive nudge from rule-based signals: NT delays, activist entry,
+    # insider buying, dilution events etc. Capped at ±0.20 in sec_signals table.
+    sec_mod = _get_sec_modifier(conn, symbol_id)
+    if sec_mod != 0.0:
+        final_score = max(-1.0, min(1.0, final_score + sec_mod))
+        logger.debug(f"[save_scores] symbol_id={symbol_id} sec_modifier={sec_mod:+.4f} → {final_score:.4f}")
 
     # ── Step 4: clamp ─────────────────────────────────────────────────────────
     final_score = round(max(-1.0, min(1.0, final_score)), 6)
@@ -1891,7 +2085,9 @@ def _process_symbol(
             except Exception: pass
 
         _t0 = time.time()
-        result = _call_stage2(main_client, prompt, prev_master_summary=master_summary)
+        result = _call_stage2(main_client, prompt,
+                              prev_master_summary=master_summary,
+                              system_prompt=_get_stage2_system(article.get("form_type")))
         t_s2 = round(time.time() - _t0, 1)
 
         if result is None:
@@ -1941,7 +2137,10 @@ def _process_symbol(
             if _hint and isinstance(_hint, str):
                 ai_sector_hints.append(_hint)
             if abs(raw_score) >= MATERIALITY_THRESHOLD:
-                raw_weight_pairs.append((raw_score, decay_w))
+                # Apply sec_source_weight so Tier-1 filings (10-K=2.5×, 10-Q=2.0×)
+                # count proportionally more in the final weighted mean.
+                _sec_w = float(article.get("sec_source_weight") or 1.0)
+                raw_weight_pairs.append((raw_score, decay_w * _sec_w))
                 # Track newest material pub for gravity calculation
                 if newest_material_pub is None or published_at > newest_material_pub:
                     newest_material_pub = published_at
@@ -1969,7 +2168,8 @@ def _process_symbol(
                                 ai_sector_pick=ai_sector_pick,
                                 ai_sector_multiplier=ai_sector_mult,
                                 raw_weight_pairs=raw_weight_pairs,
-                                newest_material_pub=newest_material_pub)
+                                newest_material_pub=newest_material_pub,
+                                conn=conn)
         conn.commit()
         avg_w = sum(weighted_scores) / len(weighted_scores)
         logger.info(f"[{symbol}] scored={scored} skipped={skipped} "

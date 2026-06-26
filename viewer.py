@@ -23,6 +23,14 @@ from config import DB_CONFIG
 
 app = FastAPI(title="TradeIntel Viewer", docs_url=None, redoc_url=None)
 
+# ── Mount SEC Intelligence Dashboard ─────────────────────────────────────────
+try:
+    from sec_dashboard import sec_router
+    app.include_router(sec_router)
+    logging.getLogger("tradeintel.viewer").info("SEC dashboard mounted at /sec/{symbol}")
+except Exception as _sec_e:
+    logging.getLogger("tradeintel.viewer").warning(f"SEC dashboard not loaded: {_sec_e}")
+
 
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
@@ -578,6 +586,9 @@ def leaderboard_partial(sort: str = "final_score", dir: str = "desc"):
           </td>
           <td style="text-align:center;font-size:11px;color:#475569">{scored}/{total}</td>
           <td style="text-align:center;font-size:11px;color:#475569">{upd}</td>
+          <td style="text-align:center">
+            <a href="/sec/{r['symbol']}" onclick="event.stopPropagation()" style="color:#c084fc;text-decoration:none;font-size:11px;padding:3px 8px;border:1px solid #c084fc33;border-radius:4px;white-space:nowrap">📊 SEC</a>
+          </td>
         </tr>"""
 
         card_items += f"""
@@ -651,6 +662,9 @@ def index(sort: str = "final_score", dir: str = "desc"):
           </td>
           <td style="text-align:center;font-size:11px;color:#475569">{scored}/{total}</td>
           <td style="text-align:center;font-size:11px;color:#475569">{upd}</td>
+          <td style="text-align:center">
+            <a href="/sec/{r['symbol']}" onclick="event.stopPropagation()" style="color:#c084fc;text-decoration:none;font-size:11px;padding:3px 8px;border:1px solid #c084fc33;border-radius:4px;white-space:nowrap">📊 SEC</a>
+          </td>
         </tr>"""
 
         card_items += f"""

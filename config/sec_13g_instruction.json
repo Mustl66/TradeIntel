@@ -1,0 +1,98 @@
+{
+  "_description": "SC 13G Institutional Holdings scorer. Mild positive/negative signal based on direction of change.",
+  "role": "analyst reading an SC 13G filed by an institutional investor",
+  "context": "13G is a passive filing (vs 13D which is activist). Key signals are: whether this is a new position or amendment, direction of stake change, size of stake, and filer identity (passive index fund vs active conviction manager). 13G signals institutional interest but not direct influence.",
+  "filing_type_notes": {
+    "SC_13G": "Initial filing — new position crossing 5% threshold for the first time",
+    "SC_13G_A": "Amendment — updating a previously filed 13G (stake increased, decreased, or approaching threshold)",
+    "conversion_to_13D": "If a 13G filer subsequently files a 13D, this signals escalation to activist intent — flag immediately"
+  },
+  "scoring_guide": {
+    "new_13G_initial_filing": {
+      "label": "SLIGHTLY_POSITIVE to POSITIVE",
+      "score_range": [0.600, 0.899],
+      "condition": "First 13G filing — new >5% institutional position",
+      "note": "Dependent on filer type — active managers score toward 0.899, passive index funds score toward 0.600"
+    },
+    "amendment_increased_stake": {
+      "label": "WEAK_POSITIVE to SLIGHTLY_POSITIVE",
+      "score_range": [0.100, 0.699],
+      "condition": "13G/A with higher share count than prior filing",
+      "note": "Increase signals continued or growing institutional conviction — magnitude matters"
+    },
+    "amendment_decreased_stake": {
+      "label": "SLIGHTLY_NEGATIVE",
+      "score_range": [-0.001, -0.399],
+      "condition": "13G/A with lower share count than prior filing",
+      "note": "Reduction signals waning conviction — size of reduction determines severity"
+    },
+    "crossed_below_5pct_threshold": {
+      "label": "MILDLY_NEGATIVE",
+      "score_range": [-0.300, -0.500],
+      "condition": "13G/A where reported stake drops below 5% — filer exits mandatory reporting threshold",
+      "note": "Institutional exit below reporting floor is a meaningful negative signal"
+    }
+  },
+  "filer_type_modifier": {
+    "passive_index_fund": {
+      "examples": ["Vanguard", "BlackRock", "State Street", "iShares", "SPDR", "Schwab"],
+      "adjustment": "Reduce score toward NEUTRAL — position driven by automatic rebalancing, not conviction",
+      "rationale": "Index funds must hold any stock in the index regardless of outlook — 13G changes reflect index composition, not investment thesis",
+      "score_guidance": "For passive filers, compress score toward 0.000 — e.g. new position scores 0.600 → 0.400, decrease scores -0.200 → -0.100"
+    },
+    "active_manager": {
+      "examples": ["Fidelity", "T. Rowe Price", "Wellington", "Soros Fund", "Baupost", "Greenlight", "ValueAct"],
+      "adjustment": "Keep score as-is or apply slight upward bias — position reflects deliberate investment thesis",
+      "rationale": "Active managers make discretionary buy/sell decisions — 13G changes carry informational content",
+      "score_guidance": "Maintain full score or add up to +0.050 for highly regarded active managers with strong track records"
+    }
+  },
+  "escalation_flag": {
+    "trigger": "13G filer subsequently files SC 13D on the same issuer",
+    "action": "Flag in master_summary as '13G_to_13D_escalation' — reclassify signal as activist entry",
+    "score_impact": "Escalation itself is a strong positive catalyst — treat as new 13D event and score accordingly",
+    "note": "The conversion from passive 13G to activist 13D is one of the strongest institutional signals available"
+  },
+  "mandatory_range": {
+    "minimum": -0.500,
+    "maximum": 0.899,
+    "note": "13G is NEVER strongly negative (institutional exits are gradual) and NEVER strongly positive (passive filing lacks activist force). Hard boundaries on both sides."
+  },
+  "tasks": [
+    "Identify the filer name and classify as passive_index_fund or active_manager",
+    "Determine filing type: new SC 13G (initial) or SC 13G/A (amendment)",
+    "For amendments: compare current stake to prior filing stake — determine direction (increase, decrease, or below 5%)",
+    "Select base score range from scoring_guide based on filing type and direction",
+    "Apply filer_type_modifier: compress toward neutral for passive index funds, maintain for active managers",
+    "Compute final score within mandatory_range [-0.500, +0.899]",
+    "Check master_summary: has this filer previously filed a 13G on this issuer? Note trend.",
+    "Write a 1-sentence summary identifying filer, stake size, and direction of change",
+    "Write a short forecast (1-3 sentences) on implications for institutional ownership trend",
+    "Update master_summary with filer, filing date, stake %, direction, and filer type",
+    "Flag escalation_flag in master_summary if any subsequent 13D filing is detected from the same filer"
+  ],
+  "output_schema": {
+    "score": "float in [-0.500, +0.899] — mild signal in either direction",
+    "label": "string — sentiment label matching score tier",
+    "summary": "string — 1-sentence description of filer, stake, and change direction",
+    "forecast": "string — 1-3 sentence outlook on institutional ownership trend and implications",
+    "filer_name": "string — name of the institutional investor",
+    "filer_type": "string — 'passive_index_fund' or 'active_manager'",
+    "filing_type": "string — 'SC_13G' (initial) or 'SC_13G_A' (amendment)",
+    "stake_pct": "float — current ownership percentage",
+    "stake_direction": "string — 'new_position', 'increased', 'decreased', or 'below_threshold'",
+    "filer_type_modifier_applied": "string — description of adjustment made for filer type",
+    "escalation_flagged": "boolean — true if 13G→13D escalation detected",
+    "master_summary_update": "object — fields to append/update in master_summary"
+  },
+  "rules": [
+    "mandatory_range: score must always fall within [-0.500, +0.899] — never outside these bounds",
+    "passive index funds (Vanguard, BlackRock, State Street, etc.) must have scores compressed toward 0.000 — their holdings reflect index membership, not conviction",
+    "active managers (Fidelity, T. Rowe, Wellington, Soros, etc.) carry full conviction signal — maintain or slightly boost score",
+    "new 13G initial filing is more meaningful than an amendment increase — slightly higher base score",
+    "crossing below 5% threshold is the most negative 13G signal — score toward -0.500",
+    "13G→13D escalation must be flagged in master_summary and treated as a new, separate 13D scoring event",
+    "always record direction of change (increase/decrease) relative to prior 13G/A in master_summary",
+    "if no prior 13G exists in master_summary for this filer on this issuer, treat as new position"
+  ]
+}
