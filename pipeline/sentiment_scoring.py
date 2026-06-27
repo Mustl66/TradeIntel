@@ -1184,29 +1184,30 @@ def _get_symbols_with_unscored(conn, exchange: str, limit: int) -> list[dict]:
 
 
 def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
-    """Get rolling window for scoring: newest MAX_EVAL_ARTICLES articles, oldest→newest.
+    """Get articles for scoring: always 12 news + ALL SEC filings.
 
-    SEC-reserved slot strategy:
-      - Always include most recent 10-K (if ≤18 months old) — up to 1 slot
-      - Always include most recent 3 10-Qs (if ≤15 months old) — up to 3 slots
-      - Always include most recent Tier-2/3 SEC filings in last 90 days — up to 2 slots
-      - Remaining slots filled with standard news (current behaviour)
+    SEC filings are NEVER crowded out by news:
+      - ALL 10-K / 10-K/A within staleness window (18 months)
+      - ALL 10-Q / 10-Q/A within staleness window (15 months)
+      - ALL Tier-2/3 SEC forms within last 90 days (S-3, 424B, NT, 13D/G, Form 4)
+      - ALL 8-K / 8-K/A within last 90 days
+      - PLUS always 12 news articles (non-SEC) newest first
 
-    This ensures fundamental filings always influence scoring even when there
-    are many recent news articles that would otherwise crowd them out.
+    Final list sorted oldest → newest for LLM context window.
     """
-    from pipeline_config import EDGAR_SEC_RESERVED_SLOTS, EDGAR_10K_STALENESS_MONTHS, EDGAR_10Q_STALENESS_MONTHS
+    from pipeline_config import EDGAR_10K_STALENESS_MONTHS, EDGAR_10Q_STALENESS_MONTHS
     now = datetime.now(timezone.utc)
-    cutoff_10k = now - timedelta(days=EDGAR_10K_STALENESS_MONTHS * 30.44)
-    cutoff_10q = now - timedelta(days=EDGAR_10Q_STALENESS_MONTHS * 30.44)
-    cutoff_t23 = now - timedelta(days=90)
+    cutoff_10k  = now - timedelta(days=EDGAR_10K_STALENESS_MONTHS * 30.44)
+    cutoff_10q  = now - timedelta(days=EDGAR_10Q_STALENESS_MONTHS * 30.44)
+    cutoff_t23  = now - timedelta(days=90)
+    cutoff_8k   = now - timedelta(days=90)
 
     SEC_COLS = "id, title, summary, full_text, published_at, sentiment_score, pre_summary_data, form_type, sec_source_weight"
 
-    # ── 1. Most recent 10-K (1 slot, max staleness 18 months) ────────────────
     reserved: list[dict] = []
     reserved_ids: set[int] = set()
 
+    # ── 1. ALL 10-K / 10-K/A within staleness window ─────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT {SEC_COLS}
@@ -1215,7 +1216,6 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
               AND form_type IN ('10-K', '10-K/A')
               AND published_at >= %s
             ORDER BY published_at DESC
-            LIMIT 1
         """, (symbol_id, cutoff_10k))
         cols = [d[0] for d in cur.description]
         for r in cur.fetchall():
@@ -1223,7 +1223,7 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
             reserved.append(row)
             reserved_ids.add(row["id"])
 
-    # ── 2. Most recent 3 10-Qs (up to 3 slots, max staleness 15 months) ──────
+    # ── 2. ALL 10-Q / 10-Q/A within staleness window ─────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT {SEC_COLS}
@@ -1232,7 +1232,6 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
               AND form_type IN ('10-Q', '10-Q/A')
               AND published_at >= %s
             ORDER BY published_at DESC
-            LIMIT 3
         """, (symbol_id, cutoff_10q))
         cols = [d[0] for d in cur.description]
         for r in cur.fetchall():
@@ -1241,9 +1240,12 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
                 reserved.append(row)
                 reserved_ids.add(row["id"])
 
-    # ── 3. Most recent Tier-2/3 events in last 90 days (up to 2 slots) ───────
-    tier23_forms = ("S-3","S-3/A","424B1","424B3","424B4","424B5",
-                    "NT 10-K","NT 10-Q","SC 13D","SC 13D/A","SC 13G","SC 13G/A","4")
+    # ── 3. ALL Tier-2/3 SEC forms within last 90 days ────────────────────────
+    tier23_forms = (
+        "S-3","S-3/A","424B1","424B3","424B4","424B5",
+        "NT 10-K","NT 10-Q",
+        "SC 13D","SC 13D/A","SC 13G","SC 13G/A","4"
+    )
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT {SEC_COLS}
@@ -1252,7 +1254,6 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
               AND form_type = ANY(%s)
               AND published_at >= %s
             ORDER BY published_at DESC
-            LIMIT 2
         """, (symbol_id, list(tier23_forms), cutoff_t23))
         cols = [d[0] for d in cur.description]
         for r in cur.fetchall():
@@ -1261,10 +1262,25 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
                 reserved.append(row)
                 reserved_ids.add(row["id"])
 
-    # ── 4. News articles fill remaining slots ─────────────────────────────────
-    news_limit = max(1, MAX_EVAL_ARTICLES - len(reserved))
-    excl = list(reserved_ids) if reserved_ids else [-1]
+    # ── 4. ALL 8-K / 8-K/A within last 90 days ───────────────────────────────
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {SEC_COLS}
+            FROM news_articles
+            WHERE symbol_id = %s
+              AND form_type IN ('8-K', '8-K/A')
+              AND published_at >= %s
+            ORDER BY published_at DESC
+        """, (symbol_id, cutoff_8k))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            if row["id"] not in reserved_ids:
+                reserved.append(row)
+                reserved_ids.add(row["id"])
 
+    # ── 5. Always 12 newest non-SEC news articles ─────────────────────────────
+    excl = list(reserved_ids) if reserved_ids else [-1]
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT {SEC_COLS}
@@ -1273,38 +1289,27 @@ def _get_articles_for_symbol(conn, symbol_id: int) -> list[dict]:
               AND (form_type IS NULL OR form_type NOT IN (
                   '10-K','10-K/A','10-Q','10-Q/A',
                   'S-3','S-3/A','424B1','424B3','424B4','424B5',
-                  'NT 10-K','NT 10-Q','SC 13D','SC 13D/A','SC 13G','SC 13G/A','4',
+                  'NT 10-K','NT 10-Q',
+                  'SC 13D','SC 13D/A','SC 13G','SC 13G/A','4',
                   '8-K','8-K/A'
               ))
               AND id != ALL(%s)
             ORDER BY published_at DESC
             LIMIT %s
-        """, (symbol_id, excl, news_limit))
+        """, (symbol_id, excl, MAX_EVAL_ARTICLES))
         cols = [d[0] for d in cur.description]
         news_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    # Also grab recent 8-K filings not in reserved (they fit in the news slots)
-    eight_k_limit = max(0, news_limit - len(news_rows))
-    if eight_k_limit > 0:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT {SEC_COLS}
-                FROM news_articles
-                WHERE symbol_id = %s
-                  AND form_type IN ('8-K', '8-K/A')
-                  AND id != ALL(%s)
-                ORDER BY published_at DESC
-                LIMIT %s
-            """, (symbol_id, excl, eight_k_limit))
-            cols = [d[0] for d in cur.description]
-            for r in cur.fetchall():
-                row = dict(zip(cols, r))
-                if row["id"] not in reserved_ids:
-                    news_rows.append(row)
-
-    # ── 5. Merge: reserved (SEC) first, then news, sorted oldest→newest ───────
+    # ── 6. Merge + sort oldest → newest for LLM context ──────────────────────
     all_rows = reserved + news_rows
     all_rows.sort(key=lambda x: x["published_at"])
+
+    total_sec  = len(reserved)
+    total_news = len(news_rows)
+    logger.debug(
+        f"[articles] symbol_id={symbol_id} sec={total_sec} news={total_news} "
+        f"total={len(all_rows)}"
+    )
     return all_rows
 
 

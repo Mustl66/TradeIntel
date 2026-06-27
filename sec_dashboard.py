@@ -716,6 +716,18 @@ const NULL_SKIP = {{ spanGaps: true }};
 function mkChart(id, config) {{
   const ctx = document.getElementById(id);
   if (!ctx) return null;
+  // Check if all data arrays are empty / all-null
+  const datasets = (config.data || {{}}).datasets || [];
+  const hasData = datasets.some(ds => (ds.data || []).some(v => v !== null && v !== undefined));
+  if (!hasData) {{
+    const wrap = ctx.parentElement;
+    ctx.style.display = 'none';
+    const msg = document.createElement('div');
+    msg.style.cssText = 'padding:40px;text-align:center;color:#475569;font-size:12px';
+    msg.innerHTML = '<div style="font-size:24px;margin-bottom:8px">📭</div>Awaiting LLM scoring — run <code style="color:#fcd34d">orchestrator.py</code>';
+    wrap.appendChild(msg);
+    return null;
+  }}
   return new Chart(ctx, config);
 }}
 
@@ -872,6 +884,11 @@ mkChart('c10', {{
 // ── C11: 8-K Event Timeline (scatter) ────────────────────────────────────────
 (function() {{
   const events = D.eightk_events || [];
+  if (!events.length) {{
+    const wrap = document.getElementById('c11')?.parentElement;
+    if (wrap) {{ document.getElementById('c11').style.display='none'; wrap.innerHTML += '<div style="padding:40px;text-align:center;color:#475569;font-size:12px"><div style="font-size:24px;margin-bottom:8px">📭</div>No 8-K events scored yet — run <code style="color:#fcd34d">orchestrator.py</code></div>'; }}
+    return;
+  }}
   const pts = events.map(e => ({{
     x: new Date(e.date).getTime(),
     y: e.score,
@@ -942,6 +959,11 @@ mkChart('c10', {{
 // ── C13: Insider Timeline ─────────────────────────────────────────────────────
 (function() {{
   const events = D.insider_events || [];
+  if (!events.length) {{
+    const wrap = document.getElementById('c13')?.parentElement;
+    if (wrap) {{ document.getElementById('c13').style.display='none'; wrap.innerHTML += '<div style="padding:40px;text-align:center;color:#475569;font-size:12px"><div style="font-size:24px;margin-bottom:8px">👤</div>No insider transactions on record</div>'; }}
+    return;
+  }}
   const buys  = events.filter(e => e.type === 'insider_buy').map(e => ({{ x: new Date(e.date).getTime(), y: e.value/1000, r: Math.max(4, Math.min(16, e.value/100000)), label: e.text }}));
   const sells = events.filter(e => e.type === 'insider_sell').map(e => ({{ x: new Date(e.date).getTime(), y: -e.value/1000, r: Math.max(4, Math.min(16, e.value/100000)), label: e.text }}));
   mkChart('c13', {{
@@ -963,6 +985,11 @@ mkChart('c10', {{
 // ── C16: Dilution Events ──────────────────────────────────────────────────────
 (function() {{
   const events = D.dilution_events || [];
+  if (!events.length) {{
+    const wrap = document.getElementById('c16')?.parentElement;
+    if (wrap) {{ document.getElementById('c16').style.display='none'; wrap.innerHTML += '<div style="padding:40px;text-align:center;color:#475569;font-size:12px"><div style="font-size:24px;margin-bottom:8px">⚠️</div>No S-3 / 424B capital raise events found</div>'; }}
+    return;
+  }}
   mkChart('c16', {{
     type: 'bar',
     data: {{ labels: events.map(e => e.date ? new Date(e.date).toLocaleDateString('en-US',{{month:'short',year:'2-digit'}}) : '?'),

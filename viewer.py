@@ -589,9 +589,6 @@ def leaderboard_partial(sort: str = "final_score", dir: str = "desc"):
           </td>
           <td style="text-align:center;font-size:11px;color:#475569">{scored}/{total}</td>
           <td style="text-align:center;font-size:11px;color:#475569">{upd}</td>
-          <td style="text-align:center">
-            <a href="/sec/{r['symbol']}" onclick="event.stopPropagation()" style="color:#c084fc;text-decoration:none;font-size:11px;padding:3px 8px;border:1px solid #c084fc33;border-radius:4px;white-space:nowrap">📊 SEC</a>
-          </td>
         </tr>"""
 
         card_items += f"""
@@ -665,9 +662,6 @@ def index(sort: str = "final_score", dir: str = "desc"):
           </td>
           <td style="text-align:center;font-size:11px;color:#475569">{scored}/{total}</td>
           <td style="text-align:center;font-size:11px;color:#475569">{upd}</td>
-          <td style="text-align:center">
-            <a href="/sec/{r['symbol']}" onclick="event.stopPropagation()" style="color:#c084fc;text-decoration:none;font-size:11px;padding:3px 8px;border:1px solid #c084fc33;border-radius:4px;white-space:nowrap">📊 SEC</a>
-          </td>
         </tr>"""
 
         card_items += f"""
@@ -960,7 +954,7 @@ def symbol_detail(sym_id: int):
                        s.return_on_equity, s.debt_to_equity, s.current_ratio,
                        s.earnings_per_share_basic_ttm, s.earnings_release_date,
                        s.dividend_yield_recent, s.number_of_employees,
-                       s.total_revenue, s.net_income,
+                       s.total_revenue, s.net_income, s.sec_score_modifier,
                        (SELECT COALESCE(MAX(macro_multiplier), 1.000)
                           FROM sectors_macro
                          WHERE industry_name ILIKE '%%' || s.industry || '%%')::float AS macro_multiplier,
@@ -1375,6 +1369,155 @@ def symbol_detail(sym_id: int):
     forecast = (sym.get("symbol_forecast_narrative") or "").replace("<","&lt;")
     sector_rat = (sym.get("sector_rationale") or "").replace("<","&lt;")
 
+    # ── SEC Filings tab ──────────────────────────────────────────────────────
+    conn2 = get_conn()
+    try:
+        with conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur2:
+            cur2.execute("""
+                SELECT id, form_type, filing_tier, published_at,
+                       sentiment_score, sec_source_weight,
+                       title, article_summary, score_rationale, url
+                FROM news_articles
+                WHERE symbol_id = %s AND form_type IS NOT NULL
+                ORDER BY published_at DESC
+                LIMIT 200
+            """, (sym["id"],))
+            sec_filings = [dict(r) for r in cur2.fetchall()]
+    finally:
+        conn2.close()
+
+    sym_sec_count = len(sec_filings)
+
+    _TIER_COLOR = {1: "#f87171", 2: "#fb923c", 3: "#a78bfa"}
+    _TIER_LABEL = {1: "Tier 1 — Core", 2: "Tier 2 — Capital", 3: "Tier 3 — Ownership"}
+    _FORM_ICON  = {
+        "10-K": "📋", "10-K/A": "📋", "10-Q": "📈", "10-Q/A": "📈",
+        "8-K": "🔔", "8-K/A": "🔔", "S-3": "⚠️", "S-3/A": "⚠️",
+        "424B1": "⚠️", "424B3": "⚠️", "424B4": "⚠️", "424B5": "⚠️",
+        "NT 10-K": "🚨", "NT 10-Q": "🚨",
+        "4": "👤", "SC 13D": "🎯", "SC 13D/A": "🎯",
+        "SC 13G": "🏦", "SC 13G/A": "🏦",
+    }
+
+    if sec_filings:
+        # Summary bar by form type
+        from collections import Counter
+        form_counts = Counter(f.get("form_type","?") for f in sec_filings)
+        scored_sec  = sum(1 for f in sec_filings if f.get("sentiment_score") is not None)
+        sec_mod_val  = float(sym.get("sec_score_modifier") or 0)
+        sec_mod_col  = "#4ade80" if sec_mod_val >= 0 else "#f87171"
+        summary_bar = (
+            f'<div style="display:flex;gap:16px;flex-wrap:wrap;padding:14px 18px;background:#0f172a;'
+            f'border:1px solid #1e2535;border-radius:10px;margin-bottom:16px;align-items:center">'
+            f'<div style="font-size:12px;color:#64748b">Total: <span style="color:#e2e8f0;font-weight:700">{sym_sec_count}</span></div>'
+            f'<div style="font-size:12px;color:#64748b">Scored: <span style="color:#4ade80;font-weight:700">{scored_sec}</span> '
+            f'/ Pending: <span style="color:#f59e0b;font-weight:700">{sym_sec_count - scored_sec}</span></div>'
+            + "".join(
+                f'<div style="background:#1e293b;padding:3px 10px;border-radius:10px;font-size:11px;color:#94a3b8">'
+                f'{_FORM_ICON.get(ft,"📄")} <b>{ft}</b> × {cnt}</div>'
+                for ft, cnt in sorted(form_counts.items())
+            )
+            + f'<div style="margin-left:auto;font-size:11px;color:#475569">SEC modifier: '
+            f'<span style="color:{sec_mod_col};font-weight:700">'
+            f'{sec_mod_val:+.4f}</span></div>'
+            + '</div>'
+        )
+
+        # Tier separator headers
+        current_tier = None
+        rows = ""
+        for f in sec_filings:
+            ft      = f.get("form_type") or "?"
+            tier    = f.get("filing_tier") or 1
+            sc_val  = f.get("sentiment_score")
+            weight  = f.get("sec_source_weight") or 1.0
+            pub     = f.get("published_at")
+            pub_str = pub.strftime("%Y-%m-%d") if pub else "?"
+            title_s = (f.get("title") or f"{ft} filing").replace("<","&lt;")[:100]
+            summary = (f.get("article_summary") or "").replace("<","&lt;")
+            rat     = (f.get("score_rationale") or "").replace("<","&lt;")
+            icon    = _FORM_ICON.get(ft, "📄")
+            t_col   = _TIER_COLOR.get(tier, "#64748b")
+            url_link = f'<a href="{f["url"]}" target="_blank" style="color:#60a5fa;font-size:11px">↗ EDGAR</a>' if f.get("url") else ""
+
+            # Tier separator
+            if tier != current_tier:
+                current_tier = tier
+                t_lbl = _TIER_LABEL.get(tier, f"Tier {tier}")
+                rows += (
+                    f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;'
+                    f'color:{t_col};margin:20px 0 8px;padding:6px 10px;border-left:3px solid {t_col};'
+                    f'background:{t_col}11">{t_lbl}</div>'
+                )
+
+            # Score badge
+            if sc_val is not None:
+                sc_f = float(sc_val)
+                sc_col = score_color(sc_f)
+                sc_badge = (
+                    f'<div style="text-align:right;flex-shrink:0">'
+                    f'<div style="font-size:18px;font-weight:900;color:{sc_col}">{fmt_score(sc_f)}</div>'
+                    f'<div style="font-size:9px;color:#64748b">×{float(weight):.1f}w</div>'
+                    f'</div>'
+                )
+            else:
+                sc_badge = (
+                    '<div style="text-align:right;flex-shrink:0">'
+                    '<div style="font-size:11px;color:#f59e0b;font-weight:700">⏳ Pending</div>'
+                    '<div style="font-size:9px;color:#475569">Not scored</div>'
+                    '</div>'
+                )
+
+            # Form type badge
+            ft_badge = (
+                f'<span style="background:{t_col}22;color:{t_col};padding:2px 8px;'
+                f'border-radius:6px;font-size:11px;font-weight:700;border:1px solid {t_col}44">'
+                f'{icon} {ft}</span>'
+            )
+
+            # Collapsible body
+            body = ""
+            if summary:
+                body += f'<div style="margin-top:10px;font-size:13px;color:#94a3b8;line-height:1.6">{summary}</div>'
+            if rat:
+                body += (
+                    f'<details style="margin-top:8px"><summary style="cursor:pointer;font-size:10px;'
+                    f'font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.5px">Rationale</summary>'
+                    f'<div style="margin-top:6px;font-size:12px;color:#cbd5e1;line-height:1.6">{rat}</div></details>'
+                )
+            if not summary and not rat:
+                body = '<div style="margin-top:8px;font-size:12px;color:#475569">Scoring pending — run orchestrator.py to score this filing.</div>'
+
+            rows += (
+                f'<div style="background:#0f172a;border:1px solid #1e2535;border-radius:10px;'
+                f'padding:14px;margin-bottom:8px;border-left:3px solid {t_col}">'
+                f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'
+                f'<div style="flex:1">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+                f'{ft_badge}'
+                f'<span style="font-size:11px;color:#475569">{pub_str}</span>'
+                f'{url_link}'
+                f'</div>'
+                f'<div style="font-size:13px;color:#e2e8f0;font-weight:600;line-height:1.4">{title_s}</div>'
+                f'{body}'
+                f'</div>'
+                f'{sc_badge}'
+                f'</div>'
+                f'</div>'
+            )
+
+        sec_filings_html = summary_bar + rows
+    else:
+        sec_filings_html = (
+            '<div style="text-align:center;padding:40px;color:#475569">'
+            '<div style="font-size:32px;margin-bottom:12px">🏛</div>'
+            '<div style="font-size:14px;font-weight:700;color:#64748b;margin-bottom:8px">No SEC Filings Ingested</div>'
+            '<div style="font-size:12px;color:#475569">Run: <code style="background:#0f172a;padding:2px 8px;'
+            'border-radius:4px;color:#fcd34d">python scripts\\edgar_backfill.py --symbol '
+            + sym["symbol"] + '</code></div>'
+            '</div>'
+        )
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1550,9 +1693,52 @@ def symbol_detail(sym_id: int):
   <div class="section-title">📚 Recent Market Research</div>
   {mr_html}
 
-  <!-- Articles -->
-  <div class="section-title">📰 Scored Articles ({len(articles)}) — expand for details</div>
-  {"".join(arts_html) if arts_html else '<div style="color:#475569;font-size:13px">No scored articles yet.</div>'}
+  <!-- ══════ TABBED: News + SEC Filings ══════ -->
+  <div style="margin-top:24px">
+    <!-- Tab buttons -->
+    <div style="display:flex;gap:4px;border-bottom:2px solid #1e2535;margin-bottom:0">
+      <button id="tab-news-btn" onclick="switchDetailTab('news')"
+        style="padding:10px 20px;background:#1d4ed8;border:1px solid #3b82f6;border-bottom:2px solid #1d4ed8;
+               color:#fff;font-size:13px;font-weight:700;border-radius:8px 8px 0 0;cursor:pointer;margin-bottom:-2px">
+        📰 News &amp; Scored Articles ({len(articles)})
+      </button>
+      <button id="tab-sec-btn" onclick="switchDetailTab('sec')"
+        style="padding:10px 20px;background:#161b27;border:1px solid #1e2535;border-bottom:2px solid #1e2535;
+               color:#c084fc;font-size:13px;font-weight:700;border-radius:8px 8px 0 0;cursor:pointer;margin-bottom:-2px">
+        🏛 SEC Filings ({sym_sec_count})
+      </button>
+    </div>
+
+    <!-- News tab pane -->
+    <div id="tab-pane-news" style="background:#0d1117;border:1px solid #1e2535;border-top:none;border-radius:0 8px 8px 8px;padding:20px">
+      {"".join(arts_html) if arts_html else '<div style="color:#475569;font-size:13px;padding:20px">No scored articles yet.</div>'}
+    </div>
+
+    <!-- SEC tab pane -->
+    <div id="tab-pane-sec" style="display:none;background:#0d1117;border:1px solid #1e2535;border-top:none;border-radius:0 8px 8px 8px;padding:20px">
+      {sec_filings_html}
+    </div>
+  </div>
+
+  <script>
+  function switchDetailTab(tab) {{
+    const isNews = tab === 'news';
+    document.getElementById('tab-pane-news').style.display = isNews ? 'block' : 'none';
+    document.getElementById('tab-pane-sec').style.display  = isNews ? 'none'  : 'block';
+    const nb = document.getElementById('tab-news-btn');
+    const sb = document.getElementById('tab-sec-btn');
+    nb.style.background = isNews ? '#1d4ed8' : '#161b27';
+    nb.style.borderColor = isNews ? '#3b82f6' : '#1e2535';
+    nb.style.borderBottomColor = isNews ? '#1d4ed8' : '#1e2535';
+    nb.style.color = isNews ? '#fff' : '#60a5fa';
+    sb.style.background = !isNews ? '#4c1d95' : '#161b27';
+    sb.style.borderColor = !isNews ? '#7c3aed' : '#1e2535';
+    sb.style.borderBottomColor = !isNews ? '#4c1d95' : '#1e2535';
+    sb.style.color = !isNews ? '#e9d5ff' : '#c084fc';
+  }}
+  // Auto-open SEC tab if URL hash is #sec
+  if (window.location.hash === '#sec') switchDetailTab('sec');
+  </script>
 
 </div>
 </body>
