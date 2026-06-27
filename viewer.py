@@ -1716,6 +1716,23 @@ def symbol_detail(sym_id: int):
 
     <!-- SEC tab pane -->
     <div id="tab-pane-sec" style="display:none;background:#0d1117;border:1px solid #1e2535;border-top:none;border-radius:0 8px 8px 8px;padding:20px">
+      <!-- Charts button -->
+      <div style="margin-bottom:18px">
+        <a href="/sec/{sym['symbol']}" target="_blank"
+           style="display:inline-flex;align-items:center;gap:8px;
+                  background:linear-gradient(135deg,#4c1d95,#6d28d9);
+                  color:#e9d5ff;font-size:13px;font-weight:700;
+                  padding:10px 20px;border-radius:8px;text-decoration:none;
+                  border:1px solid #7c3aed;letter-spacing:.3px;
+                  box-shadow:0 0 12px #7c3aed44;transition:opacity .15s"
+           onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">
+          📊 View SEC Charts — {sym['symbol']}
+          <span style="font-size:10px;opacity:.7">↗ opens in new tab</span>
+        </a>
+        <span style="font-size:11px;color:#475569;margin-left:12px">
+          18 charts · Revenue · Margins · Cash Flow · Balance Sheet · Insiders · Dilution
+        </span>
+      </div>
       {sec_filings_html}
     </div>
   </div>
