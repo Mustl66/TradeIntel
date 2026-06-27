@@ -7,6 +7,7 @@ Run: python viewer.py
 """
 
 import json
+import logging
 import math
 import threading
 import time
@@ -23,13 +24,15 @@ from config import DB_CONFIG
 
 app = FastAPI(title="TradeIntel Viewer", docs_url=None, redoc_url=None)
 
+_viewer_log = logging.getLogger("tradeintel.viewer")
+
 # ── Mount SEC Intelligence Dashboard ─────────────────────────────────────────
 try:
     from sec_dashboard import sec_router
     app.include_router(sec_router)
-    logging.getLogger("tradeintel.viewer").info("SEC dashboard mounted at /sec/{symbol}")
+    _viewer_log.info("SEC dashboard mounted at /sec/{symbol}")
 except Exception as _sec_e:
-    logging.getLogger("tradeintel.viewer").warning(f"SEC dashboard not loaded: {_sec_e}")
+    _viewer_log.warning(f"SEC dashboard not loaded: {_sec_e}")
 
 
 def get_conn():

@@ -21,7 +21,7 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Change this to "save" or "load", or set TYPE env var
-TYPE = os.getenv("TYPE", "save").lower()   # "save" | "load"
+TYPE = os.getenv("TYPE", "load").lower()   # "save" | "load"
 
 # Backup dir — created next to this script if missing
 BACKUP_DIR = Path(__file__).resolve().parent / "db_transfer"

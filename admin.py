@@ -1079,7 +1079,7 @@ async def symbol_news(sym_id: int, page: int = 1, q: str = ""):
                     FROM news_articles na
                     LEFT JOIN rss_feeds rf ON rf.id = na.feed_id
                     WHERE na.symbol_id = %s
-                      AND (na.source_name IS NULL OR na.source_name != 'edgar_8k')
+                      AND (na.source_name IS NULL OR na.source_name NOT IN ('edgar_8k', 'edgar_sec'))
                       {kw_filter}
                 ),
                 deduped AS (SELECT * FROM ranked WHERE rn = 1)
@@ -1248,30 +1248,32 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
             if keyword:
                 cur.execute("""
                     SELECT COUNT(*) AS total FROM news_articles
-                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                    WHERE symbol_id = %s AND form_type IS NOT NULL
                       AND (title ILIKE %s OR full_text ILIKE %s)
                 """, (sym_id, f"%{keyword}%", f"%{keyword}%"))
             else:
                 cur.execute("""
                     SELECT COUNT(*) AS total FROM news_articles
-                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                    WHERE symbol_id = %s AND form_type IS NOT NULL
                 """, (sym_id,))
             total = cur.fetchone()["total"]
 
             if keyword:
                 cur.execute("""
-                    SELECT id, title, url, published_at, inserted_at, full_text
+                    SELECT id, title, url, published_at, inserted_at, full_text,
+                           form_type, filing_tier, sentiment_score
                     FROM news_articles
-                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                    WHERE symbol_id = %s AND form_type IS NOT NULL
                       AND (title ILIKE %s OR full_text ILIKE %s)
                     ORDER BY published_at DESC NULLS LAST
                     LIMIT %s OFFSET %s
                 """, (sym_id, f"%{keyword}%", f"%{keyword}%", per_page, offset))
             else:
                 cur.execute("""
-                    SELECT id, title, url, published_at, inserted_at, full_text
+                    SELECT id, title, url, published_at, inserted_at, full_text,
+                           form_type, filing_tier, sentiment_score
                     FROM news_articles
-                    WHERE symbol_id = %s AND source_name = 'edgar_8k'
+                    WHERE symbol_id = %s AND form_type IS NOT NULL
                     ORDER BY published_at DESC NULLS LAST
                     LIMIT %s OFFSET %s
                 """, (sym_id, per_page, offset))
@@ -1315,12 +1317,19 @@ async def symbol_sec(sym_id: int, page: int = 1, q: str = ""):
             preview = a["full_text"][:300].replace("<", "&lt;").replace(">", "&gt;")
             if len(a["full_text"]) > 300:
                 preview += "…"
+        form_type  = a.get("form_type") or "SEC"
+        score      = a.get("sentiment_score")
+        score_html = f'<span class="chip chip-{"green" if score and score > 0.5 else "red" if score and score < 0 else "blue"}">{score:.3f}</span>' if score is not None else '<span class="chip chip-blue">unscored</span>'
+        tier_map   = {1: "🔴 Tier 1", 2: "🟠 Tier 2", 3: "🟡 Tier 3"}
+        tier_html  = f'<span class="chip chip-blue">{tier_map.get(a.get("filing_tier"), "SEC")}</span>'
         html += f"""
         <div class="news-card">
-          <a class="news-title" href="{a['url']}" target="_blank">{a['title'] or 'Untitled 8-K'}</a>
+          <a class="news-title" href="{a['url']}" target="_blank">{a['title'] or form_type}</a>
           <div class="news-meta">
             <span class="news-date">📅 {pub}</span>
-            <span class="chip chip-blue">SEC 8-K</span>
+            <span class="chip chip-blue">{form_type}</span>
+            {tier_html}
+            {score_html}
           </div>
           {'<div class="news-preview">' + preview + '</div>' if preview else ''}
         </div>"""
@@ -1347,7 +1356,7 @@ async def delete_all_sec(sym_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM news_articles WHERE symbol_id = %s AND source_name = 'edgar_8k'",
+                "DELETE FROM news_articles WHERE symbol_id = %s AND form_type IS NOT NULL",
                 (sym_id,)
             )
             deleted = cur.rowcount
@@ -1368,7 +1377,7 @@ async def delete_all_sec_global():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM news_articles WHERE source_name = 'edgar_8k'")
+            cur.execute("DELETE FROM news_articles WHERE form_type IS NOT NULL")
             deleted = cur.rowcount
             conn.commit()
     finally:

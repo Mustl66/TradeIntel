@@ -49,6 +49,12 @@ from dateutil import parser as dateutil_parser
 import warnings
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# ── Config-driven tier depth ──────────────────────────────────────────────────
+try:
+    from pipeline_config import EDGAR_MAX_TIER as _EDGAR_MAX_TIER
+except ImportError:
+    _EDGAR_MAX_TIER = 3  # default: all tiers
+
 sys.path.insert(0, ".")
 from db.connection import get_connection
 
@@ -149,11 +155,78 @@ def _load_cik_map() -> dict[str, str]:
     r.raise_for_status()
     raw     = r.json()
     mapping = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in raw.values()}
+
+    # Also load the exchange-specific map which includes more tickers
+    try:
+        r2 = requests.get(
+            "https://www.sec.gov/files/company_tickers_exchange.json",
+            headers=EDGAR_HEADERS, timeout=30,
+        )
+        if r2.status_code == 200:
+            raw2 = r2.json()
+            fields = raw2.get("fields", [])
+            ticker_idx = fields.index("ticker") if "ticker" in fields else -1
+            cik_idx    = fields.index("cik")    if "cik"    in fields else -1
+            if ticker_idx >= 0 and cik_idx >= 0:
+                for row in raw2.get("data", []):
+                    t = str(row[ticker_idx]).upper()
+                    c = str(row[cik_idx]).zfill(10)
+                    if t not in mapping:   # don't overwrite primary map
+                        mapping[t] = c
+    except Exception as e:
+        logger.debug(f"[edgar] exchange map fetch failed (non-fatal): {e}")
+
     BULK_MAP_CACHE.parent.mkdir(exist_ok=True)
     with open(BULK_MAP_CACHE, "w") as f:
         json.dump(mapping, f)
     logger.info(f"[edgar] CIK map loaded: {len(mapping)} companies")
     return mapping
+
+
+def _lookup_cik_by_ticker(ticker: str) -> Optional[str]:
+    """
+    Fallback CIK lookup for tickers missing from the bulk map.
+    Uses EDGAR EFTS full-text search and company search API.
+    Returns zero-padded 10-digit CIK string, or None if not found.
+    """
+    # Method 1: EDGAR company search API
+    try:
+        url = (
+            f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
+            f"&dateRange=custom&startdt=2020-01-01&enddt=2030-01-01"
+            f"&forms=10-K,10-Q,8-K"
+        )
+        r = requests.get(url, headers=EDGAR_HEADERS, timeout=10)
+        if r.status_code == 200:
+            hits = r.json().get("hits", {}).get("hits", [])
+            for hit in hits:
+                src = hit.get("_source", {})
+                if src.get("file_type", "").upper() == ticker.upper():
+                    cik = str(src.get("entity_id", "")).zfill(10)
+                    if cik and cik != "0000000000":
+                        return cik
+    except Exception:
+        pass
+
+    # Method 2: EDGAR browse company search
+    try:
+        url = (
+            f"https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?company=&CIK={ticker}&type=8-K&dateb=&owner=include"
+            f"&count=5&search_text=&action=getcompany&output=atom"
+        )
+        r = requests.get(url, headers=EDGAR_HEADERS, timeout=10)
+        if r.status_code == 200:
+            # Parse CIK from atom feed
+            m = re.search(r"CIK=(\d+)", r.text)
+            if not m:
+                m = re.search(r"/cgi-bin/browse-edgar\?action=getcompany&CIK=(\d+)", r.text)
+            if m:
+                return str(m.group(1)).zfill(10)
+    except Exception:
+        pass
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -983,6 +1056,12 @@ def _load_symbols_without_rss(conn, limit: int = 0) -> list[tuple]:
 
 
 def _get_seen_hashes(conn) -> set:
+    """
+    Return a set of all article_hash values that are already properly tagged as
+    SEC filings (form_type IS NOT NULL).  Articles that exist without form_type
+    (e.g. ingested via RSS) are intentionally NOT included so _insert_article
+    will touch them and stamp the correct SEC metadata via ON CONFLICT DO UPDATE.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT article_hash FROM news_articles WHERE form_type IS NOT NULL")
         return {row[0] for row in cur.fetchall()}
@@ -1010,8 +1089,16 @@ def _ensure_edgar_feed_row(conn, symbol_id: int, ticker: str) -> int:
 
 
 def _insert_article(conn, feed_id: int, symbol_id: int, a: dict) -> Optional[int]:
-    """Insert one filing article. Returns new article id or None if duplicate."""
+    """
+    Insert one filing article. Returns new article id or None if nothing changed.
+
+    Key behaviour: if the article already exists (same url OR same hash, e.g.
+    previously ingested via RSS without SEC metadata), we UPDATE it to stamp the
+    correct form_type / filing_tier / sec_source_weight / source_name so the
+    SEC dashboard and sentiment router see it correctly.
+    """
     with conn.cursor() as cur:
+        # Try insert; on any unique conflict update the SEC-specific columns
         cur.execute("""
             INSERT INTO news_articles
                 (symbol_id, feed_id, url, title, full_text, published_at,
@@ -1019,7 +1106,16 @@ def _insert_article(conn, feed_id: int, symbol_id: int, a: dict) -> Optional[int
                  form_type, filing_tier, sec_source_weight)
             VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, 'edgar_sec',
                     %s, %s, %s)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (symbol_id, url) DO UPDATE
+                SET form_type        = EXCLUDED.form_type,
+                    filing_tier      = EXCLUDED.filing_tier,
+                    sec_source_weight= EXCLUDED.sec_source_weight,
+                    source_name      = 'edgar_sec',
+                    full_text        = CASE
+                                           WHEN LENGTH(EXCLUDED.full_text) > LENGTH(news_articles.full_text)
+                                           THEN EXCLUDED.full_text
+                                           ELSE news_articles.full_text
+                                       END
             RETURNING id
         """, (
             symbol_id, feed_id,
@@ -1158,18 +1254,28 @@ def run(
     limit: int = 0,
     tier_filter: list[int] | None = None,
     forms_only: list[str] | None = None,
+    symbols_only: list[str] | None = None,
 ) -> dict:
     """
     Main EDGAR ingestion entry point.
 
     Args:
         limit:        Process only the first N symbols (0 = all).
-        tier_filter:  If set, only process forms in these tiers (e.g. [1,2]).
+        tier_filter:  Explicit tier list override (e.g. [1,2]).
+                      If None, derived from EDGAR_MAX_TIER in pipeline_config.py:
+                        EDGAR_MAX_TIER=1 → [1]
+                        EDGAR_MAX_TIER=2 → [1, 2]
+                        EDGAR_MAX_TIER=3 → [1, 2, 3]
         forms_only:   If set, only process these specific form types.
+        symbols_only: If set, only process these specific ticker symbols (e.g. ['BMRA', 'AAPL']).
 
     Returns:
         Summary dict with inserted counts per form.
     """
+    # Resolve tier_filter from config if caller didn't specify
+    if tier_filter is None:
+        tier_filter = list(range(1, _EDGAR_MAX_TIER + 1))  # 1→[1], 2→[1,2], 3→[1,2,3]
+
     conn = get_connection()
     try:
         cik_map     = _load_cik_map()
@@ -1208,6 +1314,16 @@ def run(
                 symbol_form_map[key] = {}
             symbol_form_map[key].update(rss_only_forms)
 
+        # ── Apply symbols_only filter ──────────────────────────────────────────
+        if symbols_only:
+            upper = {s.upper() for s in symbols_only}
+            symbol_form_map = {
+                (sid, sym): forms
+                for (sid, sym), forms in symbol_form_map.items()
+                if sym.upper() in upper
+            }
+            logger.info(f"[edgar] symbols_only filter: {sorted(upper)}")
+
         logger.info(
             f"[edgar] {len(symbol_form_map)} symbols to process | "
             f"forms active: {sorted(active_registry.keys())}"
@@ -1219,11 +1335,17 @@ def run(
 
         for (symbol_id, ticker), forms_to_fetch in symbol_form_map.items():
             if ticker not in cik_map:
-                sym_skipped += 1
-                sym_processed += 1
-                if sym_processed % 10 == 0:
-                    logger.info(f"[edgar] {sym_processed}/{len(symbol_form_map)} processed | inserted={sum(totals.values())} | no_cik={sym_skipped}")
-                continue
+                # Fallback: try per-ticker EDGAR lookup for tickers missing from bulk map
+                cik_fallback = _lookup_cik_by_ticker(ticker)
+                if cik_fallback:
+                    cik_map[ticker] = cik_fallback   # cache for this run
+                    logger.debug(f"[edgar] CIK fallback resolved: {ticker} → {cik_fallback}")
+                else:
+                    sym_skipped += 1
+                    sym_processed += 1
+                    if sym_processed % 10 == 0:
+                        logger.info(f"[edgar] {sym_processed}/{len(symbol_form_map)} processed | inserted={sum(totals.values())} | no_cik={sym_skipped}")
+                    continue
 
             cik      = cik_map[ticker]
             filings  = _fetch_symbol_filings(ticker, cik, seen_hashes, forms_to_fetch)

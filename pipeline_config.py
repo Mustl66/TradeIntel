@@ -130,8 +130,17 @@ WORKER2_INTERVAL = 3600     # Universal news pipeline   — every 1 hour
 WORKER3_INTERVAL = 86400    # Macro / market research   — every 24 hours
 WORKER4_INTERVAL = 21600    # EDGAR live: 8-K, Form4, S-3, NT — every 6 hours
 WORKER5_INTERVAL = 86400    # EDGAR daily: 10-K, 10-Q — every 24 hours
+WORKER6_INTERVAL = 300      # LLM scoring: score all unscored articles — every 5 minutes
 
 # ── SEC EDGAR ingestion controls ──────────────────────────────────────────────
 EDGAR_SEC_RESERVED_SLOTS   = 4      # slots in MAX_EVAL_ARTICLES always held for SEC filings
 EDGAR_10K_STALENESS_MONTHS = 18     # skip 10-K older than this for scoring (still stored)
 EDGAR_10Q_STALENESS_MONTHS = 15     # skip 10-Q older than this for scoring
+
+# ── SEC tier depth ─────────────────────────────────────────────────────────────
+# Controls which SEC filing tiers are fetched and scored.
+# Acts as a MAX tier — selecting a tier implicitly includes all tiers below it:
+#   EDGAR_MAX_TIER = 1  →  Tier 1 only  (10-K, 10-Q, 8-K)
+#   EDGAR_MAX_TIER = 2  →  Tier 1 + 2  (+ S-3, 424B, NT filings)
+#   EDGAR_MAX_TIER = 3  →  All tiers   (+ Form 4, SC 13D/G)
+EDGAR_MAX_TIER = 1

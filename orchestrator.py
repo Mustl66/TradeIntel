@@ -46,7 +46,7 @@ from pipeline_config import (
     HTML_DELAY_RANGE,
     SUMMARY_LLM_MODEL,
 )
-from pipeline_config import WORKER4_INTERVAL, WORKER5_INTERVAL
+from pipeline_config import WORKER4_INTERVAL, WORKER5_INTERVAL, WORKER6_INTERVAL, EDGAR_MAX_TIER as _EDGAR_MAX_TIER
 from config import LLM_CONFIG
 
 # ── Worker 2 FIFO queue ────────────────────────────────────────────────────────
@@ -223,11 +223,12 @@ def _worker2_consumer():
     """
     Dedicated consumer thread — processes W2 run tokens one at a time (FIFO).
     If the queue had backlog, runs immediately without waiting for the next tick.
+    NOTE: Scoring is handled by Worker6 (dedicated scoring worker) — Worker2
+    only handles ingest so a crash in ingest never stops scoring.
     """
     import random
     from pipeline.news_ingest import run as rss_run
     from pipeline.html_ingest import run as html_run
-    from pipeline.sentiment_scoring import run as sentiment_run
 
     logger.info("[Worker2-Consumer] Ready — waiting for ticks")
     while True:
@@ -237,7 +238,7 @@ def _worker2_consumer():
                     f"queue depth after dequeue={_w2_queue.qsize()})")
         try:
             # Step 1: RSS ingest (feed_type: rss/atom/unknown)
-            logger.info("[Worker2] Step 1/3 — RSS ingest")
+            logger.info("[Worker2] Step 1/2 — RSS ingest")
             rss_result = rss_run(exchange="NASDAQ", limit=0, scrape_full_text=True)
             rss_new = rss_result.get("articles_new", 0)
             logger.info(f"[Worker2] RSS done — new={rss_new}")
@@ -246,17 +247,13 @@ def _worker2_consumer():
             time.sleep(random.uniform(*RSS_DELAY_RANGE))
 
             # Step 2: HTML ingest (feed_type: html)
-            logger.info("[Worker2] Step 2/3 — HTML ingest")
+            logger.info("[Worker2] Step 2/2 — HTML ingest")
             html_result = html_run(exchange="NASDAQ", limit=0, scrape_full_text=True)
             html_new = html_result.get("articles_new", 0)
             logger.info(f"[Worker2] HTML done — new={html_new}")
 
-            # Step 3: Score ALL unscored articles
-            logger.info("[Worker2] Step 3/3 — Sentiment scoring (all unscored)")
-            score_result = sentiment_run(exchange="NASDAQ", limit=0)
-            logger.info(f"[Worker2] Scoring done — {score_result}")
-
-            logger.info(f"[Worker2] Run complete — rss_new={rss_new} html_new={html_new}")
+            logger.info(f"[Worker2] Run complete — rss_new={rss_new} html_new={html_new} "
+                        f"(scoring handled by Worker6)")
 
         except Exception as e:
             logger.error(f"[Worker2] Run failed: {e}", exc_info=True)
@@ -289,19 +286,21 @@ def worker3_tick():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def worker4_tick():
-    """EDGAR live tracker — Tier 1 events (8-K) + Tier 2 (S-3, NT) + Tier 3 (Form4, 13D, 13G). Every 6 hours."""
+    """EDGAR live tracker — event-driven forms up to EDGAR_MAX_TIER. Every 6 hours."""
     try:
-        logger.info("[Worker4] Starting EDGAR live tick (event-driven forms)...")
+        active_tiers = list(range(1, _EDGAR_MAX_TIER + 1))
+        logger.info(f"[Worker4] Starting EDGAR live tick (tiers={active_tiers})...")
         from pipeline.edgar_ingest import run as edgar_run
-        result = edgar_run(
-            tier_filter=[1, 2, 3],
-            forms_only=[
-                "8-K", "8-K/A",
-                "S-3", "S-3/A", "424B1", "424B3", "424B4", "424B5",
-                "NT 10-K", "NT 10-Q",
-                "4", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A",
-            ],
-        )
+        # Build forms_only from active tiers:
+        # Tier 1 event form: 8-K
+        # Tier 2 forms: S-3, 424B, NT
+        # Tier 3 forms: Form 4, 13D, 13G
+        forms = ["8-K", "8-K/A"]  # always — Tier 1 event form
+        if _EDGAR_MAX_TIER >= 2:
+            forms += ["S-3", "S-3/A", "424B1", "424B3", "424B4", "424B5", "NT 10-K", "NT 10-Q"]
+        if _EDGAR_MAX_TIER >= 3:
+            forms += ["4", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]
+        result = edgar_run(tier_filter=active_tiers, forms_only=forms)
         logger.info(f"[Worker4] EDGAR live tick done: {result}")
     except Exception as e:
         logger.error(f"[Worker4] Error: {e}", exc_info=True)
@@ -319,6 +318,29 @@ def worker5_tick():
         logger.info(f"[Worker5] EDGAR daily tick done: {result}")
     except Exception as e:
         logger.error(f"[Worker5] Error: {e}", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Worker 6 — Dedicated LLM Scoring (every 5 minutes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def worker6_tick():
+    """
+    Score ALL unscored articles (news + SEC filings) via LLM.
+    Runs every 5 minutes, fully decoupled from ingest workers.
+    This means:
+      - A crash in HTML/RSS ingest (Worker2) never stops scoring
+      - New SEC filings from Worker4/5 get scored within 5 minutes
+      - GNW live articles from Worker1 get scored within 5 minutes
+    """
+    try:
+        from pipeline.sentiment_scoring import run as sentiment_run
+        logger.info("[Worker6] Starting LLM scoring tick (all unscored articles + SEC filings)...")
+        result = sentiment_run(exchange="NASDAQ", limit=0)
+        total = result.get("total_scored", 0) if isinstance(result, dict) else 0
+        logger.info(f"[Worker6] Scoring tick done — scored={total} result={result}")
+    except Exception as e:
+        logger.error(f"[Worker6] Error: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,10 +394,11 @@ def main():
     logger.info("=" * 60)
     logger.info("TradeIntel Orchestrator starting")
     logger.info(f"  Worker1 (GlobeNewswire live): every {WORKER1_INTERVAL}s")
-    logger.info(f"  Worker2 (News pipeline):      every {WORKER2_INTERVAL}s  [ACTIVE — FIFO queue]")
+    logger.info(f"  Worker2 (News ingest):        every {WORKER2_INTERVAL}s  [ACTIVE — FIFO queue]")
     logger.info(f"  Worker3 (Macro research):     every {WORKER3_INTERVAL}s  [DISABLED]")
-    logger.info(f"  Worker4 (EDGAR live events): every {WORKER4_INTERVAL}s [6h]")
-    logger.info(f"  Worker5 (EDGAR 10-K/10-Q):   every {WORKER5_INTERVAL}s [24h]")
+    logger.info(f"  Worker4 (EDGAR live events):  every {WORKER4_INTERVAL}s [6h]")
+    logger.info(f"  Worker5 (EDGAR 10-K/10-Q):    every {WORKER5_INTERVAL}s [24h]")
+    logger.info(f"  Worker6 (LLM scoring):        every {WORKER6_INTERVAL}s [5min] ← scores news + SEC")
     logger.info("=" * 60)
 
     _warmup_models()
@@ -416,6 +439,12 @@ def main():
             args=("Worker5", WORKER5_INTERVAL, worker5_tick),
             daemon=True,
             name="Worker5-EDGAR-Daily",
+        ),
+        threading.Thread(
+            target=_run_worker,
+            args=("Worker6", WORKER6_INTERVAL, worker6_tick),
+            daemon=True,
+            name="Worker6-LLM-Scoring",
         ),
     ]
 

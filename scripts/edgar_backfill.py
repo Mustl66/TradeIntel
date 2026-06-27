@@ -74,6 +74,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show what would run without executing",
     )
+    parser.add_argument(
+        "--symbol", "-s",
+        nargs="+",
+        default=None,
+        metavar="TICKER",
+        help="Only process specific ticker(s) e.g. --symbol BMRA AAPL",
+    )
 
     return parser.parse_args()
 
@@ -96,6 +103,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     logger.info("Run parameters:")
     logger.info("  --limit   : %s", args.limit if args.limit else "all symbols")
+    logger.info("  --symbol  : %s", " ".join(args.symbol) if args.symbol else "all symbols")
     logger.info("  --tier    : %s", args.tier if args.tier is not None else "all tiers (1, 2, 3)")
     logger.info("  --forms   : %s", " ".join(args.forms) if args.forms else "all forms for selected tier(s)")
     logger.info("  --dry-run : %s", args.dry_run)
@@ -143,6 +151,7 @@ def main() -> None:
         limit=args.limit,
         tier_filter=tier_filter_p1,
         forms_only=args.forms,
+        symbols_only=[s.upper() for s in args.symbol] if args.symbol else None,
     )
     inserted_p1 = result_p1.get("inserted", 0) if isinstance(result_p1, dict) else result_p1
     logger.info("Phase 1 result: %s records inserted.", inserted_p1)
@@ -163,6 +172,7 @@ def main() -> None:
             limit=args.limit,
             tier_filter=[2],
             forms_only=args.forms,
+            symbols_only=[s.upper() for s in args.symbol] if args.symbol else None,
         )
         inserted_p2 = result_p2.get("inserted", 0) if isinstance(result_p2, dict) else result_p2
         logger.info("Phase 2 result: %s records inserted.", inserted_p2)
@@ -177,6 +187,7 @@ def main() -> None:
             limit=args.limit,
             tier_filter=[3],
             forms_only=args.forms,
+            symbols_only=[s.upper() for s in args.symbol] if args.symbol else None,
         )
         inserted_p3 = result_p3.get("inserted", 0) if isinstance(result_p3, dict) else result_p3
         logger.info("Phase 3 result: %s records inserted.", inserted_p3)
