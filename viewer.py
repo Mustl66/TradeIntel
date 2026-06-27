@@ -1719,14 +1719,25 @@ def symbol_detail(sym_id: int):
       <!-- Charts button -->
       <div style="margin-bottom:18px">
         <a href="/sec/{sym['symbol']}" target="_blank"
-           style="display:inline-flex;align-items:center;gap:8px;
-                  background:linear-gradient(135deg,#4c1d95,#6d28d9);
-                  color:#e9d5ff;font-size:13px;font-weight:700;
-                  padding:10px 20px;border-radius:8px;text-decoration:none;
-                  border:1px solid #7c3aed;letter-spacing:.3px;
-                  box-shadow:0 0 12px #7c3aed44;transition:opacity .15s"
+           style="display:inline-flex;align-items:center;gap:8px;\
+                  background:linear-gradient(135deg,#4c1d95,#6d28d9);\
+                  color:#e9d5ff;font-size:13px;font-weight:700;\
+                  padding:10px 20px;border-radius:8px;text-decoration:none;\
+                  border:1px solid #7c3aed;letter-spacing:.3px;\
+                  box-shadow:0 0 12px #7c3aed44;transition:opacity .15s"\
            onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">
           📊 View SEC Charts — {sym['symbol']}
+          <span style="font-size:10px;opacity:.7">↗ opens in new tab</span>
+        </a>
+        <a href="/sec/{sym['symbol']}/llm-io" target="_blank"
+           style="display:inline-flex;align-items:center;gap:8px;\
+                  background:linear-gradient(135deg,#164e63,#0e7490);\
+                  color:#a5f3fc;font-size:13px;font-weight:700;\
+                  padding:10px 20px;border-radius:8px;text-decoration:none;\
+                  border:1px solid #0891b2;letter-spacing:.3px;\
+                  box-shadow:0 0 12px #0891b244;transition:opacity .15s;margin-left:10px"\
+           onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">
+          🔬 LLM I/O Debug — {sym['symbol']}
           <span style="font-size:10px;opacity:.7">↗ opens in new tab</span>
         </a>
         <span style="font-size:11px;color:#475569;margin-left:12px">

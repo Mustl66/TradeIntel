@@ -21,12 +21,12 @@
   "scoring_bands_10q": {
     "_note": "10-Q bands weight sequential momentum more than absolute performance.",
     "POSITIVE": [
-      {"range": [0.970, 0.984], "label": "VERY_STRONG_QTR",    "trigger": "Revenue acceleration >5% QoQ AND margin improvement AND cash generation. Rare acceleration signal.", "stock": "+10% to +40%"},
-      {"range": [0.940, 0.969], "label": "STRONG_QTR",         "trigger": "Revenue +3–5% QoQ or significant YoY beat, stable/improving margins, adequate liquidity.", "stock": "+5% to +20%"},
+      {"range": [0.970, 0.984], "label": "VERY_STRONG_QTR",     "trigger": "Revenue acceleration >5% QoQ AND margin improvement AND cash generation. Rare acceleration signal.", "stock": "+10% to +40%"},
+      {"range": [0.940, 0.969], "label": "STRONG_QTR",          "trigger": "Revenue +3–5% QoQ or significant YoY beat, stable/improving margins, adequate liquidity.", "stock": "+5% to +20%"},
       {"range": [0.900, 0.939], "label": "CLEARLY_POSITIVE_QTR","trigger": "Revenue growing QoQ and YoY, flat margins, no liquidity concern.", "stock": "+3% to +12%"},
-      {"range": [0.800, 0.899], "label": "POSITIVE_QTR",       "trigger": "In-line quarter, modest QoQ growth, no negative surprises.", "stock": "+1% to +8%"},
+      {"range": [0.800, 0.899], "label": "POSITIVE_QTR",        "trigger": "In-line quarter, modest QoQ growth, no negative surprises.", "stock": "+1% to +8%"},
       {"range": [0.001, 0.799], "label": "WEAK_TO_SLIGHTLY_POSITIVE_QTR", "trigger": "Mixed signals — one metric improving, another declining.", "stock": "0% to +5%"},
-      {"range": [0.000, 0.000], "label": "NEUTRAL_QTR",        "trigger": "Quarter in line with prior quarter and year. No acceleration, no deceleration.", "stock": "0%"}
+      {"range": [0.000, 0.000], "label": "NEUTRAL_QTR",         "trigger": "Quarter in line with prior quarter and year. No acceleration, no deceleration.", "stock": "0%"}
     ],
     "NEGATIVE": [
       {"range": [-0.001, -0.399], "label": "MILDLY_NEGATIVE_QTR",  "trigger": "Slight revenue deceleration QoQ or minor margin compression. No liquidity concern.", "stock": "0% to -10%"},
@@ -63,7 +63,7 @@
     "10. Write article_summary: 'Q[N] FY[YEAR]: Revenue [X] ([QoQ%] QoQ / [YoY%] YoY), [key signal].'",
     "11. Write forecast_until_earnings (150–300 words): focus on trajectory into next quarter.",
     "12. Write updated_master_summary (400–600 words): APPEND quarterly figures. Preserve ALL prior quarters.",
-    "13. Populate all output_schema keys."
+    "13. Populate all output_schema keys, especially financial_figures array with EXACT metric names."
   ],
 
   "output_schema": {
@@ -87,8 +87,34 @@
     },
     "extracted_facts": {
       "headline_event": "≤25 words quarterly summary",
-      "financial_figures": "array — quarterly P&L, balance sheet, cash flow figures",
-      "guidance_and_outlook": "array",
+      "financial_figures": [
+        {
+          "_INSTRUCTION": "CRITICAL: Output one object per metric. Use EXACTLY these metric names (lowercase with underscores). The charts depend on these exact names.",
+          "_REQUIRED_METRICS": [
+            "revenue",
+            "gross_margin",
+            "operating_margin",
+            "net_margin",
+            "operating_cash_flow",
+            "free_cash_flow",
+            "net_income",
+            "cash_and_equivalents",
+            "total_debt",
+            "shares_outstanding",
+            "rd_spend",
+            "sga_spend",
+            "capex"
+          ],
+          "metric": "EXACT name from _REQUIRED_METRICS list above (e.g. 'revenue', 'gross_margin')",
+          "value": "verbatim value from filing with units (e.g. '$4.1M', '$0.3B', '38.7%', '-$1.2M')",
+          "period": "quarter this figure covers (e.g. 'Q1 FY2024', 'Q3 FY2025')",
+          "yoy_change": "year-over-year change if available (e.g. '+8.2%', '-12.1%', null)",
+          "qoq_change": "quarter-over-quarter change if available (e.g. '+3.1%', '-5.4%', null)",
+          "context": "one sentence context"
+        }
+      ],
+      "_financial_figures_note": "Include ALL metrics you can find. If a metric is not in the filing, omit it — do NOT output null values. gross_margin, operating_margin, net_margin are percentages. revenue, operating_cash_flow, net_income, cash_and_equivalents, total_debt, rd_spend, sga_spend, capex are dollar amounts with units.",
+      "guidance_and_outlook": "array of guidance statements",
       "contracts_and_orders": [], "mergers_and_acquisitions": [],
       "partnerships_and_collaborations": [], "management_and_board_changes": [],
       "legal_and_regulatory_events": [], "patents_and_ip": [],
@@ -116,6 +142,8 @@
     "Liquidity runway <2 quarters AND no financing confirmed → score MUST be <= -0.400.",
     "QoQ revenue ACCELERATION is the most bullish signal in a 10-Q — weight it heavily.",
     "NEVER assign VERY_STRONG_QTR if going-concern language present.",
+    "financial_figures MUST use the exact metric names from _REQUIRED_METRICS — charts will fail if names differ.",
+    "financial_figures MUST be an array of objects, each with metric, value, period fields.",
     "updated_master_summary: APPEND this quarter's figures to prior master. Never delete prior quarters.",
     "article_summary must include quarter, revenue figure, QoQ change, and YoY change."
   ]

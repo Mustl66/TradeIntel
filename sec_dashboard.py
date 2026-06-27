@@ -89,22 +89,79 @@ def _parse_value(raw: str) -> Optional[float]:
 
 def _extract_figures(extracted_facts: dict, metric_keys: list[str],
                      period_hint: str = "") -> list[dict]:
-    """Pull specific metrics from extracted_facts.financial_figures array."""
-    figures = (extracted_facts or {}).get("financial_figures") or []
+    """Pull specific metrics from extracted_facts.financial_figures array.
+
+    Handles both:
+      • Structured array: [{"metric": "revenue", "value": "$4.1M", ...}, ...]
+      • Legacy flat dict:  {"revenue": "$4.1M", ...}
+    Matching is fuzzy: any metric_key that appears as a substring of the
+    stored metric name (or vice-versa) counts as a hit.
+    """
+    ef = extracted_facts or {}
+    raw_figs = ef.get("financial_figures") or []
+
+    # ── Normalise to list of dicts ────────────────────────────────────────────
+    if isinstance(raw_figs, dict):
+        # Legacy flat dict → convert to list
+        items = []
+        for k, v in raw_figs.items():
+            if k.startswith("_"):
+                continue
+            items.append({"metric": k, "value": str(v), "period": period_hint})
+        raw_figs = items
+    elif isinstance(raw_figs, list):
+        # Filter out the _INSTRUCTION / _REQUIRED_METRICS meta objects
+        raw_figs = [
+            fig for fig in raw_figs
+            if isinstance(fig, dict) and not (fig.get("metric") or "").startswith("_")
+            and not "_INSTRUCTION" in fig and not "_REQUIRED_METRICS" in fig
+        ]
+    else:
+        raw_figs = []
+
+    # ── Also scan top-level keys in extracted_facts for flat metric storage ───
+    # Some LLMs output metrics directly at the top level
+    for k, v in ef.items():
+        if k.startswith("_") or k in ("financial_figures", "guidance_and_outlook",
+           "contracts_and_orders", "mergers_and_acquisitions", "partnerships_and_collaborations",
+           "management_and_board_changes", "legal_and_regulatory_events", "patents_and_ip",
+           "clinical_and_regulatory_pipeline", "products_and_technology", "capital_structure_events",
+           "key_quotes", "people_mentioned", "connected_companies_detail", "earnings_calendar",
+           "industry_and_market", "article_metadata", "headline_event"):
+            continue
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            raw_figs.append({"metric": k, "value": str(v), "period": period_hint,
+                             "_from_toplevel": True})
+
     results = []
-    for fig in figures:
-        metric = (fig.get("metric") or "").lower()
-        if any(k in metric for k in metric_keys):
-            val = _parse_value(fig.get("value") or "")
-            if val is not None:
-                results.append({
-                    "metric":  metric,
-                    "value":   val,
-                    "raw":     fig.get("value"),
-                    "period":  fig.get("period") or period_hint,
-                    "yoy":     fig.get("yoy_change"),
-                    "context": fig.get("context"),
-                })
+    seen_metrics = set()
+    for fig in raw_figs:
+        if not isinstance(fig, dict):
+            continue
+        metric = (fig.get("metric") or "").lower().strip()
+        if not metric or metric in seen_metrics:
+            continue
+        # Fuzzy match: key is substring of metric or metric is substring of key
+        matched = False
+        for k in metric_keys:
+            kl = k.lower()
+            if kl in metric or metric in kl:
+                matched = True
+                break
+        if not matched:
+            continue
+        val = _parse_value(fig.get("value") or "")
+        if val is not None:
+            seen_metrics.add(metric)
+            results.append({
+                "metric":  metric,
+                "value":   val,
+                "raw":     fig.get("value"),
+                "period":  fig.get("period") or period_hint,
+                "yoy":     fig.get("yoy_change"),
+                "qoq":     fig.get("qoq_change"),
+                "context": fig.get("context"),
+            })
     return results
 
 
@@ -427,6 +484,157 @@ async def sec_data(symbol: str):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+# ── LLM I/O Debug Endpoint ────────────────────────────────────────────────────
+
+@sec_router.get("/sec/{symbol}/llm-io", response_class=HTMLResponse)
+async def sec_llm_io(symbol: str):
+    """Show exactly what the LLM saw (stage2_prompt) and output (extracted_facts,
+    score_rationale, article_summary) for every SEC filing of this symbol."""
+    sym = symbol.upper()
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, form_type, filing_tier, published_at,
+                       title, sentiment_score, article_summary,
+                       score_rationale, stage2_prompt,
+                       extracted_facts, key_events,
+                       forecast_until_earnings
+                FROM news_articles
+                WHERE symbol_id = (SELECT id FROM symbols WHERE symbol=%s AND status=TRUE LIMIT 1)
+                  AND form_type IS NOT NULL
+                ORDER BY published_at DESC
+                LIMIT 50
+            """, (sym,))
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    import html as _html
+
+    def _fmt(v):
+        if v is None: return "<em style='color:#64748b'>NULL</em>"
+        if isinstance(v, (dict, list)): v = json.dumps(v, indent=2)
+        return "<pre style='white-space:pre-wrap;word-break:break-word;font-size:11px;color:#94a3b8;margin:0'>" + _html.escape(str(v)) + "</pre>"
+
+    cards = ""
+    for r in rows:
+        sc = r.get("sentiment_score")
+        sc_color = "#4ade80" if sc and float(sc) > 0 else ("#f87171" if sc and float(sc) < 0 else "#64748b")
+        sc_str = f"{float(sc):.4f}" if sc is not None else "⏳ Not scored yet"
+        pub = r["published_at"].strftime("%Y-%m-%d") if r.get("published_at") else "?"
+
+        # Parse extracted_facts for financial_figures display
+        ef_raw = r.get("extracted_facts") or {}
+        if isinstance(ef_raw, str):
+            try: ef_raw = json.loads(ef_raw)
+            except: ef_raw = {}
+        figs = ef_raw.get("financial_figures") or []
+        figs_html = ""
+        if isinstance(figs, list) and figs:
+            figs_html = "<table style='width:100%;border-collapse:collapse;font-size:11px'>"
+            figs_html += "<tr style='color:#38bdf8'><th style='text-align:left;padding:3px 8px'>metric</th><th style='text-align:left;padding:3px 8px'>value</th><th style='text-align:left;padding:3px 8px'>period</th><th style='text-align:left;padding:3px 8px'>yoy</th></tr>"
+            for fig in figs:
+                if not isinstance(fig, dict) or "_INSTRUCTION" in fig or "_REQUIRED_METRICS" in fig:
+                    continue
+                m = _html.escape(str(fig.get("metric") or ""))
+                v = _html.escape(str(fig.get("value") or ""))
+                p = _html.escape(str(fig.get("period") or ""))
+                y = _html.escape(str(fig.get("yoy_change") or fig.get("yoy") or ""))
+                figs_html += f"<tr style='border-top:1px solid #1e2535'><td style='padding:3px 8px;color:#c084fc'>{m}</td><td style='padding:3px 8px;color:#4ade80'>{v}</td><td style='padding:3px 8px'>{p}</td><td style='padding:3px 8px'>{y}</td></tr>"
+            figs_html += "</table>"
+        elif isinstance(figs, dict):
+            figs_html = _fmt(figs)
+
+        stage2_prompt_val = r.get("stage2_prompt") or ""
+        prompt_html = _fmt(stage2_prompt_val) if stage2_prompt_val else "<em style='color:#f87171'>stage2_prompt not stored — run orchestrator to score this filing</em>"
+
+        cards += f"""
+<div style="background:#1e2535;border-radius:10px;margin-bottom:24px;overflow:hidden;border:1px solid #2d3748">
+  <div style="background:#0f172a;padding:14px 18px;display:flex;align-items:center;gap:12px">
+    <span style="background:#7c3aed;color:#fff;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:700">{_html.escape(r.get("form_type") or "")}</span>
+    <span style="color:#94a3b8;font-size:13px">{pub}</span>
+    <span style="color:{sc_color};font-weight:700;font-size:14px">{sc_str}</span>
+    <span style="color:#e2e8f0;font-size:13px;flex:1">{_html.escape((r.get("title") or "")[:100])}</span>
+  </div>
+
+  <!-- Summary row -->
+  <div style="padding:12px 18px;border-bottom:1px solid #2d3748">
+    <div style="color:#38bdf8;font-size:11px;font-weight:600;margin-bottom:4px">📝 ARTICLE SUMMARY (LLM output)</div>
+    <div style="color:#e2e8f0;font-size:13px">{_html.escape(r.get("article_summary") or "—")}</div>
+  </div>
+
+  <!-- Score rationale -->
+  <div style="padding:12px 18px;border-bottom:1px solid #2d3748">
+    <div style="color:#38bdf8;font-size:11px;font-weight:600;margin-bottom:4px">🎯 SCORE RATIONALE (LLM output)</div>
+    <div style="color:#e2e8f0;font-size:12px">{_html.escape(r.get("score_rationale") or "—")}</div>
+  </div>
+
+  <!-- Financial figures -->
+  <div style="padding:12px 18px;border-bottom:1px solid #2d3748">
+    <div style="color:#38bdf8;font-size:11px;font-weight:600;margin-bottom:6px">📊 EXTRACTED FINANCIAL FIGURES (feeds charts)</div>
+    {figs_html if figs_html else "<em style='color:#f87171;font-size:12px'>⚠ No financial_figures extracted — charts will be empty. Check LLM output below.</em>"}
+  </div>
+
+  <!-- Full LLM prompt -->
+  <details style="padding:0">
+    <summary style="padding:10px 18px;cursor:pointer;color:#fb923c;font-size:12px;font-weight:600;background:#0f172a;list-style:none">
+      ▶ 📥 WHAT THE LLM SAW (stage2_prompt — click to expand)
+    </summary>
+    <div style="padding:12px 18px;border-top:1px solid #2d3748">
+      {prompt_html}
+    </div>
+  </details>
+
+  <!-- Full extracted facts -->
+  <details style="padding:0">
+    <summary style="padding:10px 18px;cursor:pointer;color:#4ade80;font-size:12px;font-weight:600;background:#0f172a;list-style:none">
+      ▶ 📤 FULL LLM OUTPUT — extracted_facts (click to expand)
+    </summary>
+    <div style="padding:12px 18px;border-top:1px solid #2d3748">
+      {_fmt(ef_raw)}
+    </div>
+  </details>
+</div>"""
+
+    scored_count = sum(1 for r in rows if r.get("sentiment_score") is not None)
+    pending_count = len(rows) - scored_count
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head>
+<title>LLM I/O Debug — {sym}</title>
+<meta charset="utf-8">
+<style>
+  body{{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',sans-serif;margin:0;padding:20px}}
+  a{{color:#38bdf8;text-decoration:none}}
+  details>summary::marker{{display:none}}
+  details>summary{{outline:none}}
+</style>
+</head><body>
+<div style="max-width:1200px;margin:0 auto">
+  <div style="display:flex;align-items:center;gap:16px;margin-bottom:24px">
+    <a href="/sec/{sym}">← SEC Dashboard</a>
+    <h1 style="margin:0;font-size:22px">🔬 LLM I/O Debug — {sym}</h1>
+    <span style="background:#1e2535;padding:4px 12px;border-radius:8px;font-size:13px">
+      {len(rows)} SEC filings · <span style="color:#4ade80">{scored_count} scored</span> · <span style="color:#f87171">{pending_count} pending</span>
+    </span>
+  </div>
+
+  <div style="background:#1e2535;border-radius:10px;padding:16px;margin-bottom:24px;border-left:4px solid #38bdf8">
+    <div style="font-size:13px;color:#94a3b8">
+      <strong style="color:#e2e8f0">How to read this page:</strong><br>
+      • <span style="color:#fb923c">📥 What the LLM saw</span> = the exact JSON payload sent to the LLM (symbol, master_summary, article text)<br>
+      • <span style="color:#4ade80">📤 Full LLM output</span> = extracted_facts stored in DB — this is what feeds the charts<br>
+      • <span style="color:#c084fc">📊 Financial figures</span> = parsed metrics that go into revenue/margin/cash flow charts<br>
+      • If financial_figures is empty or missing → charts will be blank → check the LLM output for the correct keys
+    </div>
+  </div>
+
+  {cards if cards else '<div style="color:#64748b;text-align:center;padding:60px">No SEC filings found for ' + sym + '</div>'}
+</div>
+</body></html>""")
+
+
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
 
 def _score_color(s: float) -> str:
@@ -545,6 +753,14 @@ async def sec_dashboard(symbol: str):
   <div>
     <div class="symbol-title">{sym}</div>
     <div class="company-name">{data.get("company_name",sym)} &nbsp;·&nbsp; {data.get("industry","")}</div>
+  </div>
+  <div style="display:flex;gap:10px;align-items:center">
+    <a href="/sec/{sym}/llm-io" target="_blank"
+       style="display:inline-flex;align-items:center;gap:6px;background:#0c4a6e;color:#7dd3fc;
+              font-size:12px;font-weight:700;padding:7px 14px;border-radius:7px;text-decoration:none;
+              border:1px solid #0369a1">
+      🔬 LLM I/O Debug
+    </a>
   </div>
   <div class="score-badge">
     <div class="score-val">{fs:+.4f}</div>
@@ -724,7 +940,16 @@ function mkChart(id, config) {{
     ctx.style.display = 'none';
     const msg = document.createElement('div');
     msg.style.cssText = 'padding:40px;text-align:center;color:#475569;font-size:12px';
-    msg.innerHTML = '<div style="font-size:24px;margin-bottom:8px">📭</div>Awaiting LLM scoring — run <code style="color:#fcd34d">orchestrator.py</code>';
+    // Check if filings exist but facts not extracted (different from "no filings at all")
+    const hasFilings = D.filings_count && (D.filings_count['10k'] > 0 || D.filings_count['10q'] > 0);
+    const hasScored = D.score_composition && (D.score_composition.tenk_contrib !== 0 || D.score_composition.tenq_contrib !== 0);
+    if (hasFilings && hasScored) {{
+      msg.innerHTML = '<div style="font-size:24px;margin-bottom:8px">⚠️</div><div style="color:#fcd34d">Filings scored but no financial figures extracted</div><div style="margin-top:8px">Check <a href="/sec/' + D.symbol + '/llm-io" target="_blank" style="color:#38bdf8">🔬 LLM I/O Debug</a> to see what the LLM output</div>';
+    }} else if (hasFilings) {{
+      msg.innerHTML = '<div style="font-size:24px;margin-bottom:8px">⏳</div>SEC filings ingested but not yet scored<br>Run <code style="color:#fcd34d">python orchestrator.py</code> to score them';
+    }} else {{
+      msg.innerHTML = '<div style="font-size:24px;margin-bottom:8px">📭</div>No SEC filings ingested yet<br>Run <code style="color:#fcd34d">python scripts/edgar_backfill.py --symbol ' + D.symbol + '</code>';
+    }}
     wrap.appendChild(msg);
     return null;
   }}

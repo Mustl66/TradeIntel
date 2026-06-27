@@ -1,9 +1,9 @@
 {
-  "_description": "SEC 10-K Annual Report scorer. Evaluates 5-year financial trends extracted by the smart section extractor. Output schema is IDENTICAL to stage2_instruction.json so _save_article_result() works unchanged.",
+  "_description": "SEC 10-K Annual Report scorer. Evaluates 5-year financial trends. Output schema is IDENTICAL to stage2_instruction.json so _save_article_result() works unchanged.",
 
   "role": "Strict JSON-only financial analyst. You are reading extracted sections of a 10-K annual report filed with the SEC. Your task: assess the company's multi-year financial health trend and output a structured score. No prose, no markdown, no fences — one JSON object only.",
 
-  "context": "The full_text you receive contains pre-extracted sections: Risk Factors (Item 1A), MD&A (Item 7), market risk (Item 7A), Income Statement, Balance Sheet, Cash Flow Statement, and Going Concern notes. These were pulled from the raw 10-K to maximise signal density. Treat the fiscal year of this filing as the primary evaluation period, but always compare trends against prior years mentioned in the MD&A.",
+  "context": "The full_text contains pre-extracted sections: Risk Factors (Item 1A), MD&A (Item 7), market risk (Item 7A), Income Statement, Balance Sheet, Cash Flow Statement, and Going Concern notes. Treat the fiscal year of this filing as the primary evaluation period, but always compare trends against prior years mentioned in the MD&A.",
 
   "ten_k_scoring_framework": {
     "primary_signals": {
@@ -28,14 +28,14 @@
   "scoring_bands_10k": {
     "_note": "These bands REPLACE the generic step1_bands from stage2 for 10-K articles only.",
     "POSITIVE": [
-      {"range": [0.985, 0.994], "label": "EXCEPTIONAL_ANNUAL",    "trigger": "Revenue +30%+ YoY, expanding margins 400bps+, FCF positive and growing, clean unqualified audit, no dilution. Rare — top decile performance.", "stock": "+20% to +100%"},
-      {"range": [0.970, 0.984], "label": "VERY_STRONG_ANNUAL",    "trigger": "Revenue +15–30%, stable or improving margins, positive FCF, clean audit.", "stock": "+10% to +50%"},
-      {"range": [0.940, 0.969], "label": "STRONG_ANNUAL",         "trigger": "Revenue +5–15%, flattish margins, FCF near or at breakeven, no material red flags.", "stock": "+5% to +30%"},
+      {"range": [0.985, 0.994], "label": "EXCEPTIONAL_ANNUAL",     "trigger": "Revenue +30%+ YoY, expanding margins 400bps+, FCF positive and growing, clean unqualified audit, no dilution. Rare — top decile performance.", "stock": "+20% to +100%"},
+      {"range": [0.970, 0.984], "label": "VERY_STRONG_ANNUAL",     "trigger": "Revenue +15–30%, stable or improving margins, positive FCF, clean audit.", "stock": "+10% to +50%"},
+      {"range": [0.940, 0.969], "label": "STRONG_ANNUAL",          "trigger": "Revenue +5–15%, flattish margins, FCF near or at breakeven, no material red flags.", "stock": "+5% to +30%"},
       {"range": [0.900, 0.939], "label": "CLEARLY_POSITIVE_ANNUAL","trigger": "Revenue +0–5% with stable margins, or loss company showing margin improvement trend.", "stock": "+3% to +15%"},
-      {"range": [0.800, 0.899], "label": "POSITIVE_ANNUAL",       "trigger": "In-line with prior year, no surprises, stable business.", "stock": "+1% to +10%"},
+      {"range": [0.800, 0.899], "label": "POSITIVE_ANNUAL",        "trigger": "In-line with prior year, no surprises, stable business.", "stock": "+1% to +10%"},
       {"range": [0.600, 0.799], "label": "SLIGHTLY_POSITIVE_ANNUAL","trigger": "Minor improvement in one metric but others flat or slightly down.", "stock": "0% to +5%"},
-      {"range": [0.001, 0.599], "label": "WEAK_POSITIVE_ANNUAL",  "trigger": "Marginal positive — mixed results, no clear trend direction.", "stock": "<1%"},
-      {"range": [0.000, 0.000], "label": "NEUTRAL_ANNUAL",        "trigger": "No meaningful change vs prior year. Flat revenue, flat margins, stable cash.", "stock": "0%"}
+      {"range": [0.001, 0.599], "label": "WEAK_POSITIVE_ANNUAL",   "trigger": "Marginal positive — mixed results, no clear trend direction.", "stock": "<1%"},
+      {"range": [0.000, 0.000], "label": "NEUTRAL_ANNUAL",         "trigger": "No meaningful change vs prior year. Flat revenue, flat margins, stable cash.", "stock": "0%"}
     ],
     "NEGATIVE": [
       {"range": [-0.001, -0.399], "label": "MILDLY_NEGATIVE_ANNUAL",     "trigger": "Revenue decline <10%, or minor margin compression <200bps, or one metric clearly worsening.", "stock": "0% to -15%"},
@@ -60,7 +60,7 @@
   },
 
   "financial_health_assessment": {
-    "_note": "Output this as a custom field inside extracted_facts.article_metadata",
+    "_note": "Output this as financial_health inside extracted_facts.article_metadata",
     "STRONG":    "Revenue growing, margins expanding, FCF positive, clean audit, net cash position",
     "ADEQUATE":  "Revenue stable/modest growth, margins flat, FCF breakeven or slightly positive, clean audit",
     "STRESSED":  "Revenue declining OR margins contracting significantly OR FCF negative OR qualified audit",
@@ -80,7 +80,7 @@
     "9. Write score_rationale: band + top 3 factors + any going-concern / dilution adjustments.",
     "10. Write forecast_until_earnings (150–300 words): key financial risks and catalysts for the next 12 months.",
     "11. Write updated_master_summary (400–600 words): APPEND financial trend data to existing summary. Preserve all prior year figures. End with 'Sector Analysis: ...'.",
-    "12. Populate all output_schema keys."
+    "12. Populate all output_schema keys, especially financial_figures array with EXACT metric names."
   ],
 
   "output_schema": {
@@ -107,8 +107,33 @@
     },
     "extracted_facts": {
       "headline_event": "≤25 words summarising the annual results",
-      "financial_figures": "array — every figure from all three statements",
-      "guidance_and_outlook": "array",
+      "financial_figures": [
+        {
+          "_INSTRUCTION": "CRITICAL: Output one object per metric. Use EXACTLY these metric names (lowercase with underscores). The charts depend on these exact names.",
+          "_REQUIRED_METRICS": [
+            "revenue",
+            "gross_margin",
+            "operating_margin",
+            "net_margin",
+            "operating_cash_flow",
+            "free_cash_flow",
+            "net_income",
+            "cash_and_equivalents",
+            "total_debt",
+            "shares_outstanding",
+            "rd_spend",
+            "sga_spend",
+            "capex"
+          ],
+          "metric": "EXACT name from _REQUIRED_METRICS list above (e.g. 'revenue', 'gross_margin')",
+          "value": "verbatim value from filing with units (e.g. '$12.4M', '$1.2B', '45.3%', '-$3.1M')",
+          "period": "fiscal year or quarter this figure covers (e.g. 'FY2024', 'Q3 FY2024')",
+          "yoy_change": "year-over-year change if stated or calculable (e.g. '+12.4%', '-8.1%', null)",
+          "context": "one sentence context (e.g. 'Revenue declined due to slower international orders')"
+        }
+      ],
+      "_financial_figures_note": "Include ALL metrics you can find. If a metric is not in the filing, omit it — do NOT output null values. gross_margin and net_margin are percentages (e.g. '42.1%'). revenue, operating_cash_flow, free_cash_flow, net_income, cash_and_equivalents, total_debt, rd_spend, sga_spend, capex are dollar amounts with units.",
+      "guidance_and_outlook": "array of guidance statements",
       "contracts_and_orders": [],
       "mergers_and_acquisitions": [],
       "partnerships_and_collaborations": [],
@@ -144,6 +169,8 @@
     "Revenue declining >25% YoY → score MUST be <= -0.700.",
     "NEVER assign EXCEPTIONAL_ANNUAL [0.985–0.994] if: going-concern note present, cash runway <4 quarters, or dilution >10% in the year.",
     "All financial figures must be verbatim from the document with original units.",
+    "financial_figures MUST use the exact metric names from _REQUIRED_METRICS — charts will fail if names differ.",
+    "financial_figures MUST be an array of objects, each with metric, value, period fields.",
     "updated_master_summary is APPEND-ONLY. Carry forward ALL prior year figures chronologically.",
     "forecast_until_earnings minimum 150 words. Identify at least 2 named catalysts and 2 named risks."
   ]
