@@ -143,4 +143,4 @@ EDGAR_10Q_STALENESS_MONTHS = 15     # skip 10-Q older than this for scoring
 #   EDGAR_MAX_TIER = 1  →  Tier 1 only  (10-K, 10-Q, 8-K)
 #   EDGAR_MAX_TIER = 2  →  Tier 1 + 2  (+ S-3, 424B, NT filings)
 #   EDGAR_MAX_TIER = 3  →  All tiers   (+ Form 4, SC 13D/G)
-EDGAR_MAX_TIER = 1
+EDGAR_MAX_TIER = 3

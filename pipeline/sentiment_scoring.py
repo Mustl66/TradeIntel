@@ -2162,25 +2162,53 @@ def _process_symbol(
 
     # Save symbol-level scores
     if weighted_scores:
-        # Dedicated AI sector pick — runs once after all articles scored
-        all_sectors = _load_all_sectors(conn)
-        ai_sector_pick = _call_ai_sector_pick(main_client, symbol, master_summary,
-                                              all_sectors, hint_candidates=ai_sector_hints)
-        ai_sector_mult = _resolve_ai_sector_multiplier(conn, ai_sector_pick)
-        with conn.cursor() as cur:
-            _save_symbol_scores(cur, sym_id, master_summary,
-                                last_forecast, weighted_scores, macro_mult,
-                                ai_sector_pick=ai_sector_pick,
-                                ai_sector_multiplier=ai_sector_mult,
-                                raw_weight_pairs=raw_weight_pairs,
-                                newest_material_pub=newest_material_pub,
-                                conn=conn)
-        conn.commit()
-        avg_w = sum(weighted_scores) / len(weighted_scores)
-        logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
-                    f"macro_mult={macro_mult:.3f} ai_sector='{ai_sector_pick}' "
-                    f"ai_sector_mult={ai_sector_mult:.3f} final_score="
-                    f"{round(avg_w * macro_mult * ai_sector_mult, 4)}")
+        # ── Guard: block final_score if Tier-1 SEC filings exist but none scored ──
+        # A symbol that has 10-K/10-Q filings stored but hasn't had them run through
+        # the LLM yet would produce a misleading final_score (news-only average).
+        # We block the symbol-level save in that case and log a clear message so
+        # the user knows to wait for Worker6 to score those SEC articles first.
+        with conn.cursor() as _sec_cur:
+            _sec_cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE form_type IN ('10-K','10-K/A','10-Q','10-Q/A'))
+                        AS total_tier1,
+                    COUNT(*) FILTER (WHERE form_type IN ('10-K','10-K/A','10-Q','10-Q/A')
+                                     AND sentiment_score IS NOT NULL)
+                        AS scored_tier1
+                FROM news_articles
+                WHERE symbol_id = %s AND form_type IS NOT NULL
+            """, (sym_id,))
+            _sec_row = _sec_cur.fetchone()
+        _total_tier1  = _sec_row[0] if _sec_row else 0
+        _scored_tier1 = _sec_row[1] if _sec_row else 0
+        _has_unscored_sec = (_total_tier1 > 0 and _scored_tier1 == 0)
+
+        if _has_unscored_sec:
+            logger.warning(
+                f"[{symbol}] BLOCKING final_score: {_total_tier1} Tier-1 SEC filings "
+                f"(10-K/10-Q) stored but NONE scored yet. Run Worker6 / orchestrator.py "
+                f"to score SEC filings before final_score is computed."
+            )
+        else:
+            # Dedicated AI sector pick — runs once after all articles scored
+            all_sectors = _load_all_sectors(conn)
+            ai_sector_pick = _call_ai_sector_pick(main_client, symbol, master_summary,
+                                                  all_sectors, hint_candidates=ai_sector_hints)
+            ai_sector_mult = _resolve_ai_sector_multiplier(conn, ai_sector_pick)
+            with conn.cursor() as cur:
+                _save_symbol_scores(cur, sym_id, master_summary,
+                                    last_forecast, weighted_scores, macro_mult,
+                                    ai_sector_pick=ai_sector_pick,
+                                    ai_sector_multiplier=ai_sector_mult,
+                                    raw_weight_pairs=raw_weight_pairs,
+                                    newest_material_pub=newest_material_pub,
+                                    conn=conn)
+            conn.commit()
+            avg_w = sum(weighted_scores) / len(weighted_scores)
+            logger.info(f"[{symbol}] scored={scored} skipped={skipped} "
+                        f"macro_mult={macro_mult:.3f} ai_sector='{ai_sector_pick}' "
+                        f"ai_sector_mult={ai_sector_mult:.3f} final_score="
+                        f"{round(avg_w * macro_mult * ai_sector_mult, 4)}")
     else:
         logger.info(f"[{symbol}] scored={scored} skipped={skipped} — no weighted scores")
     return {"symbol": symbol, "scored": scored, "skipped": skipped,
